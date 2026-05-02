@@ -27,13 +27,21 @@ pub struct ServerConfig {
     #[serde(default = "default_server_admin")]
     pub admin: AdminConfig,
 
-    #[serde(default, rename = "networks")]
+    // `skip_serializing_if` keeps an empty list out of the saved
+    // TOML — otherwise serde produces a stray `routes = []` that
+    // ends up before `[server]` because of TOML's "scalars first,
+    // tables after" rule.
+    #[serde(default, rename = "networks", skip_serializing_if = "Vec::is_empty")]
     pub networks: Vec<NetRecord>,
 
-    #[serde(default, rename = "approved_clients")]
+    #[serde(
+        default,
+        rename = "approved_clients",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub approved_clients: Vec<ApprovedClient>,
 
-    #[serde(default, rename = "routes")]
+    #[serde(default, rename = "routes", skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<WireRoute>,
 }
 
@@ -151,7 +159,7 @@ pub struct ClientConfig {
     #[serde(default = "default_client_admin")]
     pub admin: AdminConfig,
 
-    #[serde(default, rename = "routes")]
+    #[serde(default, rename = "routes", skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<WireRoute>,
 }
 

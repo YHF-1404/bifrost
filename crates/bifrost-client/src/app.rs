@@ -274,6 +274,9 @@ impl App {
         if let Some(tx) = &self.session_tx {
             let _ = tx.send(SessionCmd::SetIp(ip.clone())).await;
         }
+        // Mirror the new value into both the cached state (so admin
+        // status reflects it immediately) and the on-disk config.
+        self.joined_tap_ip = ip.clone();
         self.cfg.tap.ip = ip.clone().unwrap_or_default();
         let _ = self.cfg.save(&self.cfg_path).await;
         println!("[*] TAP IP updated: {}", ip.unwrap_or_else(|| "(cleared)".into()));
