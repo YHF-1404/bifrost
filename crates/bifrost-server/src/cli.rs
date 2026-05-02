@@ -9,7 +9,12 @@ use clap::{Parser, Subcommand};
 #[command(name = "bifrost-server", version, about)]
 pub struct Cli {
     /// Path to the server TOML config (created on first run).
-    #[arg(long, default_value = "server.toml", global = true)]
+    ///
+    /// Default points at the standard systemd-deployed location so
+    /// `bifrost-server admin <cmd>` works with no flags on the same
+    /// host as the daemon. For dev runs, pass `--config ./server.toml`
+    /// (or wherever).
+    #[arg(long, default_value = "/etc/bifrost/server.toml", global = true)]
     pub config: PathBuf,
 
     /// Override `[admin] socket` from the config.

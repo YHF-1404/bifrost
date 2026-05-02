@@ -10,7 +10,12 @@ use uuid::Uuid;
 #[command(name = "bifrost-client", version, about)]
 pub struct Cli {
     /// Path to the client TOML config (created on first run).
-    #[arg(long, default_value = "client.toml", global = true)]
+    ///
+    /// Default points at the standard systemd-deployed location so
+    /// `bifrost-client admin <cmd>` works with no flags on the same
+    /// host as the daemon. For dev runs, pass `--config ./client.toml`
+    /// (or wherever).
+    #[arg(long, default_value = "/etc/bifrost/client.toml", global = true)]
     pub config: PathBuf,
 
     /// Disable the SOCKS5 proxy even if `proxy.enabled = true` in the config.
