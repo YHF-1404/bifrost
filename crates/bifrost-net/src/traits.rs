@@ -55,6 +55,15 @@ pub trait Bridge: Send + Sync + 'static {
     /// Remove `tap_name` from this bridge. Idempotent.
     async fn remove_tap(&self, tap_name: &str) -> io::Result<()>;
 
+    /// Replace the kernel routes that flow through this bridge.
+    /// Implementations install each entry with the bridge as the
+    /// output device, so the host's routing table can reach the
+    /// `via` gateway over its local TAP ports.
+    ///
+    /// Pre-existing user-installed routes through this device are
+    /// flushed; kernel-installed direct-connect routes are preserved.
+    async fn apply_routes(&self, routes: &[RouteEntry]) -> io::Result<()>;
+
     /// Best-effort destruction of the kernel bridge. Idempotent.
     async fn destroy(&self) -> io::Result<()>;
 }

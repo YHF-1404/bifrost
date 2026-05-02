@@ -13,8 +13,9 @@ use ipnet::IpNet;
 use rtnetlink::Handle;
 use tracing::{debug, warn};
 
-use super::tap::{del_link, io_other, lookup_if_index};
+use super::tap::{add_route, del_link, flush_user_routes, io_other, lookup_if_index};
 use crate::traits::Bridge;
+use crate::types::RouteEntry;
 
 pub struct LinuxBridge {
     name: String,
@@ -114,6 +115,20 @@ impl Bridge for LinuxBridge {
             .execute()
             .await
             .map_err(io_other)
+    }
+
+    async fn apply_routes(&self, routes: &[RouteEntry]) -> io::Result<()> {
+        // Routes that flow OUT of this host toward a client's TAP go
+        // via the bridge as their `dev`. Per-route `via` is a
+        // 10.0.0.x address that the bridge knows how to reach because
+        // the client's TAP is one of its ports.
+        flush_user_routes(&self.handle, self.if_index).await?;
+        for r in routes {
+            if let Err(e) = add_route(&self.handle, self.if_index, r).await {
+                warn!(error = %e, dst = %r.dst, via = %r.via, "skip bridge route");
+            }
+        }
+        Ok(())
     }
 
     async fn destroy(&self) -> io::Result<()> {

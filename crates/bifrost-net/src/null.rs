@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use ipnet::IpNet;
 
 use crate::traits::{Bridge, Platform, Tap};
+use crate::types::RouteEntry;
 
 /// Platform whose `create_tap` returns [`io::ErrorKind::Unsupported`]
 /// and whose `create_bridge` returns a [`NullBridge`].
@@ -61,6 +62,9 @@ impl Bridge for NullBridge {
         ))
     }
     async fn remove_tap(&self, _tap_name: &str) -> io::Result<()> {
+        Ok(())
+    }
+    async fn apply_routes(&self, _routes: &[RouteEntry]) -> io::Result<()> {
         Ok(())
     }
     async fn destroy(&self) -> io::Result<()> {

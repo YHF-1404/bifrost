@@ -266,7 +266,7 @@ async fn flush_addrs(handle: &Handle, idx: u32) -> io::Result<()> {
     Ok(())
 }
 
-async fn flush_user_routes(handle: &Handle, idx: u32) -> io::Result<()> {
+pub(super) async fn flush_user_routes(handle: &Handle, idx: u32) -> io::Result<()> {
     use futures::TryStreamExt;
     use netlink_packet_route::route::{RouteAttribute, RouteProtocol};
 
@@ -305,7 +305,7 @@ async fn flush_user_routes(handle: &Handle, idx: u32) -> io::Result<()> {
     Ok(())
 }
 
-async fn add_route(handle: &Handle, idx: u32, r: &RouteEntry) -> io::Result<()> {
+pub(super) async fn add_route(handle: &Handle, idx: u32, r: &RouteEntry) -> io::Result<()> {
     match (r.dst, r.via) {
         (IpNet::V4(dst), std::net::IpAddr::V4(gw)) => {
             handle

@@ -135,6 +135,7 @@ pub struct MockBridge {
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct MockBridgeState {
     pub ports: Vec<String>,
+    pub routes: Vec<RouteEntry>,
     pub destroyed: bool,
 }
 
@@ -167,6 +168,11 @@ impl Bridge for MockBridge {
 
     async fn remove_tap(&self, tap_name: &str) -> io::Result<()> {
         self.state.lock().await.ports.retain(|p| p != tap_name);
+        Ok(())
+    }
+
+    async fn apply_routes(&self, routes: &[RouteEntry]) -> io::Result<()> {
+        self.state.lock().await.routes = routes.to_vec();
         Ok(())
     }
 

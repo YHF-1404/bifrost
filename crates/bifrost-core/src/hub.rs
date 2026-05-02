@@ -422,12 +422,38 @@ impl Hub {
         }
     }
 
+    /// Replay the configured route table into the host's kernel
+    /// routing table via the bridge. Without this, hosts behind a
+    /// client (e.g. a LAN reachable through `via 10.0.0.2`) cannot be
+    /// reached *from* the server side: the kernel has no idea those
+    /// destinations live behind the bridge.
+    ///
+    /// Bad rows are dropped silently — `RouteEntry::parse` enforces
+    /// validity at `route add` time, so this is just defensive.
+    async fn sync_local_routes(&self) {
+        let parsed: Vec<bifrost_net::RouteEntry> = self
+            .cfg
+            .routes
+            .iter()
+            .filter_map(|r| bifrost_net::RouteEntry::parse(&r.dst, &r.via).ok())
+            .collect();
+        if let Err(e) = self.bridge.apply_routes(&parsed).await {
+            warn!(error = %e, "bridge.apply_routes failed");
+        }
+    }
+
     pub async fn run(mut self) {
         info!(
             bridge = self.bridge.name(),
             disconnect_timeout_s = self.disconnect_timeout.as_secs(),
             "hub start"
         );
+
+        // Replay any persisted routes into the kernel — covers the
+        // "daemon restart" path. Without this, traffic from the
+        // server toward LANs behind a client would 'no route to host'
+        // until someone re-ran `route push`.
+        self.sync_local_routes().await;
 
         loop {
             tokio::select! {
@@ -842,6 +868,7 @@ impl Hub {
             via: via.clone(),
         });
         self.persist().await;
+        self.sync_local_routes().await;
         info!(%dst, %via, "route added");
         let _ = ack.send(Ok(()));
     }
@@ -852,6 +879,7 @@ impl Hub {
         let removed = self.cfg.routes.len() < before;
         if removed {
             self.persist().await;
+            self.sync_local_routes().await;
             info!(%dst, "route removed");
         }
         let _ = ack.send(removed);
