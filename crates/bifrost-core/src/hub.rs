@@ -635,9 +635,14 @@ impl Hub {
             .as_ref()
             .map(|a| a.tap_ip.clone())
             .filter(|s| !s.is_empty());
-        let tap_ip_parsed = tap_ip_str.as_deref().and_then(|s| s.parse::<IpNet>().ok());
 
-        let tap = match self.platform.create_tap(&tap_name, tap_ip_parsed).await {
+        // Server-side TAPs are L2 bridge ports — they MUST NOT carry
+        // an IP. The bridge interface (`br-bifrost`) holds the gateway
+        // address; this TAP only forwards Ethernet frames between the
+        // socket and the bridge. The configured `tap_ip` belongs to
+        // the *client*: it travels in `JoinOk` (and via `SetIp`) and
+        // is applied on the client's local TAP, not here.
+        let tap = match self.platform.create_tap(&tap_name, None).await {
             Ok(t) => t,
             Err(e) => {
                 error!(error = %e, "create_tap failed");
