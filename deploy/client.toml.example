@@ -1,0 +1,19 @@
+[client]
+# Generated automatically on first run if empty.
+uuid = ""
+host = "64.176.40.25"
+port = 8888
+save_dir = "/var/lib/bifrost/received"
+retry_interval = 5
+joined_network = ""
+
+[proxy]
+enabled = true
+host = "127.0.0.1"
+port = 10808
+
+[tap]
+ip = ""
+
+[admin]
+socket = "/run/bifrost/client.sock"

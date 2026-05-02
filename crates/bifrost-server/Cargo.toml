@@ -1,0 +1,33 @@
+[package]
+name = "bifrost-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bifrost VPN server — accept loop, conn task, REPL"
+
+[lib]
+name = "bifrost_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bifrost-server"
+path = "src/main.rs"
+
+[dependencies]
+bifrost-proto.workspace = true
+bifrost-net.workspace   = true
+bifrost-core.workspace  = true
+
+anyhow.workspace             = true
+clap.workspace               = true
+futures.workspace            = true
+rustyline.workspace          = true
+tokio.workspace              = true
+tokio-util                   = { workspace = true, features = ["codec"] }
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+uuid.workspace               = true
+
+[dev-dependencies]
+bifrost-net = { workspace = true, features = ["mock"] }
+tempfile = "3"

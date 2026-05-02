@@ -1,0 +1,12 @@
+# Default cross images suffice — both targets get glibc-based Debian
+# bookworm-ish toolchains, which is wider compatibility than the Arch
+# (server) and Ubuntu 24.04 (router-client) deployment hosts need.
+#
+# `passthrough` carries our RUST_LOG / RUSTC_WRAPPER through into the
+# cross container, otherwise CI/cache settings get lost.
+[build.env]
+passthrough = ["RUST_LOG", "RUSTC_WRAPPER"]
+
+[target.x86_64-unknown-linux-gnu]
+
+[target.aarch64-unknown-linux-gnu]

@@ -1,0 +1,21 @@
+[Unit]
+Description=Bifrost VPN server
+Documentation=https://github.com/hml/bifrost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bifrost-server --config /etc/bifrost/server.toml
+ExecStartPre=/bin/mkdir -p /run/bifrost /var/lib/bifrost/received
+Restart=on-failure
+RestartSec=2
+# /dev/net/tun + netlink RTM_NEWLINK require root.
+User=root
+Group=root
+# Don't kill the daemon if it's still draining sessions on shutdown.
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

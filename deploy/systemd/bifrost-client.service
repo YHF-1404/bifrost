@@ -1,0 +1,19 @@
+[Unit]
+Description=Bifrost VPN client
+Documentation=https://github.com/hml/bifrost
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bifrost-client --config /etc/bifrost/client.toml
+ExecStartPre=/bin/mkdir -p /run/bifrost /var/lib/bifrost/received
+Restart=on-failure
+RestartSec=2
+User=root
+Group=root
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

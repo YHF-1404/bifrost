@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bifrost-proto",
+    "crates/bifrost-net",
+    "crates/bifrost-core",
+    "crates/bifrost-client",
+    "crates/bifrost-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+repository = "https://github.com/hml/bifrost"
+
+[workspace.dependencies]
+# ── protocol & util ───────────────────────────────────────────────
+bytes      = "1"
+serde      = { version = "1", features = ["derive"] }
+postcard   = { version = "1", features = ["use-std"] }
+uuid       = { version = "1", features = ["v4", "serde"] }
+thiserror  = "1"
+anyhow     = "1"
+
+# ── async ─────────────────────────────────────────────────────────
+tokio       = { version = "1", features = ["full"] }
+tokio-util  = { version = "0.7", features = ["codec"] }
+tokio-socks = "0.5"
+async-trait = "0.1"
+futures     = "0.3"
+
+# ── observability ─────────────────────────────────────────────────
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+
+# ── CLI / config ──────────────────────────────────────────────────
+clap      = { version = "4", features = ["derive"] }
+rustyline = "14"
+toml      = "0.8"
+
+# ── networking ────────────────────────────────────────────────────
+ipnet = { version = "2", features = ["serde"] }
+
+# ── internal crates ───────────────────────────────────────────────
+bifrost-proto  = { path = "crates/bifrost-proto",  version = "0.1.0" }
+bifrost-net    = { path = "crates/bifrost-net",    version = "0.1.0" }
+bifrost-core   = { path = "crates/bifrost-core",   version = "0.1.0" }
+bifrost-server = { path = "crates/bifrost-server", version = "0.1.0" }
+bifrost-client = { path = "crates/bifrost-client", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

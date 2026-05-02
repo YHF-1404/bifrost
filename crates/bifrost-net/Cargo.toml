@@ -1,0 +1,30 @@
+[package]
+name = "bifrost-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bifrost — TAP / L2 bridge platform abstraction (interface-only)"
+
+[features]
+default = []
+# Enable in-memory mock implementations for downstream tests.
+mock = ["dep:tokio"]
+
+[dependencies]
+async-trait.workspace = true
+ipnet.workspace       = true
+thiserror.workspace   = true
+tracing.workspace     = true
+tokio = { workspace = true, optional = true, features = ["sync"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux backend deps — kept off macOS / Windows builds entirely.
+libc                 = "0.2"
+nix                  = { version = "0.29", features = ["ioctl", "fs"] }
+rtnetlink            = "0.14"
+netlink-packet-route = "0.19"
+futures              = { workspace = true }
+tokio                = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
