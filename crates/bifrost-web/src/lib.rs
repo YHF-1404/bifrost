@@ -28,6 +28,7 @@
 
 use std::net::SocketAddr;
 
+use axum::routing::get;
 use axum::Router;
 use bifrost_core::HubHandle;
 use tokio::sync::mpsc;
@@ -35,6 +36,7 @@ use tracing::{info, warn};
 
 mod api;
 mod state;
+mod ws;
 
 pub use state::AppState;
 
@@ -53,6 +55,7 @@ pub async fn serve(
 
     let app = Router::new()
         .nest("/api", api::router())
+        .route("/ws", get(ws::handler))
         .with_state(state)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
