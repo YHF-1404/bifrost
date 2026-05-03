@@ -3,7 +3,7 @@ import { Navigate, Route, BrowserRouter as Router, Routes } from "react-router-d
 import { Layout } from "@/components/Layout";
 import { Toaster } from "@/components/Toaster";
 import { EventInvalidator } from "@/lib/eventInvalidator";
-import { DeviceTable } from "@/views/DeviceTable";
+import { NetworkDetail } from "@/views/NetworkDetail";
 import { NetworkList } from "@/views/NetworkList";
 
 const queryClient = new QueryClient({
@@ -25,7 +25,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route index element={<Navigate to="/networks" replace />} />
             <Route path="/networks" element={<NetworkList />} />
-            <Route path="/networks/:nid" element={<DeviceTable />} />
+            <Route path="/networks/:nid" element={<NetworkDetail />} />
             <Route path="*" element={<Navigate to="/networks" replace />} />
           </Route>
         </Routes>
