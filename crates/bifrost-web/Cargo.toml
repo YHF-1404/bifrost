@@ -19,6 +19,13 @@ tracing    = { workspace = true }
 thiserror  = { workspace = true }
 anyhow     = { workspace = true }
 
+# Embed the React WebUI build output into the binary. The folder is
+# populated by `npm run build` in web/; build.rs writes a placeholder
+# index.html when the dir doesn't exist yet so cargo can still compile
+# (e.g. on a fresh clone before the frontend is built).
+rust-embed  = "8"
+mime_guess  = "2"
+
 [dev-dependencies]
 bifrost-net      = { workspace = true, features = ["mock"] }
 reqwest          = { version = "0.12", default-features = false, features = ["json"] }

@@ -61,7 +61,7 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 134 个单测 / 集成测试
+cargo test  --workspace      # 156 个单测 / 集成测试
 cargo clippy --workspace --all-targets -- -D warnings
 
 # 前端（只在动 WebUI 时需要）
@@ -278,17 +278,41 @@ ssh -L 8080:127.0.0.1:8080 root@<server-ip>
 `server.toml` 的 `[web]` 段可以改 listen 或彻底关掉；命令行也支持
 `--web-listen <addr>` / `--no-web` 临时覆盖。
 
-### Endpoints（v0.1 只读）
+### Endpoints
 
-| Method | Path | 返回 |
+| Method | Path | 返回 / 行为 |
 |---|---|---|
 | `GET` | `/api/networks` | 网络列表 + 每网的 `device_count` / `online_count` |
-| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备的合并视图，含在线状态、TAP 名等 |
-| `GET` | `/ws` | WebSocket。v0.1 仅做 25 秒 keepalive；后续阶段会推 `metrics.tick` / `device.online` / `device.changed` |
+| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备的合并视图 |
+| `PATCH` | `/api/networks/:nid/devices/:cid` | 改 admitted 设备字段（name / tap_ip / lan_subnets / `admitted=false` 踢人） |
+| `POST` | `/api/networks/:nid/devices/:cid/approve` | 批准 pending |
+| `POST` | `/api/networks/:nid/devices/:cid/deny` | 拒绝 pending |
+| `POST` | `/api/networks/:nid/routes/push` | 重新派生路由表 + 下发 |
+| `GET` | `/ws` | WebSocket，推送 `metrics.tick` / `device.{online,offline,changed,pending,removed}` / `routes.changed` |
 
-写入端点（就地编辑、admit 开关、`routes/push` 按钮）下一阶段添加。
+### 生产部署：单二进制
+
+`bifrost-server` 通过 [`rust-embed`](https://crates.io/crates/rust-embed)
+在编译期把 `web/dist/` 烤进二进制。先 build 前端再 build 后端：
+
+```bash
+cd web && npm install && npm run build && cd ..
+cargo build --release -p bifrost-server          # 或 scripts/build-cross.sh
+```
+
+`scripts/build-cross.sh` 会自动跑 `npm run build`；想跳过用
+`--skip-web`。装好之后，`bifrost-server` 在同一个端口同时服务 API +
+WS + SPA：哈希过的资产走 `Cache-Control: immutable`，`index.html`
+不缓存，深链接（`/networks/:nid` 等）回退到 `index.html` 让 React
+Router 接管。
+
+如果 `web/dist/` 不存在，`build.rs` 会写一个占位 `index.html`，
+`cargo build` 仍能通过——但 WebUI 显示 "WebUI not built"
+直到你真的跑过 `npm run build`。
 
 ### 前端 dev 工作流
+
+只动 React 时不必每次重 build Rust，开 Vite 在前面挡：
 
 ```bash
 cd web
@@ -296,18 +320,16 @@ npm install
 npm run dev        # http://127.0.0.1:5173；/api 与 /ws 自动 proxy 到 8080
 ```
 
-如果 backend 不在 `127.0.0.1:8080`，设 `BIFROST_BACKEND=http://host:port`。
+如果 backend 不在 `127.0.0.1:8080`，设 `BIFROST_BACKEND=http://host:port`。HMR 正常工作。
 
-```bash
-npm run build      # → web/dist/
-```
+当前能用的页面：
 
-当前 SPA 是单独 serve 的；`rust-embed` 把产物嵌进 `bifrost-server`
-单二进制是 1.5 阶段的事。当前能用的页面：
-
-- `/networks`：虚拟网络列表，5 秒轮询
-- `/networks/:nid`：该网下所有设备，行内显示状态徽章（online / offline / pending）、名字、TAP IP、LAN 子网、短 UUID
-- 顶栏的连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动
+- `/networks`：虚拟网络列表；事件驱动，30 秒兜底轮询
+- `/networks/:nid`：该网下所有设备，**两种可切换视图**——表格视图 / 节点图视图（React Flow），切换状态写 localStorage
+  - 行内可编辑名字 / TAP IP / LAN 子网，乐观更新 + 失败回滚
+  - 实时上下行 sparkline，由 1Hz `metrics.tick` 喂数
+  - admit / deny / kick / push routes 都在 UI 上
+- 顶栏连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动
 
 ---
 
@@ -416,21 +438,19 @@ Admin RPC 是另一份独立协议：
 - ✅ 跨编译：x86_64-linux-gnu + aarch64-linux-gnu via `cross`
 - ✅ systemd unit + 部署脚本，已在生产 Arch + Ubuntu aarch64 跑通端到端
 
-### 已完成（Phase 1.0–1.1 — WebUI 基础）
+### 已完成（Phase 1.0–1.5 — WebUI v1）
 
 - ✅ **per-device `lan_subnets`** 取代全局 `[[routes]]`；路由表按需派生。CLI 改为 `device list/set/push`。
-- ✅ **`bifrost-web` crate** — axum HTTP/WS server，默认 `127.0.0.1:8080`，提供 `GET /api/networks` 与 `GET /api/networks/:nid/devices`，外加 `/ws` 心跳。
-- ✅ **`web/` SPA** — React + Vite + TypeScript + Tailwind，NetworkList + DeviceTable，顶栏连接状态实时反映 WebSocket 状态。
-- ✅ **134 个测试**通过，clippy `-D warnings` 干净。
+- ✅ **`bifrost-web` crate** — axum HTTP/WS server，默认 `127.0.0.1:8080`，提供完整 CRUD + 实时事件流（`metrics.tick` / `device.{online,offline,changed,pending,removed}` / `routes.changed`）。
+- ✅ **`web/` SPA** — React + Vite + TS + Tailwind，**两种可切换视图**（表格 / React Flow 节点图，per-tab 持久化）；行内编辑、乐观更新 + 回滚、approve/deny/kick/push routes 全在 UI；实时 sparkline。
+- ✅ **per-session 字节计数 + 1 Hz 采样**喂前端 sparkline；事件驱动让前端不再轮询。
+- ✅ **单二进制部署**：`rust-embed` 把 `web/dist/` 编进 `bifrost-server`；同一端口服务 API + WS + SPA；深链接回退到 `index.html`；哈希资产 immutable cache。
+- ✅ **156 个测试**通过，clippy `-D warnings` 干净。
 
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
 |---|---|---|
-| 1.2 | per-session 流量计数 + sparkline | `SessionTask` 加 `AtomicU64` 字节计数；1 Hz `metrics.tick` 经 WS 下发；表格里画 mini 图 |
-| 1.3 | 写入侧：`PATCH device`、admit 开关、就地编辑、`POST routes/push` | HTTP 端点 + 前端 mutation |
-| 1.4 | 节点图视图（React Flow），与表格视图互通 | 自带就地编辑，乐观更新 |
-| 1.5 | `web/dist/` 嵌进 `bifrost-server` 单二进制 | `rust-embed` + SPA fallback |
 | 2.x | 多虚拟网：`HubManager`、per-net `HubHandle`、网络 CRUD | URL 已经是 `/api/networks/:nid/...`，主要工作是 actor 拆分 |
 | —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基） |

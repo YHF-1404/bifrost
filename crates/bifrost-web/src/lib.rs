@@ -36,6 +36,7 @@ use tracing::{info, warn};
 
 mod api;
 mod state;
+mod static_files;
 mod ws;
 
 pub use state::AppState;
@@ -57,6 +58,9 @@ pub async fn serve(
         .nest("/api", api::router())
         .route("/ws", get(ws::handler))
         .with_state(state)
+        // Anything else falls through to the embedded SPA. `/api` and
+        // `/ws` matched above, so this only sees frontend routes.
+        .fallback(static_files::handler)
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

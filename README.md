@@ -190,7 +190,7 @@ appropriate moments.
 
 ```bash
 cargo build  --workspace
-cargo test   --workspace                                 # ~134 tests
+cargo test   --workspace                                 # ~156 tests
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Frontend (optional — only if you're going to touch the WebUI)
@@ -456,7 +456,35 @@ CLI flags `--web-listen <addr>` / `--no-web`.
 PATCH/POST endpoints (in-place edit, admit toggle, route push) land in
 the next phase.
 
+### Production: single binary
+
+The `bifrost-server` binary embeds `web/dist/` at compile time via
+[`rust-embed`](https://crates.io/crates/rust-embed). Build the
+frontend first, then build the server:
+
+```bash
+cd web && npm install && npm run build && cd ..
+cargo build --release -p bifrost-server          # or scripts/build-cross.sh
+```
+
+`scripts/build-cross.sh` does both steps for cross-compilation —
+pass `--skip-web` to reuse the existing `web/dist/`. After that
+`bifrost-server` serves the SPA on the same port as the API:
+
+* `GET /` → embedded `index.html`, `Cache-Control: no-cache`.
+* `GET /assets/*` → hashed JS/CSS, `Cache-Control: public, max-age=31536000, immutable`.
+* `GET /networks/:nid` → SPA fallback (still `index.html` + 200) so
+  React Router can handle deep links.
+* `GET /api/*` and `GET /ws` win against the static fallback.
+
+If the build is fresh (no `web/dist/` yet) `build.rs` writes a
+placeholder `index.html` — `cargo build` succeeds, but the WebUI just
+shows a "WebUI not built" page until you run `npm run build`.
+
 ### Frontend dev workflow
+
+For iterating on the React side without rebuilding the Rust binary
+on every change, run Vite's dev server in front of the daemon:
 
 ```bash
 cd web
@@ -465,20 +493,19 @@ npm run dev        # http://127.0.0.1:5173, proxies /api and /ws to backend
 ```
 
 Set `BIFROST_BACKEND=http://<host>:<port>` if the server is somewhere
-other than `127.0.0.1:8080`.
+other than `127.0.0.1:8080`. HMR works as expected.
 
-```bash
-npm run build      # → web/dist/
-```
+Pages currently shipping:
 
-Today the SPA is served separately; `rust-embed`-based embedding into
-`bifrost-server` is on the roadmap. Pages currently shipping:
-
-* `/networks` — table of virtual networks, polls every 5 s.
-* `/networks/:nid` — table of devices in a network, with status badges
-  (online / offline / pending), name, TAP IP, LAN subnets, short UUID.
+* `/networks` — table of virtual networks; events from `/ws` keep it fresh.
+* `/networks/:nid` — devices in a network, with two interchangeable
+  views (table / node-graph) toggled per-tab. Inline-edit name, TAP
+  IP, and LAN subnets; admit / deny pending; `Push routes` recomputes
+  and pushes the derived table to all members.
 * Header status badge — live / connecting / offline, driven by the
   WebSocket connection.
+* Live throughput sparklines on each device, fed by 1 Hz
+  `metrics.tick` events.
 
 ---
 
@@ -585,27 +612,37 @@ Crate dependency graph:
   server and an Ubuntu 24.04 aarch64 client (tunnelling through
   Xray's SOCKS5)
 
-### Completed (Phase 1.0–1.1 — WebUI groundwork)
+### Completed (Phase 1.0–1.5 — WebUI v1)
 
 * **Per-device `lan_subnets`** replaces the global `[[routes]]`
   table; route table is derived per-network at push time. CLI
   surface migrated to `device list/set/push`.
-* **`bifrost-web` crate** — axum HTTP/WS server, default
-  `127.0.0.1:8080`, exposes `GET /api/networks` and
-  `GET /api/networks/:nid/devices` plus a `/ws` heartbeat.
-* **`web/` SPA** — React + Vite + TypeScript + Tailwind,
-  NetworkList + DeviceTable views, live status badge driven by
-  WebSocket connection state.
-* **134 tests passing**, clippy-clean with `-D warnings`.
+* **`bifrost-web` crate** — axum HTTP/WS server on
+  `127.0.0.1:8080` by default. Read-only listing endpoints, write
+  endpoints (`PATCH device`, `POST approve|deny|routes/push`), and
+  a `/ws` event stream pushing `metrics.tick`, `device.online`,
+  `device.offline`, `device.changed`, `device.pending`,
+  `device.removed`, `routes.changed`.
+* **`web/` SPA** — React + Vite + TypeScript + Tailwind. Two
+  interchangeable views: a table and a React-Flow node graph,
+  toggled per-tab and persisted to localStorage. Inline edit on
+  name / TAP IP / lan_subnets, optimistic updates with rollback,
+  admit / deny / kick / push-routes actions, live throughput
+  sparklines.
+* **Per-session throughput counters** (`AtomicU64` in `SessionTask`)
+  feed a 1 Hz sampler that broadcasts `metrics.tick` events. WS
+  events also drive query invalidation so the WebUI refreshes
+  without polling — the timed safety-net poll is at 30 s.
+* **Single-binary deploy**: `rust-embed` bakes `web/dist/` into
+  `bifrost-server`. Same port serves the API, the WS, and the SPA;
+  deep links fall back to `index.html`; hashed assets get
+  `Cache-Control: immutable`.
+* **156 tests passing**, clippy-clean with `-D warnings`.
 
 ### Roadmap
 
 | Phase | Item | Notes |
 |---|---|---|
-| 1.2 | Per-session throughput + sparkline | `AtomicU64` byte counters in `SessionTask`; 1 Hz `metrics.tick` over WS; mini-graphs in the device table |
-| 1.3 | Write side: `PATCH device`, admit toggle, in-place edit, `POST routes/push` | HTTP endpoints + the React mutations behind them |
-| 1.4 | Graph view (React Flow), interchangeable with table view | Self-contained editor with optimistic updates |
-| 1.5 | Embed `web/dist/` into `bifrost-server` | Single-binary deploy via `rust-embed` + SPA fallback |
 | 2.x | Multi-network: `HubManager`, per-net `HubHandle`, network CRUD | Currently the URL paths are forward-compatible; the actor split is the actual work |
 | —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (1.2 lays the groundwork) |
