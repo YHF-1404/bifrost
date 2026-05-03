@@ -65,6 +65,14 @@ export function NetworkDetail() {
 
   // ── Mutations ─────────────────────────────────────────────────────────
 
+  // True when a `lan_subnets` PATCH has succeeded but the user hasn't
+  // hit "Push routes" yet. The server stores the new subnets in its
+  // approved_clients table immediately, but peers don't see the
+  // derived routes until push. Reset on a successful push. Dropped
+  // on full page reload — there's no server-side notion of
+  // "pushed vs unpushed", so a per-tab flag is the most we can know.
+  const [routesUnpushed, setRoutesUnpushed] = useState(false);
+
   const updateDevice = useMutation({
     mutationFn: ({ cid, body }: { cid: string; body: DeviceUpdateBody }) =>
       api.updateDevice(nid!, cid, body),
@@ -93,6 +101,17 @@ export function NetworkDetail() {
     onError: (err, _vars, ctx) => {
       if (ctx?.prev) qc.setQueryData(queryKey, ctx.prev);
       pushToast("error", `update failed: ${fmtErr(err)}`);
+    },
+    onSuccess: (_data, vars) => {
+      // Subnet edits don't reach peers until pushed. Surface that
+      // explicitly so the user doesn't wonder why nothing changed.
+      if (vars.body.lan_subnets !== undefined) {
+        setRoutesUnpushed(true);
+        pushToast(
+          "info",
+          "LAN subnets updated — click 'Push routes' to apply on every peer.",
+        );
+      }
     },
     onSettled: () => qc.invalidateQueries({ queryKey }),
   });
@@ -124,6 +143,7 @@ export function NetworkDetail() {
         "success",
         `pushed ${r.routes.length} route(s) to ${r.count} client(s)`,
       );
+      setRoutesUnpushed(false);
     } catch (e) {
       pushToast("error", `push failed: ${fmtErr(e)}`);
     } finally {
@@ -168,8 +188,27 @@ export function NetworkDetail() {
           size="sm"
           onClick={pushRoutes}
           disabled={pushing || !q.data?.length}
+          // When there are unpushed changes, switch to an amber color
+          // and add a soft pulse so the user's eye is drawn here right
+          // after they edit a LAN subnet. The toast already told them
+          // what to do — this keeps the affordance visible after the
+          // toast fades.
+          className={
+            routesUnpushed
+              ? "animate-pulse bg-amber-500 text-white ring-2 ring-amber-400 hover:bg-amber-600"
+              : undefined
+          }
+          title={
+            routesUnpushed
+              ? "LAN subnets changed — click to push to all peers"
+              : "Re-derive routes from LAN subnets and push to all peers"
+          }
         >
-          {pushing ? "pushing…" : "Push routes"}
+          {pushing
+            ? "pushing…"
+            : routesUnpushed
+              ? "Push routes •"
+              : "Push routes"}
         </Button>
       </div>
     </div>

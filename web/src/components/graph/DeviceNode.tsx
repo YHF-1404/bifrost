@@ -93,7 +93,9 @@ export function DeviceNode({ data }: Props) {
       <InlineEdit
         value={d.lan_subnets.join(", ")}
         placeholder="LAN subnets"
-        examplePlaceholder="e.g. 192.168.1.0/24, 10.0.0.0/16"
+        // The card is only ~224 px wide; a longer example gets clipped
+        // mid-string. One CIDR is enough to convey the format.
+        examplePlaceholder="e.g. 192.168.1.0/24"
         className="text-xs"
         inputClassName="w-full font-mono text-xs"
         display={(v) =>

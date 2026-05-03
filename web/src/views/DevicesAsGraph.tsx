@@ -34,7 +34,7 @@ import {
   useEdgesState,
   useNodesState,
 } from "@xyflow/react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
 
 import { DeviceNode, type DeviceNodeData } from "@/components/graph/DeviceNode";
@@ -46,7 +46,12 @@ import {
   deviceRingPositions,
 } from "@/components/graph/graphLayout";
 import { api } from "@/lib/api";
+import { cn } from "@/lib/cn";
 import type { DeviceViewProps } from "./NetworkDetail";
+
+/** Layout-save state surfaced as a chip in the corner of the canvas
+ *  so the user knows their drag was persisted. */
+type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 const nodeTypes = {
   server: ServerNode,
@@ -227,19 +232,56 @@ export function DevicesAsGraph(props: DeviceViewProps) {
   // Debounce PUTs so flicking a node across the canvas doesn't fire
   // one request per pixel.
   const putTimerRef = useRef<number | null>(null);
+  const savedFadeTimerRef = useRef<number | null>(null);
+
+  // Surface the save state to the user so a drag-and-release feels
+  // like a deliberate commit, not an act of faith. State machine:
+  //   idle → (drag end + debounce) → saving
+  //   saving → (PUT 200) → saved → (after 1.5 s) → idle
+  //   saving → (PUT err) → error  (sticks until next attempt)
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+
   const schedulePutLayout = useCallback(() => {
     if (putTimerRef.current !== null) {
       window.clearTimeout(putTimerRef.current);
     }
+    // The instant the user releases a drag, switch to "saving" so the
+    // chip appears even before the debounce fires. The debounce is
+    // there to coalesce rapid drags, not to hide work from the user.
+    setSaveStatus("saving");
+    if (savedFadeTimerRef.current !== null) {
+      window.clearTimeout(savedFadeTimerRef.current);
+      savedFadeTimerRef.current = null;
+    }
     putTimerRef.current = window.setTimeout(() => {
       putTimerRef.current = null;
-      // Fire-and-forget. PUT failures aren't user-visible — the next
-      // successful PUT overwrites them. localStorage is the safety net.
-      void api
+      api
         .putLayout(networkId, { positions: positionsRef.current })
-        .catch(() => {});
+        .then(() => {
+          setSaveStatus("saved");
+          savedFadeTimerRef.current = window.setTimeout(() => {
+            savedFadeTimerRef.current = null;
+            setSaveStatus("idle");
+          }, 1500);
+        })
+        .catch(() => {
+          // localStorage is the safety net; the user can re-drag to
+          // retry. Sticky "error" badge so they notice.
+          setSaveStatus("error");
+        });
     }, LAYOUT_PUT_DEBOUNCE_MS);
   }, [networkId]);
+
+  // Tear down timers on unmount so we don't fire PUTs against a stale
+  // network id after navigation.
+  useEffect(
+    () => () => {
+      if (putTimerRef.current !== null) window.clearTimeout(putTimerRef.current);
+      if (savedFadeTimerRef.current !== null)
+        window.clearTimeout(savedFadeTimerRef.current);
+    },
+    [],
+  );
 
   // Wrap onNodesChange so we can persist positions whenever the user
   // releases a drag. React Flow emits `position` changes both during
@@ -322,6 +364,7 @@ export function DevicesAsGraph(props: DeviceViewProps) {
     // 100% can finally resolve. Without this, the canvas collapses to
     // 0px tall and the page looks blank.
     <div className="relative min-h-0 w-full flex-1 rounded-lg border border-border">
+      <SaveStatusChip status={saveStatus} />
       <div className="absolute inset-0">
         <ReactFlow
           nodes={nodes}
@@ -347,6 +390,55 @@ export function DevicesAsGraph(props: DeviceViewProps) {
           />
         </ReactFlow>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Floating chip in the canvas's top-right corner that tells the user
+ * what's happening to their last drag. Stays out of the way when idle
+ * (renders nothing); appears for "saving" / "saved" / "error".
+ *
+ * Sits *above* the inner `absolute inset-0` ReactFlow wrapper via
+ * `z-10`. We don't pin it inside ReactFlow's `<Panel>` because Panel
+ * renders inside the viewport-transform tree — it would scale and pan
+ * with the canvas, which is the opposite of what we want for a
+ * chrome-style indicator.
+ */
+function SaveStatusChip({ status }: { status: SaveStatus }) {
+  if (status === "idle") return null;
+
+  const label =
+    status === "saving"
+      ? "Saving layout…"
+      : status === "saved"
+        ? "Layout saved"
+        : "Save failed — try dragging again";
+
+  const icon = status === "saving" ? "◌" : status === "saved" ? "✓" : "✕";
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className={cn(
+        "pointer-events-none absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-full border bg-background/90 px-2.5 py-1 text-xs shadow-sm backdrop-blur",
+        status === "saving" && "border-border text-muted-foreground",
+        status === "saved" && "border-emerald-300 text-emerald-700",
+        status === "error" && "border-destructive text-destructive",
+      )}
+    >
+      <span
+        aria-hidden
+        className={cn(
+          "inline-block",
+          status === "saving" && "animate-spin",
+          status === "saved" && "font-bold",
+        )}
+      >
+        {icon}
+      </span>
+      <span>{label}</span>
     </div>
   );
 }

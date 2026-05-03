@@ -81,7 +81,7 @@ export function DevicesAsTable({ devices, onUpdate }: DeviceViewProps) {
                     <InlineEdit
                       value={d.lan_subnets.join(", ")}
                       placeholder="comma-separated CIDRs"
-                      examplePlaceholder="e.g. 192.168.1.0/24, 10.0.0.0/16"
+                      examplePlaceholder="e.g. 192.168.1.0/24"
                       inputClassName="w-64 font-mono"
                       display={(v) =>
                         v === "" ? (
