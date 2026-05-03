@@ -17,18 +17,21 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::{Bridge, Platform};
+use bifrost_proto::admin::DeviceEntry;
 use bifrost_proto::{Frame, RouteEntry as WireRoute};
 use ipnet::IpNet;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::config::{ApprovedClient, NetRecord, ServerConfig, WireRoute as CfgRoute};
+use crate::config::{ApprovedClient, NetRecord, ServerConfig};
 use crate::ids::{ConnId, IdAllocator, SessionId};
+use crate::routes::{derive_routes_for_network, filter_for_peer};
 use crate::session::{DeathReason, SessionCmd, SessionEvt, SessionTask};
 
 // ─── Public types ─────────────────────────────────────────────────────────
@@ -43,13 +46,14 @@ pub struct ConnLink {
     pub bind_tx: mpsc::Sender<Option<mpsc::Sender<SessionCmd>>>,
 }
 
-/// Snapshot of hub state for `list`-style introspection.
+/// Snapshot of hub state for `list`-style introspection. As of v0.1
+/// the snapshot no longer carries a global routes table — routes are
+/// derived per-network on demand via `device_push`.
 #[derive(Debug, Clone)]
 pub struct HubSnapshot {
     pub networks: Vec<NetRecord>,
     pub sessions: Vec<SessionInfo>,
     pub pending: Vec<PendingInfo>,
-    pub routes: Vec<CfgRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,18 +74,42 @@ pub struct PendingInfo {
     pub conn: ConnId,
 }
 
-/// Outcome of a [`HubHandle::set_client_ip`] call.
+/// Field-level update bag for [`HubHandle::device_set`].
+///
+/// Every field is `Option<_>`: `None` means "leave unchanged", `Some`
+/// means "replace with this value". An empty string in `tap_ip` clears
+/// the IP; an empty `Vec` in `lan_subnets` clears the list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceUpdate {
+    pub name: Option<String>,
+    pub admitted: Option<bool>,
+    pub tap_ip: Option<String>,
+    pub lan_subnets: Option<Vec<String>>,
+}
+
+/// Outcome of a [`HubHandle::device_set`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SetClientIpResult {
-    /// IP was updated in config; `live` indicates whether it was also
-    /// pushed to a currently-bound conn (false if the client is offline).
-    Ok { client_uuid: Uuid, live: bool },
-    /// No approved-clients entry matched the given UUID prefix.
+pub enum DeviceSetResult {
+    /// Update applied; full updated record returned.
+    Ok(DeviceEntry),
+    /// No approved client matches `(client_uuid, net_uuid)`. The
+    /// hub creates the row only when at least one of `admitted=true`
+    /// or `tap_ip=Some(non-empty)` is provided; otherwise this is
+    /// returned.
     NotFound,
-    /// More than one entry matched — caller must disambiguate.
-    Ambiguous(Vec<Uuid>),
-    /// The provided string was not a valid IP or CIDR.
+    /// `tap_ip` is syntactically invalid.
     InvalidIp,
+    /// `tap_ip` collides with another device in the same network.
+    Conflict { msg: String },
+}
+
+/// Outcome of a [`HubHandle::device_push`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePushResult {
+    /// Routes that were derived and applied locally / sent to peers.
+    pub routes: Vec<WireRoute>,
+    /// Number of currently-bound peers that received the push.
+    pub count: u64,
 }
 
 /// Commands accepted by the hub.
@@ -122,24 +150,23 @@ pub enum HubCmd {
     List {
         ack: oneshot::Sender<HubSnapshot>,
     },
-    SetClientIp {
-        prefix: String,
-        ip: String,
-        ack: oneshot::Sender<SetClientIpResult>,
+    /// List all devices, optionally filtered by network.
+    DeviceList {
+        net_uuid: Option<Uuid>,
+        ack: oneshot::Sender<Vec<DeviceEntry>>,
     },
-    RouteAdd {
-        dst: String,
-        via: String,
-        ack: oneshot::Sender<Result<(), String>>,
+    /// Mutate one approved-client row. See [`DeviceUpdate`].
+    DeviceSet {
+        client_uuid: Uuid,
+        net_uuid: Uuid,
+        update: DeviceUpdate,
+        ack: oneshot::Sender<DeviceSetResult>,
     },
-    RouteDel {
-        dst: String,
-        ack: oneshot::Sender<bool>,
-    },
-    /// Push the current route table to every bound conn. Returns the
-    /// number of clients reached.
-    RoutePush {
-        ack: oneshot::Sender<usize>,
+    /// Re-derive routes for `net_uuid`, install them locally on the
+    /// bridge, and push to every bound conn in that network.
+    DevicePush {
+        net_uuid: Uuid,
+        ack: oneshot::Sender<DevicePushResult>,
     },
     BroadcastText {
         msg: String,
@@ -234,64 +261,64 @@ impl HubHandle {
         rx.await.ok()
     }
 
-    /// Set the persisted TAP IP for a client matched by UUID prefix.
-    ///
-    /// If the client is currently bound to a conn, also pushes a
-    /// `Frame::SetIp` so the new address takes effect immediately.
-    pub async fn set_client_ip(&self, prefix: String, ip: String) -> SetClientIpResult {
+    /// List devices, optionally filtered by network.
+    pub async fn device_list(&self, net_uuid: Option<Uuid>) -> Vec<DeviceEntry> {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(HubCmd::SetClientIp {
-                prefix,
-                ip,
+            .send(HubCmd::DeviceList { net_uuid, ack: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Mutate one approved-client row. The row is identified by
+    /// `(client_uuid, net_uuid)` — the WebUI knows both because every
+    /// device URL is path-scoped under a network. See [`DeviceUpdate`].
+    pub async fn device_set(
+        &self,
+        client_uuid: Uuid,
+        net_uuid: Uuid,
+        update: DeviceUpdate,
+    ) -> DeviceSetResult {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(HubCmd::DeviceSet {
+                client_uuid,
+                net_uuid,
+                update,
                 ack: tx,
             })
             .await
             .is_err()
         {
-            return SetClientIpResult::NotFound;
+            return DeviceSetResult::NotFound;
         }
-        rx.await.unwrap_or(SetClientIpResult::NotFound)
+        rx.await.unwrap_or(DeviceSetResult::NotFound)
     }
 
-    pub async fn route_add(&self, dst: String, via: String) -> Result<(), String> {
+    /// Re-derive and push routes for one network.
+    pub async fn device_push(&self, net_uuid: Uuid) -> DevicePushResult {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(HubCmd::RouteAdd { dst, via, ack: tx })
+            .send(HubCmd::DevicePush { net_uuid, ack: tx })
             .await
             .is_err()
         {
-            return Err("hub gone".into());
+            return DevicePushResult {
+                routes: Vec::new(),
+                count: 0,
+            };
         }
-        rx.await.unwrap_or_else(|_| Err("hub dropped reply".into()))
-    }
-
-    pub async fn route_del(&self, dst: String) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(HubCmd::RouteDel { dst, ack: tx })
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        rx.await.unwrap_or(false)
-    }
-
-    pub async fn route_push(&self) -> usize {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(HubCmd::RoutePush { ack: tx })
-            .await
-            .is_err()
-        {
-            return 0;
-        }
-        rx.await.unwrap_or(0)
+        rx.await.unwrap_or(DevicePushResult {
+            routes: Vec::new(),
+            count: 0,
+        })
     }
 
     pub async fn broadcast_text(&self, msg: String) -> usize {
@@ -422,18 +449,31 @@ impl Hub {
         }
     }
 
-    /// Replay the configured route table into the host's kernel
-    /// routing table via the bridge. Without this, hosts behind a
-    /// client (e.g. a LAN reachable through `via 10.0.0.2`) cannot be
-    /// reached *from* the server side: the kernel has no idea those
-    /// destinations live behind the bridge.
+    /// Re-install the host's kernel routes from every network's
+    /// derived table.
     ///
-    /// Bad rows are dropped silently — `RouteEntry::parse` enforces
-    /// validity at `route add` time, so this is just defensive.
+    /// Without this, hosts behind a client (e.g. a LAN reachable
+    /// through `via 10.0.0.2`) cannot be reached *from* the server
+    /// side: the kernel has no idea those destinations live behind
+    /// the bridge. We rebuild the full table from
+    /// [`derive_routes_for_network`] and shove it through
+    /// `Bridge::apply_routes`, which uses a flush-and-reapply strategy.
+    ///
+    /// Failures are logged and swallowed — daemon startup must not
+    /// abort just because rtnetlink hiccupped.
     async fn sync_local_routes(&self) {
-        let parsed: Vec<bifrost_net::RouteEntry> = self
-            .cfg
-            .routes
+        let mut all = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for net in &self.cfg.networks {
+            for r in derive_routes_for_network(&self.cfg, net.uuid) {
+                if !seen.insert(r.dst.clone()) {
+                    // Cross-network dst collision; skip the later one.
+                    continue;
+                }
+                all.push(r);
+            }
+        }
+        let parsed: Vec<bifrost_net::RouteEntry> = all
             .iter()
             .filter_map(|r| bifrost_net::RouteEntry::parse(&r.dst, &r.via).ok())
             .collect();
@@ -488,12 +528,14 @@ impl Hub {
             HubCmd::Approve { sid, ack } => self.handle_approve(sid, ack).await,
             HubCmd::Deny { sid, ack } => self.handle_deny(sid, ack).await,
             HubCmd::List { ack } => self.handle_list(ack),
-            HubCmd::SetClientIp { prefix, ip, ack } => {
-                self.handle_set_client_ip(prefix, ip, ack).await
-            }
-            HubCmd::RouteAdd { dst, via, ack } => self.handle_route_add(dst, via, ack).await,
-            HubCmd::RouteDel { dst, ack } => self.handle_route_del(dst, ack).await,
-            HubCmd::RoutePush { ack } => self.handle_route_push(ack).await,
+            HubCmd::DeviceList { net_uuid, ack } => self.handle_device_list(net_uuid, ack),
+            HubCmd::DeviceSet {
+                client_uuid,
+                net_uuid,
+                update,
+                ack,
+            } => self.handle_device_set(client_uuid, net_uuid, update, ack).await,
+            HubCmd::DevicePush { net_uuid, ack } => self.handle_device_push(net_uuid, ack).await,
             HubCmd::BroadcastText { msg, ack } => self.handle_broadcast_text(msg, ack).await,
             HubCmd::BroadcastFile { name, data, ack } => {
                 self.handle_broadcast_file(name, data, ack).await
@@ -607,7 +649,8 @@ impl Hub {
                     ip: tap_ip.clone(),
                 })
                 .await;
-            self.send_routes(&frame_tx, tap_ip.as_deref()).await;
+            self.send_routes(&frame_tx, net_uuid, tap_ip.as_deref())
+                .await;
             return;
         }
 
@@ -729,6 +772,8 @@ impl Hub {
                 client_uuid,
                 net_uuid,
                 tap_ip: String::new(),
+                display_name: String::new(),
+                lan_subnets: Vec::new(),
             });
             self.persist().await;
         }
@@ -739,32 +784,28 @@ impl Hub {
                 ip: tap_ip_str.clone(),
             })
             .await;
-        self.send_routes(&frame_tx, tap_ip_str.as_deref()).await;
+        self.send_routes(&frame_tx, net_uuid, tap_ip_str.as_deref())
+            .await;
 
         info!(?sid, ?conn, %client_uuid, tap = %tap_name, "session joined");
     }
 
-    /// Push the configured route table to a freshly-bound conn, omitting
-    /// any route whose `via` equals the conn's own TAP IP (would loop).
-    async fn send_routes(&self, frame_tx: &mpsc::Sender<Frame>, tap_ip: Option<&str>) {
-        if self.cfg.routes.is_empty() {
+    /// Push the derived route table for `net_uuid` to a freshly-bound
+    /// conn, omitting any route whose `via` equals the conn's own TAP
+    /// IP (would loop).
+    async fn send_routes(
+        &self,
+        frame_tx: &mpsc::Sender<Frame>,
+        net_uuid: Uuid,
+        tap_ip: Option<&str>,
+    ) {
+        let routes = derive_routes_for_network(&self.cfg, net_uuid);
+        if routes.is_empty() {
             return;
         }
-        let host = tap_ip
-            .and_then(|s| s.split('/').next())
-            .filter(|s| !s.is_empty());
-        let routes: Vec<WireRoute> = self
-            .cfg
-            .routes
-            .iter()
-            .filter(|r| host.is_none_or(|h| r.via != h))
-            .map(|r| WireRoute {
-                dst: r.dst.clone(),
-                via: r.via.clone(),
-            })
-            .collect();
-        if !routes.is_empty() {
-            let _ = frame_tx.send(Frame::SetRoutes(routes)).await;
+        let filtered = filter_for_peer(&routes, tap_ip);
+        if !filtered.is_empty() {
+            let _ = frame_tx.send(Frame::SetRoutes(filtered)).await;
         }
     }
 
@@ -781,64 +822,183 @@ impl Hub {
         let _ = ack.send(uuid);
     }
 
-    async fn handle_set_client_ip(
-        &mut self,
-        prefix: String,
-        ip: String,
-        ack: oneshot::Sender<SetClientIpResult>,
+    fn handle_device_list(
+        &self,
+        net_uuid: Option<Uuid>,
+        ack: oneshot::Sender<Vec<DeviceEntry>>,
     ) {
-        // Reject syntactically-invalid IP/CIDR — empty string allowed (= clear).
-        if !ip.is_empty()
-            && ip.parse::<IpNet>().is_err()
-            && ip.parse::<std::net::IpAddr>().is_err()
-        {
-            let _ = ack.send(SetClientIpResult::InvalidIp);
-            return;
+        let _ = ack.send(self.collect_devices(net_uuid));
+    }
+
+    /// Build the combined view of every (client, net) — the union of
+    /// persisted `approved_clients` rows and currently-pending sessions.
+    fn collect_devices(&self, filter_net: Option<Uuid>) -> Vec<DeviceEntry> {
+        let mut out = Vec::new();
+
+        // Approved (persistent) rows. May be online or offline.
+        for ac in self.cfg.approved_clients.iter() {
+            if let Some(want) = filter_net {
+                if ac.net_uuid != want {
+                    continue;
+                }
+            }
+            let live = self.sessions.get(&(ac.client_uuid, ac.net_uuid));
+            out.push(DeviceEntry {
+                client_uuid: ac.client_uuid,
+                net_uuid: ac.net_uuid,
+                display_name: ac.display_name.clone(),
+                admitted: true,
+                tap_ip: if ac.tap_ip.is_empty() {
+                    None
+                } else {
+                    Some(ac.tap_ip.clone())
+                },
+                lan_subnets: ac.lan_subnets.clone(),
+                online: live.is_some(),
+                sid: live.map(|s| s.sid.0),
+                tap_name: live.map(|s| s.tap_name.clone()),
+            });
         }
 
-        let matches: Vec<usize> = self
+        // Pending sessions — clients connected but not yet admitted.
+        for p in self.pending.values() {
+            if let Some(want) = filter_net {
+                if p.net_uuid != want {
+                    continue;
+                }
+            }
+            out.push(DeviceEntry {
+                client_uuid: p.client_uuid,
+                net_uuid: p.net_uuid,
+                display_name: String::new(),
+                admitted: false,
+                tap_ip: None,
+                lan_subnets: Vec::new(),
+                online: true,
+                sid: Some(p.sid.0),
+                tap_name: None,
+            });
+        }
+
+        out
+    }
+
+    async fn handle_device_set(
+        &mut self,
+        client_uuid: Uuid,
+        net_uuid: Uuid,
+        update: DeviceUpdate,
+        ack: oneshot::Sender<DeviceSetResult>,
+    ) {
+        // Validate `tap_ip` early so we don't half-mutate state.
+        if let Some(ip) = update.tap_ip.as_deref() {
+            if !ip.is_empty()
+                && ip.parse::<IpNet>().is_err()
+                && ip.parse::<std::net::IpAddr>().is_err()
+            {
+                let _ = ack.send(DeviceSetResult::InvalidIp);
+                return;
+            }
+            // Conflict check: nobody else in the same network has it.
+            if !ip.is_empty() {
+                if let Some(other) = self.cfg.approved_clients.iter().find(|a| {
+                    a.net_uuid == net_uuid && a.client_uuid != client_uuid && a.tap_ip == *ip
+                }) {
+                    let _ = ack.send(DeviceSetResult::Conflict {
+                        msg: format!(
+                            "tap_ip {} already used by {}",
+                            ip,
+                            short_uuid(&other.client_uuid)
+                        ),
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Validate every lan_subnet syntactically before persisting.
+        if let Some(subs) = update.lan_subnets.as_deref() {
+            for s in subs {
+                if IpNet::from_str(s).is_err() {
+                    let _ = ack.send(DeviceSetResult::InvalidIp);
+                    return;
+                }
+            }
+        }
+
+        // Locate (or create, on `admitted = Some(true)`) the row.
+        let idx = self
             .cfg
             .approved_clients
             .iter()
-            .enumerate()
-            .filter(|(_, a)| a.client_uuid.simple().to_string().starts_with(&prefix))
-            .map(|(i, _)| i)
-            .collect();
-        match matches.len() {
-            0 => {
-                let _ = ack.send(SetClientIpResult::NotFound);
-                return;
-            }
-            1 => {}
-            _ => {
-                let uuids = matches
-                    .iter()
-                    .map(|i| self.cfg.approved_clients[*i].client_uuid)
-                    .collect();
-                let _ = ack.send(SetClientIpResult::Ambiguous(uuids));
-                return;
-            }
-        }
-        let idx = matches[0];
-        let client_uuid = self.cfg.approved_clients[idx].client_uuid;
-        let net_uuid = self.cfg.approved_clients[idx].net_uuid;
-        self.cfg.approved_clients[idx].tap_ip = ip.clone();
-        self.persist().await;
+            .position(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid);
 
-        // Try to push to a live, bound conn.
-        let live = if let Some(s) = self.sessions.get_mut(&(client_uuid, net_uuid)) {
-            s.tap_ip = if ip.is_empty() { None } else { Some(ip.clone()) };
-            if let Some(conn_id) = s.bound_conn {
-                if let Some(c) = self.conns.get(&conn_id) {
-                    let payload = if ip.is_empty() { None } else { Some(ip) };
-                    c.link
-                        .frame_tx
-                        .send(Frame::SetIp { ip: payload })
-                        .await
-                        .is_ok()
-                } else {
-                    false
+        let want_admit = update.admitted.unwrap_or(false);
+        let idx = match idx {
+            Some(i) => i,
+            None => {
+                if !want_admit {
+                    let _ = ack.send(DeviceSetResult::NotFound);
+                    return;
                 }
+                self.cfg.approved_clients.push(ApprovedClient {
+                    client_uuid,
+                    net_uuid,
+                    tap_ip: String::new(),
+                    display_name: String::new(),
+                    lan_subnets: Vec::new(),
+                });
+                self.cfg.approved_clients.len() - 1
+            }
+        };
+
+        // `admitted = Some(false)` removes the persistent row. The
+        // running session (if any) keeps going until the next disconnect;
+        // any subsequent re-join will land in pending again.
+        if let Some(false) = update.admitted {
+            self.cfg.approved_clients.remove(idx);
+            self.persist().await;
+            // Routes may have changed (this device's lan_subnets are gone).
+            self.sync_local_routes().await;
+            let _ = ack.send(DeviceSetResult::Ok(DeviceEntry {
+                client_uuid,
+                net_uuid,
+                display_name: String::new(),
+                admitted: false,
+                tap_ip: None,
+                lan_subnets: Vec::new(),
+                online: self.sessions.contains_key(&(client_uuid, net_uuid)),
+                sid: self
+                    .sessions
+                    .get(&(client_uuid, net_uuid))
+                    .map(|s| s.sid.0),
+                tap_name: self
+                    .sessions
+                    .get(&(client_uuid, net_uuid))
+                    .map(|s| s.tap_name.clone()),
+            }));
+            return;
+        }
+
+        // Apply field updates.
+        let row = &mut self.cfg.approved_clients[idx];
+        if let Some(name) = update.name {
+            row.display_name = name;
+        }
+        let ip_changed = if let Some(ip) = update.tap_ip {
+            if row.tap_ip != ip {
+                row.tap_ip = ip;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let lan_changed = if let Some(subs) = update.lan_subnets {
+            if row.lan_subnets != subs {
+                row.lan_subnets = subs;
+                true
             } else {
                 false
             }
@@ -846,62 +1006,93 @@ impl Hub {
             false
         };
 
-        let _ = ack.send(SetClientIpResult::Ok { client_uuid, live });
-    }
+        // Capture cloned scalars for use after we drop the &mut row.
+        let display_name = row.display_name.clone();
+        let tap_ip_str = row.tap_ip.clone();
+        let lan_subnets = row.lan_subnets.clone();
 
-    async fn handle_route_add(
-        &mut self,
-        dst: String,
-        via: String,
-        ack: oneshot::Sender<Result<(), String>>,
-    ) {
-        if let Err(e) = bifrost_net::RouteEntry::parse(&dst, &via) {
-            let _ = ack.send(Err(e.to_string()));
-            return;
-        }
-        if self.cfg.routes.iter().any(|r| r.dst == dst) {
-            let _ = ack.send(Err(format!("route to {dst} already exists")));
-            return;
-        }
-        self.cfg.routes.push(CfgRoute {
-            dst: dst.clone(),
-            via: via.clone(),
-        });
         self.persist().await;
-        self.sync_local_routes().await;
-        info!(%dst, %via, "route added");
-        let _ = ack.send(Ok(()));
-    }
 
-    async fn handle_route_del(&mut self, dst: String, ack: oneshot::Sender<bool>) {
-        let before = self.cfg.routes.len();
-        self.cfg.routes.retain(|r| r.dst != dst);
-        let removed = self.cfg.routes.len() < before;
-        if removed {
-            self.persist().await;
+        // Live SET_IP push. Routes are NOT auto-pushed on lan_subnets
+        // change — caller must `device_push` to commit.
+        if ip_changed {
+            if let Some(s) = self.sessions.get_mut(&(client_uuid, net_uuid)) {
+                s.tap_ip = if tap_ip_str.is_empty() {
+                    None
+                } else {
+                    Some(tap_ip_str.clone())
+                };
+                if let Some(conn_id) = s.bound_conn {
+                    if let Some(c) = self.conns.get(&conn_id) {
+                        let payload = if tap_ip_str.is_empty() {
+                            None
+                        } else {
+                            Some(tap_ip_str.clone())
+                        };
+                        let _ = c.link.frame_tx.send(Frame::SetIp { ip: payload }).await;
+                    }
+                }
+            }
+            // ip change affects the bridge's view of which `via`s are
+            // valid for this network — re-sync server-side routes.
             self.sync_local_routes().await;
-            info!(%dst, "route removed");
         }
-        let _ = ack.send(removed);
+        let _ = lan_changed; // currently no immediate side effect
+
+        let live = self.sessions.get(&(client_uuid, net_uuid));
+        let _ = ack.send(DeviceSetResult::Ok(DeviceEntry {
+            client_uuid,
+            net_uuid,
+            display_name,
+            admitted: true,
+            tap_ip: if tap_ip_str.is_empty() {
+                None
+            } else {
+                Some(tap_ip_str)
+            },
+            lan_subnets,
+            online: live.is_some(),
+            sid: live.map(|s| s.sid.0),
+            tap_name: live.map(|s| s.tap_name.clone()),
+        }));
     }
 
-    async fn handle_route_push(&mut self, ack: oneshot::Sender<usize>) {
-        // Snapshot the (conn_id, tap_ip) pairs so we don't hold a
-        // borrow on `self.sessions` across the awaits below.
+    async fn handle_device_push(
+        &mut self,
+        net_uuid: Uuid,
+        ack: oneshot::Sender<DevicePushResult>,
+    ) {
+        let routes = derive_routes_for_network(&self.cfg, net_uuid);
+
+        // Apply the full host-wide set on the bridge (covers all networks
+        // in case multiple coexist later; in v1 there's at most one).
+        self.sync_local_routes().await;
+
+        // Push to bound conns *in this network*, filtering self-loops.
         let bound: Vec<(ConnId, Option<String>)> = self
             .sessions
             .values()
+            .filter(|s| s.net_uuid == net_uuid)
             .filter_map(|s| s.bound_conn.map(|c| (c, s.tap_ip.clone())))
             .collect();
-        let mut count = 0;
+        let mut count: u64 = 0;
         for (conn_id, tap_ip) in bound {
-            let frame_tx = self.conns.get(&conn_id).map(|c| c.link.frame_tx.clone());
-            if let Some(tx) = frame_tx {
-                self.send_routes(&tx, tap_ip.as_deref()).await;
-                count += 1;
+            let filtered = filter_for_peer(&routes, tap_ip.as_deref());
+            if filtered.is_empty() {
+                continue;
+            }
+            if let Some(c) = self.conns.get(&conn_id) {
+                if c.link
+                    .frame_tx
+                    .send(Frame::SetRoutes(filtered))
+                    .await
+                    .is_ok()
+                {
+                    count += 1;
+                }
             }
         }
-        let _ = ack.send(count);
+        let _ = ack.send(DevicePushResult { routes, count });
     }
 
     async fn handle_broadcast_text(&self, msg: String, ack: oneshot::Sender<usize>) {
@@ -989,7 +1180,6 @@ impl Hub {
                     conn: p.conn,
                 })
                 .collect(),
-            routes: self.cfg.routes.clone(),
         };
         let _ = ack.send(snap);
     }
@@ -1045,4 +1235,8 @@ fn tap_name_from_uuid(client_uuid: &Uuid) -> String {
 
 fn strip_tap_prefix(name: &str) -> String {
     name.strip_prefix("tap").unwrap_or(name).to_string()
+}
+
+fn short_uuid(u: &Uuid) -> String {
+    u.simple().to_string()[..8].to_owned()
 }

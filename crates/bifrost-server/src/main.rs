@@ -17,7 +17,7 @@ use bifrost_core::config::ServerConfig;
 use bifrost_core::{Hub, HubHandle};
 use bifrost_net::Platform;
 use bifrost_proto::admin::ServerAdminReq;
-use bifrost_server::cli::{AdminCmd, Cli, Command, RouteAction};
+use bifrost_server::cli::{AdminCmd, Cli, Command, DeviceAction};
 use bifrost_server::dispatch::{dispatch, format_resp};
 use bifrost_server::repl::ReplCmd;
 use bifrost_server::{accept, admin, repl};
@@ -74,12 +74,22 @@ async fn admin_client(socket: PathBuf, cmd: AdminCmd) -> Result<()> {
         AdminCmd::Mknet { name } => ServerAdminReq::MakeNet { name },
         AdminCmd::Approve { sid } => ServerAdminReq::Approve { sid },
         AdminCmd::Deny { sid } => ServerAdminReq::Deny { sid },
-        AdminCmd::Setip { prefix, ip } => ServerAdminReq::SetIp { prefix, ip },
-        AdminCmd::Route { action } => match action {
-            RouteAction::Add { dst, via } => ServerAdminReq::RouteAdd { dst, via },
-            RouteAction::Del { dst } => ServerAdminReq::RouteDel { dst },
-            RouteAction::List => ServerAdminReq::List, // re-uses the snapshot path
-            RouteAction::Push => ServerAdminReq::RoutePush,
+        AdminCmd::Device { action } => match action {
+            DeviceAction::List { net_uuid } => ServerAdminReq::DeviceList { net_uuid },
+            DeviceAction::Push { net_uuid } => ServerAdminReq::DevicePush { net_uuid },
+            DeviceAction::Set {
+                client_uuid,
+                name,
+                admit,
+                ip,
+                lan,
+            } => ServerAdminReq::DeviceSet {
+                client_uuid,
+                name,
+                admitted: admit,
+                tap_ip: ip,
+                lan_subnets: lan,
+            },
         },
         AdminCmd::List => ServerAdminReq::List,
         AdminCmd::Send { msg } => ServerAdminReq::Send { msg },

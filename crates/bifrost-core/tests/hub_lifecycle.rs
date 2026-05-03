@@ -9,8 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig, WireRoute};
-use bifrost_core::{ConnId, ConnLink, Hub, HubHandle, SessionCmd, SessionId};
+use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
+use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubHandle, SessionCmd, SessionId};
 use bifrost_net::mock::{MockBridge, MockPlatform};
 use bifrost_net::{Bridge, Platform, Tap};
 use bifrost_proto::{Frame, PROTOCOL_VERSION};
@@ -39,6 +39,31 @@ fn build_cfg(disconnect_secs: u64) -> ServerConfig {
     let mut cfg = ServerConfig::default();
     cfg.bridge.disconnect_timeout = disconnect_secs;
     cfg
+}
+
+fn approved(client_uuid: Uuid, net_uuid: Uuid, tap_ip: &str) -> ApprovedClient {
+    ApprovedClient {
+        client_uuid,
+        net_uuid,
+        tap_ip: tap_ip.to_string(),
+        display_name: String::new(),
+        lan_subnets: Vec::new(),
+    }
+}
+
+fn approved_with_lan(
+    client_uuid: Uuid,
+    net_uuid: Uuid,
+    tap_ip: &str,
+    lan: &[&str],
+) -> ApprovedClient {
+    ApprovedClient {
+        client_uuid,
+        net_uuid,
+        tap_ip: tap_ip.to_string(),
+        display_name: String::new(),
+        lan_subnets: lan.iter().map(|s| s.to_string()).collect(),
+    }
 }
 
 async fn spawn(cfg: ServerConfig) -> Harness {
@@ -110,11 +135,8 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: "10.0.0.5/24".into(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "1.2.3.4:1").await;
@@ -278,11 +300,8 @@ async fn disconnect_unbinds_session_but_keeps_tap() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -312,11 +331,8 @@ async fn reconnect_reuses_session_no_new_tap() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: "10.0.0.7/24".into(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, "10.0.0.7/24"));
     let h = spawn(cfg).await;
 
     // First join.
@@ -358,11 +374,8 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
     let mut c1 = fake_conn(&h, "x1").await;
@@ -393,11 +406,8 @@ async fn disconnect_then_timeout_removes_session_and_tap() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -427,20 +437,20 @@ async fn routes_pushed_after_join_and_filter_self_via() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: "10.0.0.5/24".into(),
-    });
-    cfg.routes.push(WireRoute {
-        dst: "192.168.10.0/24".into(),
-        via: "10.0.0.7".into(),
-    });
-    cfg.routes.push(WireRoute {
-        // This one matches the client's own IP — must be filtered out.
-        dst: "192.168.20.0/24".into(),
-        via: "10.0.0.5".into(),
-    });
+    let other_client = Uuid::new_v4();
+    cfg.approved_clients.push(approved_with_lan(
+        client,
+        net,
+        "10.0.0.5/24",
+        // This route's via == joining client's own IP → must be filtered.
+        &["192.168.20.0/24"],
+    ));
+    cfg.approved_clients.push(approved_with_lan(
+        other_client,
+        net,
+        "10.0.0.7/24",
+        &["192.168.10.0/24"],
+    ));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -452,6 +462,7 @@ async fn routes_pushed_after_join_and_filter_self_via() {
         Frame::SetRoutes(rs) => {
             assert_eq!(rs.len(), 1, "self-via route must be filtered: {rs:?}");
             assert_eq!(rs[0].dst, "192.168.10.0/24");
+            assert_eq!(rs[0].via, "10.0.0.7");
         }
         other => panic!("expected SetRoutes, got {other:?}"),
     }
@@ -468,11 +479,8 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
+    cfg.approved_clients
+        .push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -491,10 +499,10 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
     assert!(tap.snapshot().await.destroyed, "tap must be destroyed");
 }
 
-// ── Newly-added REPL commands: setip / route / broadcast ─────────────────
+// ── Newly-added REPL commands: device_set / device_push / broadcast ──────
 
 #[tokio::test]
-async fn set_client_ip_pushes_to_live_session() {
+async fn device_set_ip_pushes_to_live_session() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -502,11 +510,7 @@ async fn set_client_ip_pushes_to_live_session() {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
+    cfg.approved_clients.push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -515,14 +519,22 @@ async fn set_client_ip_pushes_to_live_session() {
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
 
-    // Use the first 8 hex chars as the prefix.
-    let prefix = client.simple().to_string()[..8].to_string();
     let result = h
         .hub
-        .set_client_ip(prefix, "10.0.0.42/24".to_string())
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                tap_ip: Some("10.0.0.42/24".to_string()),
+                ..Default::default()
+            },
+        )
         .await;
     match result {
-        bifrost_core::SetClientIpResult::Ok { live, .. } => assert!(live, "must push to live conn"),
+        bifrost_core::DeviceSetResult::Ok(d) => {
+            assert_eq!(d.tap_ip.as_deref(), Some("10.0.0.42/24"));
+            assert!(d.online);
+        }
         other => panic!("expected Ok, got {other:?}"),
     }
 
@@ -534,146 +546,202 @@ async fn set_client_ip_pushes_to_live_session() {
 }
 
 #[tokio::test]
-async fn set_client_ip_offline_only_persists() {
-    let net = Uuid::new_v4();
-    let client = Uuid::new_v4();
-    let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
-    let h = spawn(cfg).await;
-
-    // No conn at all — pure offline update.
-    let prefix = client.simple().to_string()[..8].to_string();
-    let result = h
-        .hub
-        .set_client_ip(prefix, "10.0.0.99/24".to_string())
-        .await;
-    match result {
-        bifrost_core::SetClientIpResult::Ok { live, .. } => {
-            assert!(!live, "no live push when client is offline")
-        }
-        other => panic!("expected Ok, got {other:?}"),
-    }
-    h.hub.shutdown().await;
-}
-
-#[tokio::test]
-async fn set_client_ip_rejects_invalid_or_unknown() {
-    let net = Uuid::new_v4();
-    let client = Uuid::new_v4();
-    let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
-        net_uuid: net,
-        tap_ip: String::new(),
-    });
-    let h = spawn(cfg).await;
-
-    // Unknown prefix.
-    assert!(matches!(
-        h.hub
-            .set_client_ip("ffffffff".into(), "10.0.0.1".into())
-            .await,
-        bifrost_core::SetClientIpResult::NotFound
-    ));
-
-    // Invalid IP.
-    let prefix = client.simple().to_string()[..8].to_string();
-    assert!(matches!(
-        h.hub.set_client_ip(prefix, "not-an-ip".into()).await,
-        bifrost_core::SetClientIpResult::InvalidIp
-    ));
-
-    h.hub.shutdown().await;
-}
-
-#[tokio::test]
-async fn route_add_del_persist_to_disk() {
+async fn device_set_offline_only_persists_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("server.toml");
-    let cfg = build_cfg(60);
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients.push(approved(client, net, ""));
+    cfg.save(&cfg_path).await.unwrap();
+    let h = spawn_with_path(cfg, Some(cfg_path.clone())).await;
+
+    // No live conn — pure offline update of name + lan.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                name: Some("router".into()),
+                lan_subnets: Some(vec!["192.168.10.0/24".into(), "192.168.20.0/24".into()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
+
+    let on_disk = ServerConfig::load(&cfg_path).await.unwrap();
+    assert_eq!(on_disk.approved_clients.len(), 1);
+    assert_eq!(on_disk.approved_clients[0].display_name, "router");
+    assert_eq!(on_disk.approved_clients[0].lan_subnets.len(), 2);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn device_set_rejects_invalid_or_unknown() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients.push(approved(client, net, ""));
+    let h = spawn(cfg).await;
+
+    // Unknown (client, net) and not admitting → NotFound.
+    let result = h
+        .hub
+        .device_set(
+            Uuid::new_v4(),
+            net,
+            DeviceUpdate {
+                tap_ip: Some("10.0.0.1/24".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::NotFound));
+
+    // Invalid IP.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                tap_ip: Some("not-an-ip".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::InvalidIp));
+
+    // Invalid CIDR in lan_subnets.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                lan_subnets: Some(vec!["not-a-cidr".into()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::InvalidIp));
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn device_set_detects_tap_ip_conflict() {
+    let net = Uuid::new_v4();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients.push(approved(a, net, "10.0.0.2/24"));
+    cfg.approved_clients.push(approved(b, net, "10.0.0.3/24"));
+    let h = spawn(cfg).await;
+
+    // Try to set b's IP to a's IP.
+    let result = h
+        .hub
+        .device_set(
+            b,
+            net,
+            DeviceUpdate {
+                tap_ip: Some("10.0.0.2/24".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, bifrost_core::DeviceSetResult::Conflict { .. }),
+        "got {result:?}"
+    );
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn device_set_persists_lan_subnets_to_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("server.toml");
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients
+        .push(approved(client, net, "10.0.0.5/24"));
     cfg.save(&cfg_path).await.unwrap();
     let h = spawn_with_path(cfg, Some(cfg_path.clone())).await;
 
     h.hub
-        .route_add("192.168.10.0/24".into(), "10.0.0.1".into())
-        .await
-        .unwrap();
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                lan_subnets: Some(vec!["192.168.10.0/24".into(), "192.168.20.0/24".into()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    let on_disk = ServerConfig::load(&cfg_path).await.unwrap();
+    assert_eq!(on_disk.approved_clients[0].lan_subnets.len(), 2);
+
+    // Clear them.
     h.hub
-        .route_add("192.168.20.0/24".into(), "10.0.0.2".into())
-        .await
-        .unwrap();
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                lan_subnets: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .await;
     let on_disk = ServerConfig::load(&cfg_path).await.unwrap();
-    assert_eq!(on_disk.routes.len(), 2);
+    assert!(on_disk.approved_clients[0].lan_subnets.is_empty());
 
-    assert!(h.hub.route_del("192.168.10.0/24".into()).await);
-    let on_disk = ServerConfig::load(&cfg_path).await.unwrap();
-    assert_eq!(on_disk.routes.len(), 1);
-    assert_eq!(on_disk.routes[0].dst, "192.168.20.0/24");
-
-    // Deleting again returns false.
-    assert!(!h.hub.route_del("192.168.10.0/24".into()).await);
     h.hub.shutdown().await;
 }
 
 #[tokio::test]
-async fn route_add_validates_input() {
-    let h = spawn(build_cfg(60)).await;
-    let err = h
-        .hub
-        .route_add("not-a-cidr".into(), "10.0.0.1".into())
-        .await
-        .unwrap_err();
-    assert!(err.contains("CIDR"), "expected CIDR error, got {err}");
-
-    h.hub
-        .route_add("192.168.0.0/24".into(), "10.0.0.1".into())
-        .await
-        .unwrap();
-    let dup_err = h
-        .hub
-        .route_add("192.168.0.0/24".into(), "10.0.0.2".into())
-        .await
-        .unwrap_err();
-    assert!(dup_err.contains("already exists"));
-    h.hub.shutdown().await;
-}
-
-#[tokio::test]
-async fn route_push_pushes_to_each_bound_session() {
+async fn device_push_pushes_to_each_bound_session() {
     let net = Uuid::new_v4();
     let client_a = Uuid::new_v4();
     let client_b = Uuid::new_v4();
+    let other = Uuid::new_v4();
     let mut cfg = build_cfg(60);
     cfg.networks.push(NetRecord {
         name: "n".into(),
         uuid: net,
     });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client_a,
-        net_uuid: net,
-        tap_ip: "10.0.0.2/24".into(),
-    });
-    cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client_b,
-        net_uuid: net,
-        tap_ip: "10.0.0.3/24".into(),
-    });
-    cfg.routes.push(WireRoute {
-        dst: "192.168.10.0/24".into(),
-        via: "10.0.0.7".into(),
-    });
+    // Two live clients and one offline client whose lan_subnet drives
+    // the route table.
+    cfg.approved_clients
+        .push(approved(client_a, net, "10.0.0.2/24"));
+    cfg.approved_clients
+        .push(approved(client_b, net, "10.0.0.3/24"));
+    cfg.approved_clients.push(approved_with_lan(
+        other,
+        net,
+        "10.0.0.7/24",
+        &["192.168.10.0/24"],
+    ));
     let h = spawn(cfg).await;
 
     let mut a = fake_conn(&h, "x:1").await;
@@ -690,8 +758,9 @@ async fn route_push_pushes_to_each_bound_session() {
     let _ = recv(&mut b.frame_rx).await;
     let _ = recv_bind(&mut b.bind_rx).await;
 
-    let pushed = h.hub.route_push().await;
-    assert_eq!(pushed, 2);
+    let result = h.hub.device_push(net).await;
+    assert_eq!(result.count, 2);
+    assert_eq!(result.routes.len(), 1);
     match recv(&mut a.frame_rx).await {
         Frame::SetRoutes(rs) => assert_eq!(rs.len(), 1),
         other => panic!("expected SetRoutes on a, got {other:?}"),

@@ -31,13 +31,33 @@ pub enum ServerAdminReq {
     MakeNet { name: String },
     Approve { sid: u64 },
     Deny { sid: u64 },
-    SetIp { prefix: String, ip: String },
-    RouteAdd { dst: String, via: String },
-    RouteDel { dst: String },
-    RoutePush,
+    /// Mutate one or more fields of an approved client. `None` on a
+    /// field means "leave unchanged"; setting `tap_ip = Some("")` or
+    /// `lan_subnets = Some(vec![])` clears the field.
+    DeviceSet {
+        client_uuid: Uuid,
+        name: Option<String>,
+        admitted: Option<bool>,
+        tap_ip: Option<String>,
+        lan_subnets: Option<Vec<String>>,
+    },
+    /// Re-derive routes for a network and push to all currently joined
+    /// clients in it.
+    DevicePush {
+        net_uuid: Uuid,
+    },
+    /// List devices. `None` = all networks; `Some(uuid)` = filter.
+    DeviceList {
+        net_uuid: Option<Uuid>,
+    },
     List,
-    Send { msg: String },
-    SendFile { name: String, data: Vec<u8> },
+    Send {
+        msg: String,
+    },
+    SendFile {
+        name: String,
+        data: Vec<u8>,
+    },
     Shutdown,
 }
 
@@ -49,25 +69,37 @@ pub enum ServerAdminResp {
     NetCreated {
         uuid: Uuid,
     },
-    SetIpOk {
-        client_uuid: Uuid,
-        live: bool,
+    /// Result of a `DeviceSet` request — full updated record.
+    Device(DeviceEntry),
+    /// Result of a `DeviceList` request.
+    Devices(Vec<DeviceEntry>),
+    /// Result of a `DevicePush` request — the routes that were derived
+    /// and pushed, plus how many live clients received them.
+    Pushed {
+        count: u64,
+        routes: Vec<RouteRow>,
     },
-    SetIpAmbiguous(Vec<Uuid>),
-    SetIpInvalid,
     NotFound,
+    /// `DeviceSet`: bad CIDR/IP given.
+    InvalidIp,
+    /// `DeviceSet`: tap_ip collides with another device in the same net.
+    Conflict {
+        msg: String,
+    },
     Snapshot(SnapshotData),
     Error(String),
 }
 
 /// Wire-friendly mirror of `bifrost_core::HubSnapshot` — kept in proto
 /// to avoid an admin-side dep on `bifrost-core`.
+///
+/// As of v0.1 the snapshot no longer carries a global routes table;
+/// derived routes are queryable per-network via `DevicePush`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotData {
     pub networks: Vec<NetEntry>,
     pub sessions: Vec<SessionEntry>,
     pub pending: Vec<PendingEntry>,
-    pub routes: Vec<RouteRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +129,26 @@ pub struct PendingEntry {
 pub struct RouteRow {
     pub dst: String,
     pub via: String,
+}
+
+/// Combined view of an approved client — both persistent
+/// (`approved_clients` row) and runtime (current session) state. Used
+/// by `DeviceList` and `DeviceSet` responses, and by the WebUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub client_uuid: Uuid,
+    pub net_uuid: Uuid,
+    pub display_name: String,
+    pub admitted: bool,
+    pub tap_ip: Option<String>,
+    pub lan_subnets: Vec<String>,
+    /// True iff the hub currently has a live `SessionTask` joined for
+    /// `(client_uuid, net_uuid)`.
+    pub online: bool,
+    /// Current session id while online, else `None`.
+    pub sid: Option<u64>,
+    /// Kernel TAP name while online, else `None`.
+    pub tap_name: Option<String>,
 }
 
 // ── Client admin protocol ──────────────────────────────────────────────────
@@ -195,11 +247,41 @@ mod tests {
             }],
             sessions: vec![],
             pending: vec![],
-            routes: vec![RouteRow {
-                dst: "10.0.0.0/24".into(),
-                via: "10.0.0.1".into(),
-            }],
         });
+        write_admin(&mut a, &resp).await.unwrap();
+        let got: ServerAdminResp = read_admin(&mut b).await.unwrap();
+        assert_eq!(got, resp);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_device_set_request() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let req = ServerAdminReq::DeviceSet {
+            client_uuid: Uuid::new_v4(),
+            name: Some("router".into()),
+            admitted: Some(true),
+            tap_ip: Some("10.0.0.5/24".into()),
+            lan_subnets: Some(vec!["192.168.10.0/24".into()]),
+        };
+        write_admin(&mut a, &req).await.unwrap();
+        let got: ServerAdminReq = read_admin(&mut b).await.unwrap();
+        assert_eq!(got, req);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_devices_response() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let resp = ServerAdminResp::Devices(vec![DeviceEntry {
+            client_uuid: Uuid::new_v4(),
+            net_uuid: Uuid::new_v4(),
+            display_name: "router".into(),
+            admitted: true,
+            tap_ip: Some("10.0.0.5/24".into()),
+            lan_subnets: vec!["192.168.10.0/24".into()],
+            online: true,
+            sid: Some(7),
+            tap_name: Some("tape251a7ee".into()),
+        }]);
         write_admin(&mut a, &resp).await.unwrap();
         let got: ServerAdminResp = read_admin(&mut b).await.unwrap();
         assert_eq!(got, resp);

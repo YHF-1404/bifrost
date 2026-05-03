@@ -40,9 +40,6 @@ pub struct ServerConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub approved_clients: Vec<ApprovedClient>,
-
-    #[serde(default, rename = "routes", skip_serializing_if = "Vec::is_empty")]
-    pub routes: Vec<WireRoute>,
 }
 
 fn default_server_admin() -> AdminConfig {
@@ -60,7 +57,6 @@ impl Default for ServerConfig {
             admin: default_server_admin(),
             networks: Vec::new(),
             approved_clients: Vec::new(),
-            routes: Vec::new(),
         }
     }
 }
@@ -135,10 +131,22 @@ pub struct ApprovedClient {
     /// Persisted TAP IP/CIDR for this `(client, net)` pair. Empty = unset.
     #[serde(default)]
     pub tap_ip: String,
+    /// Friendly name for UI / CLI display. Empty = no name set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    /// LAN subnets reachable through this client's TAP. The server-wide
+    /// route table is *derived* from these: each subnet becomes a route
+    /// `{ dst: subnet, via: tap_ip.addr() }`. See `crate::routes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lan_subnets: Vec<String>,
 }
 
-/// Route as it appears on disk and on the wire — strings only, validated
-/// at the platform layer (see `bifrost_net::RouteEntry::parse`).
+/// Route as it appears on disk (client config) and on the wire — strings
+/// only, validated at the platform layer (see `bifrost_net::RouteEntry::parse`).
+///
+/// The server no longer persists routes directly; it derives them at push
+/// time from the per-client `lan_subnets`. This type lives on solely for
+/// the client-side cache populated from `Frame::SetRoutes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireRoute {
     pub dst: String,
@@ -288,10 +296,8 @@ mod tests {
             client_uuid: Uuid::new_v4(),
             net_uuid: cfg.networks[0].uuid,
             tap_ip: "10.0.0.2/24".to_owned(),
-        });
-        cfg.routes.push(WireRoute {
-            dst: "192.168.10.0/24".to_owned(),
-            via: "10.0.0.2".to_owned(),
+            display_name: "router".to_owned(),
+            lan_subnets: vec!["192.168.10.0/24".to_owned()],
         });
 
         cfg.save(&path).await.unwrap();

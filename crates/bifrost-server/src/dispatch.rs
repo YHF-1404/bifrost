@@ -4,7 +4,7 @@
 //! admin server route requests through [`dispatch`] so behavior stays
 //! identical between the two paths.
 
-use bifrost_core::{HubHandle, SessionId, SetClientIpResult};
+use bifrost_core::{DevicePushResult, DeviceSetResult, DeviceUpdate, HubHandle, SessionId};
 use bifrost_proto::admin::{
     NetEntry, PendingEntry, RouteRow, ServerAdminReq, ServerAdminResp, SessionEntry, SnapshotData,
 };
@@ -31,26 +31,49 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
                 ServerAdminResp::NotFound
             }
         }
-        ServerAdminReq::SetIp { prefix, ip } => match hub.set_client_ip(prefix, ip).await {
-            SetClientIpResult::Ok { client_uuid, live } => {
-                ServerAdminResp::SetIpOk { client_uuid, live }
-            }
-            SetClientIpResult::NotFound => ServerAdminResp::NotFound,
-            SetClientIpResult::Ambiguous(uuids) => ServerAdminResp::SetIpAmbiguous(uuids),
-            SetClientIpResult::InvalidIp => ServerAdminResp::SetIpInvalid,
-        },
-        ServerAdminReq::RouteAdd { dst, via } => match hub.route_add(dst, via).await {
-            Ok(()) => ServerAdminResp::Ok,
-            Err(e) => ServerAdminResp::Error(e),
-        },
-        ServerAdminReq::RouteDel { dst } => {
-            if hub.route_del(dst).await {
-                ServerAdminResp::Ok
-            } else {
-                ServerAdminResp::NotFound
+        ServerAdminReq::DeviceSet {
+            client_uuid,
+            name,
+            admitted,
+            tap_ip,
+            lan_subnets,
+        } => {
+            // The CLI/HTTP caller must give us a (client, net) pair.
+            // For convenience, if no `net_uuid` was provided we look
+            // for a single matching approved-clients row.
+            let net_uuid = match resolve_single_net(hub, client_uuid).await {
+                Ok(n) => n,
+                Err(resp) => return resp,
+            };
+            let update = DeviceUpdate {
+                name,
+                admitted,
+                tap_ip,
+                lan_subnets,
+            };
+            match hub.device_set(client_uuid, net_uuid, update).await {
+                DeviceSetResult::Ok(d) => ServerAdminResp::Device(d),
+                DeviceSetResult::NotFound => ServerAdminResp::NotFound,
+                DeviceSetResult::InvalidIp => ServerAdminResp::InvalidIp,
+                DeviceSetResult::Conflict { msg } => ServerAdminResp::Conflict { msg },
             }
         }
-        ServerAdminReq::RoutePush => ServerAdminResp::Count(hub.route_push().await as u64),
+        ServerAdminReq::DevicePush { net_uuid } => {
+            let DevicePushResult { routes, count } = hub.device_push(net_uuid).await;
+            ServerAdminResp::Pushed {
+                count,
+                routes: routes
+                    .into_iter()
+                    .map(|r| RouteRow {
+                        dst: r.dst,
+                        via: r.via,
+                    })
+                    .collect(),
+            }
+        }
+        ServerAdminReq::DeviceList { net_uuid } => {
+            ServerAdminResp::Devices(hub.device_list(net_uuid).await)
+        }
         ServerAdminReq::List => match hub.list().await {
             Some(snap) => ServerAdminResp::Snapshot(SnapshotData {
                 networks: snap
@@ -82,14 +105,6 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
                         net_uuid: p.net_uuid,
                     })
                     .collect(),
-                routes: snap
-                    .routes
-                    .iter()
-                    .map(|r| RouteRow {
-                        dst: r.dst.clone(),
-                        via: r.via.clone(),
-                    })
-                    .collect(),
             }),
             None => ServerAdminResp::Error("hub gone".into()),
         },
@@ -104,6 +119,29 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
     }
 }
 
+/// CLI ergonomics: when a caller supplies just a `client_uuid`, find the
+/// unique `net_uuid` that pairs with it. Returns Err(Resp) on the
+/// 0-match or >1-match cases so the caller can short-circuit.
+async fn resolve_single_net(
+    hub: &HubHandle,
+    client_uuid: uuid::Uuid,
+) -> Result<uuid::Uuid, ServerAdminResp> {
+    let devices = hub.device_list(None).await;
+    let candidates: Vec<_> = devices
+        .iter()
+        .filter(|d| d.client_uuid == client_uuid)
+        .collect();
+    match candidates.len() {
+        0 => Err(ServerAdminResp::NotFound),
+        1 => Ok(candidates[0].net_uuid),
+        _ => Err(ServerAdminResp::Error(format!(
+            "client {} appears in {} networks; specify net_uuid",
+            client_uuid,
+            candidates.len()
+        ))),
+    }
+}
+
 /// Render a response as a multi-line block of human-readable text.
 pub fn format_resp(resp: &ServerAdminResp) -> String {
     use std::fmt::Write;
@@ -112,18 +150,56 @@ pub fn format_resp(resp: &ServerAdminResp) -> String {
         ServerAdminResp::Ok => s.push_str("ok"),
         ServerAdminResp::Count(n) => s.push_str(&format!("{n}")),
         ServerAdminResp::NetCreated { uuid } => s.push_str(&format!("network created  uuid={uuid}")),
-        ServerAdminResp::SetIpOk { client_uuid, live } => {
-            let where_ = if *live { "online — pushed" } else { "offline — saved" };
-            s.push_str(&format!("setip {client_uuid} ({where_})"));
+        ServerAdminResp::Device(d) => {
+            let _ = write!(
+                s,
+                "device {client} net={net} name={name:?} admitted={admit} ip={ip} \
+                 lan={lan} online={on}",
+                client = short(&d.client_uuid),
+                net = short(&d.net_uuid),
+                name = d.display_name,
+                admit = d.admitted,
+                ip = d.tap_ip.as_deref().unwrap_or("-"),
+                lan = if d.lan_subnets.is_empty() {
+                    "-".to_string()
+                } else {
+                    d.lan_subnets.join(",")
+                },
+                on = d.online,
+            );
         }
-        ServerAdminResp::SetIpAmbiguous(uuids) => {
-            s.push_str(&format!("ambiguous prefix; {} matches:\n", uuids.len()));
-            for u in uuids {
-                let _ = writeln!(s, "  {u}");
+        ServerAdminResp::Devices(list) => {
+            let _ = writeln!(s, "── devices ──");
+            if list.is_empty() {
+                let _ = writeln!(s, "  (none)");
+            }
+            for d in list {
+                let _ = writeln!(
+                    s,
+                    "  client={} net={} name={:?} admitted={} ip={} lan={} online={}",
+                    short(&d.client_uuid),
+                    short(&d.net_uuid),
+                    d.display_name,
+                    d.admitted,
+                    d.tap_ip.as_deref().unwrap_or("-"),
+                    if d.lan_subnets.is_empty() {
+                        "-".to_string()
+                    } else {
+                        d.lan_subnets.join(",")
+                    },
+                    d.online,
+                );
             }
         }
-        ServerAdminResp::SetIpInvalid => s.push_str("invalid ip/cidr"),
+        ServerAdminResp::Pushed { count, routes } => {
+            let _ = writeln!(s, "pushed to {count} client(s); {} route(s):", routes.len());
+            for r in routes {
+                let _ = writeln!(s, "  {} via {}", r.dst, r.via);
+            }
+        }
         ServerAdminResp::NotFound => s.push_str("not found"),
+        ServerAdminResp::InvalidIp => s.push_str("invalid ip/cidr"),
+        ServerAdminResp::Conflict { msg } => s.push_str(&format!("conflict: {msg}")),
         ServerAdminResp::Error(e) => s.push_str(&format!("error: {e}")),
         ServerAdminResp::Snapshot(snap) => {
             let _ = writeln!(s, "── networks ──");
@@ -161,13 +237,6 @@ pub fn format_resp(resp: &ServerAdminResp) -> String {
                     short(&p.client_uuid),
                     short(&p.net_uuid),
                 );
-            }
-            let _ = writeln!(s, "── routes ──");
-            if snap.routes.is_empty() {
-                let _ = writeln!(s, "  (none)");
-            }
-            for r in &snap.routes {
-                let _ = writeln!(s, "  {} via {}", r.dst, r.via);
             }
         }
     }

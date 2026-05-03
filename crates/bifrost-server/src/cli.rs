@@ -53,16 +53,10 @@ pub enum AdminCmd {
     Deny {
         sid: u64,
     },
-    /// Set TAP IP for a client matched by UUID prefix.
-    Setip {
-        prefix: String,
-        /// Empty string = clear the address.
-        ip: String,
-    },
-    /// Manage the route table.
-    Route {
+    /// Inspect or mutate per-device state.
+    Device {
         #[command(subcommand)]
-        action: RouteAction,
+        action: DeviceAction,
     },
     /// Show the current daemon snapshot.
     List,
@@ -79,9 +73,30 @@ pub enum AdminCmd {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum RouteAction {
-    Add { dst: String, via: String },
-    Del { dst: String },
-    List,
-    Push,
+pub enum DeviceAction {
+    /// List devices, optionally filtered by network.
+    List {
+        net_uuid: Option<uuid::Uuid>,
+    },
+    /// Mutate one approved-client row.
+    Set {
+        client_uuid: uuid::Uuid,
+        /// Friendly display name. Empty string clears.
+        #[arg(long)]
+        name: Option<String>,
+        /// `true` admits, `false` revokes admission.
+        #[arg(long)]
+        admit: Option<bool>,
+        /// TAP IP/CIDR for the client, e.g. `10.0.0.5/24`. Empty clears.
+        #[arg(long)]
+        ip: Option<String>,
+        /// LAN subnets reachable through this device, comma-separated.
+        /// Pass `--lan ""` to clear.
+        #[arg(long, value_delimiter = ',')]
+        lan: Option<Vec<String>>,
+    },
+    /// Re-derive routes for a network and push to all members.
+    Push {
+        net_uuid: uuid::Uuid,
+    },
 }

@@ -21,12 +21,14 @@ pub mod config;
 pub mod error;
 pub mod hub;
 pub mod ids;
+pub mod routes;
 pub mod session;
 pub mod transport;
 
 pub use error::CoreError;
 pub use hub::{
-    ConnLink, Hub, HubCmd, HubHandle, HubSnapshot, PendingInfo, SessionInfo, SetClientIpResult,
+    ConnLink, DevicePushResult, DeviceSetResult, DeviceUpdate, Hub, HubCmd, HubHandle, HubSnapshot,
+    PendingInfo, SessionInfo,
 };
 pub use ids::{ConnId, SessionId};
 pub use session::{

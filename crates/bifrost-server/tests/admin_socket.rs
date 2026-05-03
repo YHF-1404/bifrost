@@ -46,6 +46,8 @@ async fn spawn(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Harnes
             client_uuid: client,
             net_uuid: net,
             tap_ip: ip.to_string(),
+            display_name: String::new(),
+            lan_subnets: Vec::new(),
         });
     }
     let platform = MockPlatform::new();
@@ -116,64 +118,61 @@ async fn list_returns_snapshot() {
 }
 
 #[tokio::test]
-async fn route_add_persists_and_lists() {
-    let h = spawn(vec![], vec![]).await;
+async fn device_set_lan_subnets_round_trips() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let h = spawn(vec![(client, net, "10.0.0.5/24")], vec![net]).await;
 
+    // Set lan_subnets via DeviceSet.
     let resp = rpc(
         &h.socket,
-        ServerAdminReq::RouteAdd {
-            dst: "192.168.10.0/24".into(),
-            via: "10.0.0.1".into(),
+        ServerAdminReq::DeviceSet {
+            client_uuid: client,
+            name: Some("router".into()),
+            admitted: None,
+            tap_ip: None,
+            lan_subnets: Some(vec!["192.168.10.0/24".into()]),
         },
     )
     .await;
-    assert!(matches!(resp, ServerAdminResp::Ok));
-
-    let resp = rpc(&h.socket, ServerAdminReq::List).await;
     match resp {
-        ServerAdminResp::Snapshot(snap) => {
-            assert_eq!(snap.routes.len(), 1);
-            assert_eq!(snap.routes[0].dst, "192.168.10.0/24");
+        ServerAdminResp::Device(d) => {
+            assert_eq!(d.display_name, "router");
+            assert_eq!(d.lan_subnets, vec!["192.168.10.0/24".to_string()]);
         }
-        other => panic!("expected Snapshot, got {other:?}"),
+        other => panic!("expected Device, got {other:?}"),
     }
 
-    // route del
-    let resp = rpc(
-        &h.socket,
-        ServerAdminReq::RouteDel {
-            dst: "192.168.10.0/24".into(),
-        },
-    )
-    .await;
-    assert!(matches!(resp, ServerAdminResp::Ok));
-
-    // del again — NotFound
-    let resp = rpc(
-        &h.socket,
-        ServerAdminReq::RouteDel {
-            dst: "192.168.10.0/24".into(),
-        },
-    )
-    .await;
-    assert!(matches!(resp, ServerAdminResp::NotFound));
+    // Push and verify routes.
+    let resp = rpc(&h.socket, ServerAdminReq::DevicePush { net_uuid: net }).await;
+    match resp {
+        ServerAdminResp::Pushed { routes, .. } => {
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].dst, "192.168.10.0/24");
+            assert_eq!(routes[0].via, "10.0.0.5");
+        }
+        other => panic!("expected Pushed, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn route_add_validates_input() {
-    let h = spawn(vec![], vec![]).await;
+async fn device_set_validates_invalid_subnet() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let h = spawn(vec![(client, net, "10.0.0.5/24")], vec![net]).await;
+
     let resp = rpc(
         &h.socket,
-        ServerAdminReq::RouteAdd {
-            dst: "garbage".into(),
-            via: "10.0.0.1".into(),
+        ServerAdminReq::DeviceSet {
+            client_uuid: client,
+            name: None,
+            admitted: None,
+            tap_ip: None,
+            lan_subnets: Some(vec!["garbage".into()]),
         },
     )
     .await;
-    match resp {
-        ServerAdminResp::Error(msg) => assert!(msg.contains("CIDR"), "got: {msg}"),
-        other => panic!("expected Error, got {other:?}"),
-    }
+    assert!(matches!(resp, ServerAdminResp::InvalidIp), "got {resp:?}");
 }
 
 #[tokio::test]
@@ -184,13 +183,16 @@ async fn approve_unknown_returns_not_found() {
 }
 
 #[tokio::test]
-async fn setip_unknown_prefix_returns_not_found() {
+async fn device_set_unknown_client_returns_not_found() {
     let h = spawn(vec![], vec![]).await;
     let resp = rpc(
         &h.socket,
-        ServerAdminReq::SetIp {
-            prefix: "ff".into(),
-            ip: "10.0.0.1".into(),
+        ServerAdminReq::DeviceSet {
+            client_uuid: Uuid::new_v4(),
+            name: None,
+            admitted: None,
+            tap_ip: Some("10.0.0.1/24".into()),
+            lan_subnets: None,
         },
     )
     .await;
@@ -198,24 +200,22 @@ async fn setip_unknown_prefix_returns_not_found() {
 }
 
 #[tokio::test]
-async fn setip_invalid_ip() {
+async fn device_set_invalid_ip() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
-    let h = spawn(
-        vec![(client, net, "")],
-        vec![net],
-    )
-    .await;
-    let prefix = client.simple().to_string()[..8].into();
+    let h = spawn(vec![(client, net, "")], vec![net]).await;
     let resp = rpc(
         &h.socket,
-        ServerAdminReq::SetIp {
-            prefix,
-            ip: "not-an-ip".into(),
+        ServerAdminReq::DeviceSet {
+            client_uuid: client,
+            name: None,
+            admitted: None,
+            tap_ip: Some("not-an-ip".into()),
+            lan_subnets: None,
         },
     )
     .await;
-    assert!(matches!(resp, ServerAdminResp::SetIpInvalid));
+    assert!(matches!(resp, ServerAdminResp::InvalidIp));
 }
 
 #[tokio::test]

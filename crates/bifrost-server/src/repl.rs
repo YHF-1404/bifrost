@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use bifrost_proto::admin::ServerAdminReq;
 use rustyline::error::ReadlineError;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 /// Lightweight ParseResult — kept for tests that exercise the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,8 +34,10 @@ pub fn run_blocking(tx: mpsc::Sender<(ServerAdminReq, oneshot::Sender<String>)>)
 
     println!(
         "REPL — same commands as `bifrost-server admin <cmd>`:\n  \
-         mknet <name> | approve <sid> | deny <sid> | setip <prefix> <ip> |\n  \
-         route add <dst> via <gw> | route del <dst> | route list | route push |\n  \
+         mknet <name> | approve <sid> | deny <sid> |\n  \
+         device list [<net-uuid>] |\n  \
+         device set <client-uuid> [name=X] [ip=Y/CIDR] [admit=true|false] [lan=A,B,...] |\n  \
+         device push <net-uuid> |\n  \
          list | send <msg> | sendfile <path> | shutdown | quit"
     );
 
@@ -91,16 +94,7 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
         "deny" => ServerAdminReq::Deny {
             sid: parse_u64(rest)?,
         },
-        "setip" => {
-            let mut it = rest.split_whitespace();
-            let prefix = it
-                .next()
-                .ok_or("usage: setip <prefix> <ip>")?
-                .to_string();
-            let ip = it.next().unwrap_or("").to_string();
-            ServerAdminReq::SetIp { prefix, ip }
-        }
-        "route" => parse_route(rest)?,
+        "device" => parse_device(rest)?,
         "list" => ServerAdminReq::List,
         "send" => {
             if rest.is_empty() {
@@ -135,35 +129,79 @@ fn parse_u64(s: &str) -> Result<u64, String> {
     s.parse().map_err(|_| format!("expected integer, got {s:?}"))
 }
 
-fn parse_route(rest: &str) -> Result<ServerAdminReq, String> {
+/// `device list [<net-uuid>]`
+/// `device push <net-uuid>`
+/// `device set <client-uuid> [name=X] [ip=Y] [admit=true|false] [lan=A,B,...]`
+fn parse_device(rest: &str) -> Result<ServerAdminReq, String> {
     let mut it = rest.splitn(2, ' ');
     let sub = it.next().unwrap_or("").trim();
     let tail = it.next().unwrap_or("").trim();
     match sub {
-        "list" => Ok(ServerAdminReq::List),
-        "push" => Ok(ServerAdminReq::RoutePush),
-        "del" => {
+        "list" => {
+            let net_uuid = if tail.is_empty() {
+                None
+            } else {
+                Some(Uuid::parse_str(tail).map_err(|e| format!("bad net uuid: {e}"))?)
+            };
+            Ok(ServerAdminReq::DeviceList { net_uuid })
+        }
+        "push" => {
             if tail.is_empty() {
-                Err("usage: route del <dst>".into())
-            } else {
-                Ok(ServerAdminReq::RouteDel {
-                    dst: tail.to_string(),
-                })
+                return Err("usage: device push <net-uuid>".into());
             }
+            let net_uuid = Uuid::parse_str(tail).map_err(|e| format!("bad net uuid: {e}"))?;
+            Ok(ServerAdminReq::DevicePush { net_uuid })
         }
-        "add" => {
-            let pieces: Vec<&str> = tail.split_whitespace().collect();
-            if pieces.len() != 3 || pieces[1] != "via" {
-                Err("usage: route add <dst/cidr> via <gw>".into())
-            } else {
-                Ok(ServerAdminReq::RouteAdd {
-                    dst: pieces[0].to_string(),
-                    via: pieces[2].to_string(),
-                })
-            }
-        }
-        _ => Err("usage: route add|del|list|push".into()),
+        "set" => parse_device_set(tail),
+        _ => Err("usage: device list|set|push".into()),
     }
+}
+
+fn parse_device_set(tail: &str) -> Result<ServerAdminReq, String> {
+    let mut it = tail.split_whitespace();
+    let client = it
+        .next()
+        .ok_or("usage: device set <client-uuid> [name=X] [ip=Y] [admit=true|false] [lan=A,B,...]")?;
+    let client_uuid =
+        Uuid::parse_str(client).map_err(|e| format!("bad client uuid: {e}"))?;
+
+    let mut name: Option<String> = None;
+    let mut admitted: Option<bool> = None;
+    let mut tap_ip: Option<String> = None;
+    let mut lan_subnets: Option<Vec<String>> = None;
+    for kv in it {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("bad pair {kv:?}, expected key=value"))?;
+        match k {
+            "name" => name = Some(v.to_string()),
+            "ip" => tap_ip = Some(v.to_string()),
+            "admit" => {
+                admitted = Some(match v {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => return Err(format!("bad admit value {v:?}")),
+                });
+            }
+            "lan" => {
+                let list: Vec<String> = if v.is_empty() {
+                    Vec::new()
+                } else {
+                    v.split(',').map(|s| s.trim().to_string()).collect()
+                };
+                lan_subnets = Some(list);
+            }
+            other => return Err(format!("unknown key {other:?}")),
+        }
+    }
+
+    Ok(ServerAdminReq::DeviceSet {
+        client_uuid,
+        name,
+        admitted,
+        tap_ip,
+        lan_subnets,
+    })
 }
 
 #[cfg(test)]
@@ -184,13 +222,6 @@ mod tests {
             parse("deny 9").unwrap(),
             ReplCmd::Req(ServerAdminReq::Deny { sid: 9 })
         );
-        assert_eq!(
-            parse("setip abcd 10.0.0.5/24").unwrap(),
-            ReplCmd::Req(ServerAdminReq::SetIp {
-                prefix: "abcd".into(),
-                ip: "10.0.0.5/24".into()
-            })
-        );
         assert_eq!(parse("list").unwrap(), ReplCmd::Req(ServerAdminReq::List));
         assert_eq!(
             parse("send hi there").unwrap(),
@@ -205,43 +236,74 @@ mod tests {
     }
 
     #[test]
-    fn parses_route_subcommands() {
+    fn parses_device_list() {
         assert_eq!(
-            parse("route push").unwrap(),
-            ReplCmd::Req(ServerAdminReq::RoutePush)
+            parse("device list").unwrap(),
+            ReplCmd::Req(ServerAdminReq::DeviceList { net_uuid: None })
         );
+        let nid = Uuid::new_v4();
         assert_eq!(
-            parse("route add 192.168.1.0/24 via 10.0.0.1").unwrap(),
-            ReplCmd::Req(ServerAdminReq::RouteAdd {
-                dst: "192.168.1.0/24".into(),
-                via: "10.0.0.1".into()
+            parse(&format!("device list {nid}")).unwrap(),
+            ReplCmd::Req(ServerAdminReq::DeviceList {
+                net_uuid: Some(nid)
             })
         );
+    }
+
+    #[test]
+    fn parses_device_push() {
+        let nid = Uuid::new_v4();
         assert_eq!(
-            parse("route del 192.168.1.0/24").unwrap(),
-            ReplCmd::Req(ServerAdminReq::RouteDel {
-                dst: "192.168.1.0/24".into()
+            parse(&format!("device push {nid}")).unwrap(),
+            ReplCmd::Req(ServerAdminReq::DevicePush { net_uuid: nid })
+        );
+    }
+
+    #[test]
+    fn parses_device_set_full() {
+        let cid = Uuid::new_v4();
+        let line = format!(
+            "device set {cid} name=router ip=10.0.0.5/24 admit=true lan=192.168.10.0/24,192.168.20.0/24"
+        );
+        let parsed = parse(&line).unwrap();
+        assert_eq!(
+            parsed,
+            ReplCmd::Req(ServerAdminReq::DeviceSet {
+                client_uuid: cid,
+                name: Some("router".into()),
+                admitted: Some(true),
+                tap_ip: Some("10.0.0.5/24".into()),
+                lan_subnets: Some(vec![
+                    "192.168.10.0/24".into(),
+                    "192.168.20.0/24".into()
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_device_set_partial_clears() {
+        let cid = Uuid::new_v4();
+        let parsed = parse(&format!("device set {cid} ip= lan=")).unwrap();
+        assert_eq!(
+            parsed,
+            ReplCmd::Req(ServerAdminReq::DeviceSet {
+                client_uuid: cid,
+                name: None,
+                admitted: None,
+                tap_ip: Some(String::new()),
+                lan_subnets: Some(Vec::new()),
             })
         );
     }
 
     #[test]
     fn rejects_malformed() {
-        assert!(parse("mknet").is_err());
+        assert_eq!(parse("garbage"), Err("unknown command \"garbage\"".into()));
         assert!(parse("approve abc").is_err());
-        assert!(parse("route").is_err());
-        assert!(parse("garbage").is_err());
-    }
-
-    #[test]
-    fn setip_with_empty_ip_clears() {
-        // Hub treats empty `ip` as "clear"; the REPL forwards verbatim.
-        assert_eq!(
-            parse("setip abcd").unwrap(),
-            ReplCmd::Req(ServerAdminReq::SetIp {
-                prefix: "abcd".into(),
-                ip: String::new()
-            })
-        );
+        assert!(parse("device").is_err());
+        assert!(parse("device push not-a-uuid").is_err());
+        assert!(parse("device set not-a-uuid").is_err());
+        assert!(parse("mknet").is_err());
     }
 }
