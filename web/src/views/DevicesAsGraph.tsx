@@ -20,7 +20,7 @@
 //     hub's right and the edge swings to enter on its left side. See
 //     `components/graph/FloatingEdge.tsx`.
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Background,
   BackgroundVariant,
@@ -45,7 +45,7 @@ import {
   type XY,
   deviceRingPositions,
 } from "@/components/graph/graphLayout";
-import { api } from "@/lib/api";
+import { api, type GraphLayout } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import type { DeviceViewProps } from "./NetworkDetail";
 
@@ -168,11 +168,14 @@ const LAYOUT_PUT_DEBOUNCE_MS = 300;
 export function DevicesAsGraph(props: DeviceViewProps) {
   const { devices, networkId, networkName, onUpdate, onRenameNetwork } = props;
 
+  const qc = useQueryClient();
+  const layoutQueryKey = ["layout", networkId] as const;
+
   // Server-side layout — single source of truth across browsers. The
   // localStorage map is just a warm cache while the GET is in flight
   // and a write-through copy in case the PUT fails.
   const layoutQ = useQuery({
-    queryKey: ["layout", networkId] as const,
+    queryKey: layoutQueryKey,
     queryFn: () => api.getLayout(networkId),
     // Don't refetch on every focus; positions only change when this
     // tab edits them, and `network.changed` events don't carry layout
@@ -272,15 +275,27 @@ export function DevicesAsGraph(props: DeviceViewProps) {
     }, LAYOUT_PUT_DEBOUNCE_MS);
   }, [networkId]);
 
-  // Tear down timers on unmount so we don't fire PUTs against a stale
-  // network id after navigation.
+  // On unmount: if a debounced PUT is still pending, flush it
+  // *immediately* instead of cancelling. Without this, a quick drag
+  // followed by switching to the table view inside the 300 ms window
+  // would lose the change at the server (the cache and localStorage
+  // copies survive, but a fresh browser would still see the old
+  // positions). The fetch itself doesn't depend on the component
+  // being mounted, so it completes fine in the background.
   useEffect(
     () => () => {
-      if (putTimerRef.current !== null) window.clearTimeout(putTimerRef.current);
-      if (savedFadeTimerRef.current !== null)
+      if (putTimerRef.current !== null) {
+        window.clearTimeout(putTimerRef.current);
+        putTimerRef.current = null;
+        api
+          .putLayout(networkId, { positions: positionsRef.current })
+          .catch(() => {});
+      }
+      if (savedFadeTimerRef.current !== null) {
         window.clearTimeout(savedFadeTimerRef.current);
+      }
     },
-    [],
+    [networkId],
   );
 
   // Wrap onNodesChange so we can persist positions whenever the user
@@ -299,10 +314,25 @@ export function DevicesAsGraph(props: DeviceViewProps) {
       }
       if (touched) {
         saveLocalPositions(networkId, positionsRef.current);
+        // Eagerly mirror the new positions into the layout query cache.
+        // Otherwise, a rapid view-mode toggle (table → graph) remounts
+        // this component, the cached `layoutQ.data` still holds the
+        // pre-drag server response, and the `[layoutQ.data]` effect
+        // re-merges it over our fresh positions — visually reverting
+        // the drag the user just made. With write-through, the cache
+        // always reflects the latest committed positions, so remount
+        // round-trips are a no-op.
+        qc.setQueryData<GraphLayout>(layoutQueryKey, {
+          positions: { ...positionsRef.current },
+        });
         schedulePutLayout();
       }
     },
-    [onNodesChange, networkId, schedulePutLayout],
+    // layoutQueryKey is a stable tuple per networkId, but ESLint
+    // can't see through the array literal — listing networkId is
+    // equivalent and cheaper.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onNodesChange, networkId, schedulePutLayout, qc],
   );
 
   // Stable signature of "which devices are present, in what order".
