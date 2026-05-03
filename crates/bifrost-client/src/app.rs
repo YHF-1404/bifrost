@@ -233,6 +233,11 @@ impl App {
         };
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        // Client-side counters are unused (the server samples its own
+        // side of the conversation); supply fresh atomics so the type
+        // checks. They are dropped when the session ends.
+        let bytes_in = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let bytes_out = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let task = SessionTask::new(
             SessionId(0), // sid is server-side concept; on client we don't track
             self.cfg.client.uuid.parse().unwrap_or(Uuid::nil()),
@@ -241,6 +246,8 @@ impl App {
             cmd_rx,
             self.session_evt_tx.clone(),
             None, // no disconnect timeout — the user controls TAP lifetime
+            bytes_in,
+            bytes_out,
         );
         tokio::spawn(task.run(self.out_tx.clone()));
         self.session_tx = Some(cmd_tx);

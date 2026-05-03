@@ -18,6 +18,7 @@
 //! the `Drop` impl on the concrete platform type, as a belt-and-braces
 //! guard against the task being aborted instead of returning normally.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,9 +104,16 @@ pub struct SessionTask {
     cmd_rx: mpsc::Receiver<SessionCmd>,
     evt_tx: mpsc::Sender<SessionEvt>,
     disconnect_timeout: DisconnectTimeout,
+    /// Cumulative payload bytes flowing socket → TAP. Wrapped in an
+    /// `Arc` so the Hub can sample it concurrently.
+    bytes_in: Arc<AtomicU64>,
+    /// Cumulative payload bytes flowing TAP → socket.
+    bytes_out: Arc<AtomicU64>,
 }
 
 impl SessionTask {
+    // Three call sites total; a builder would cost more than it saves.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sid: SessionId,
         client_uuid: Uuid,
@@ -114,6 +122,8 @@ impl SessionTask {
         cmd_rx: mpsc::Receiver<SessionCmd>,
         evt_tx: mpsc::Sender<SessionEvt>,
         disconnect_timeout: DisconnectTimeout,
+        bytes_in: Arc<AtomicU64>,
+        bytes_out: Arc<AtomicU64>,
     ) -> Self {
         Self {
             sid,
@@ -123,6 +133,8 @@ impl SessionTask {
             cmd_rx,
             evt_tx,
             disconnect_timeout,
+            bytes_in,
+            bytes_out,
         }
     }
 
@@ -151,6 +163,8 @@ impl SessionTask {
                         conn_tx,
                         &mut buf,
                         self.disconnect_timeout,
+                        &self.bytes_in,
+                        &self.bytes_out,
                     )
                     .await
                 }
@@ -189,6 +203,8 @@ impl SessionTask {
         conn_tx: &mut mpsc::Sender<Frame>,
         buf: &mut [u8],
         disconnect_timeout: DisconnectTimeout,
+        bytes_in: &AtomicU64,
+        bytes_out: &AtomicU64,
     ) -> LoopOutcome {
         tokio::select! {
             biased;
@@ -204,9 +220,11 @@ impl SessionTask {
                     LoopOutcome::Stay(LoopState::Joined { conn_tx: conn_tx.clone() })
                 }
                 Some(SessionCmd::EthIn(frame)) => {
+                    let n = frame.len();
                     if let Err(e) = tap.write(&frame).await {
                         return LoopOutcome::Die(DeathReason::TapError(e.to_string()));
                     }
+                    bytes_in.fetch_add(n as u64, Ordering::Relaxed);
                     LoopOutcome::Stay(LoopState::Joined { conn_tx: conn_tx.clone() })
                 }
                 Some(SessionCmd::SetIp(ip_str)) => {
@@ -231,6 +249,7 @@ impl SessionTask {
                     match conn_tx.send(frame).await {
                         Ok(()) => {
                             trace!(bytes = n, "tap → conn");
+                            bytes_out.fetch_add(n as u64, Ordering::Relaxed);
                             LoopOutcome::Stay(LoopState::Joined { conn_tx: conn_tx.clone() })
                         }
                         Err(_) => {

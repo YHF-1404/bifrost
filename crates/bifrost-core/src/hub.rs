@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,14 +26,26 @@ use bifrost_net::{Bridge, Platform};
 use bifrost_proto::admin::DeviceEntry;
 use bifrost_proto::{Frame, RouteEntry as WireRoute};
 use ipnet::IpNet;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ApprovedClient, NetRecord, ServerConfig};
+use crate::events::{HubEvent, MetricsSample};
 use crate::ids::{ConnId, IdAllocator, SessionId};
 use crate::routes::{derive_routes_for_network, filter_for_peer};
 use crate::session::{DeathReason, SessionCmd, SessionEvt, SessionTask};
+
+/// 1 Hz sampling cadence. Subscribers (the WebUI) plot deltas; this
+/// constant doubles as the divisor when bps_in / bps_out are being
+/// interpreted as "bytes per second" downstream.
+const METRICS_TICK: Duration = Duration::from_secs(1);
+
+/// Buffer depth for the events broadcast. A slow subscriber (e.g. a
+/// browser tab in the background) drops oldest events instead of
+/// stalling the Hub.
+const EVENTS_CAPACITY: usize = 256;
 
 // ─── Public types ─────────────────────────────────────────────────────────
 
@@ -185,6 +198,18 @@ pub enum HubCmd {
 #[derive(Clone)]
 pub struct HubHandle {
     cmd_tx: mpsc::Sender<HubCmd>,
+    events: broadcast::Sender<HubEvent>,
+}
+
+impl HubHandle {
+    /// Subscribe to the Hub's broadcast event stream. New subscribers
+    /// only see events emitted from this point forward — there is no
+    /// backfill. Lagging subscribers receive
+    /// `RecvError::Lagged(n)` and should treat that as "skip n events,
+    /// keep going."
+    pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
+        self.events.subscribe()
+    }
 }
 
 impl HubHandle {
@@ -376,6 +401,10 @@ struct SessionEntry {
     tap_ip: Option<String>,
     /// Conn currently forwarding into this session.
     bound_conn: Option<ConnId>,
+    /// Live byte counters shared with the matching `SessionTask`.
+    /// Sampled by the Hub's metrics tick every `METRICS_TICK`.
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
 }
 
 struct PendingApproval {
@@ -408,6 +437,14 @@ pub struct Hub {
     evt_rx: mpsc::Receiver<SessionEvt>,
 
     disconnect_timeout: Duration,
+
+    /// Broadcast channel for pushed events (metrics ticks today,
+    /// device.* events in 1.3). Held in `Arc`-style `Sender` form;
+    /// receivers are minted via `Sender::subscribe`.
+    events_tx: broadcast::Sender<HubEvent>,
+    /// Previous (in, out) byte counters per session, for delta
+    /// computation in the metrics tick.
+    metrics_prev: HashMap<SessionId, (u64, u64)>,
 }
 
 impl Hub {
@@ -419,6 +456,7 @@ impl Hub {
     ) -> (Self, HubHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (evt_tx, evt_rx) = mpsc::channel(64);
+        let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
         let disconnect_timeout = Duration::from_secs(cfg.bridge.disconnect_timeout);
         let hub = Self {
             cfg,
@@ -434,8 +472,16 @@ impl Hub {
             evt_tx,
             evt_rx,
             disconnect_timeout,
+            events_tx: events_tx.clone(),
+            metrics_prev: HashMap::new(),
         };
-        (hub, HubHandle { cmd_tx })
+        (
+            hub,
+            HubHandle {
+                cmd_tx,
+                events: events_tx,
+            },
+        )
     }
 
     /// Atomically write the in-memory config to disk, if a path is set.
@@ -495,6 +541,12 @@ impl Hub {
         // until someone re-ran `route push`.
         self.sync_local_routes().await;
 
+        let mut sampler = tokio::time::interval(METRICS_TICK);
+        // Hub is the bottleneck for these — if we ever fall behind
+        // (very long config save?), skip the missed beats rather than
+        // burst-emit a backlog the WS subscribers don't want.
+        sampler.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 cmd = self.cmd_rx.recv() => match cmd {
@@ -504,12 +556,54 @@ impl Hub {
                 },
                 Some(evt) = self.evt_rx.recv() => match evt {
                     SessionEvt::Died { sid, reason } => self.handle_session_died(sid, reason).await,
-                }
+                },
+                _ = sampler.tick() => self.emit_metrics_tick(),
             }
         }
 
         self.shutdown_all().await;
         info!("hub stop");
+    }
+
+    /// Snapshot every joined session's byte counters, compute deltas
+    /// against the previous tick, and broadcast a `MetricsTick` event.
+    /// Skips emission when there are no sessions (no subscribers want
+    /// empty arrays).
+    fn emit_metrics_tick(&mut self) {
+        if self.sessions.is_empty() {
+            // Drop stale prev entries so a re-joining client starts
+            // from zero-delta on first emit.
+            self.metrics_prev.clear();
+            return;
+        }
+        let mut samples = Vec::with_capacity(self.sessions.len());
+        let mut alive = std::collections::HashSet::with_capacity(self.sessions.len());
+        for s in self.sessions.values() {
+            alive.insert(s.sid);
+            let in_now = s.bytes_in.load(Ordering::Relaxed);
+            let out_now = s.bytes_out.load(Ordering::Relaxed);
+            let (in_prev, out_prev) = self
+                .metrics_prev
+                .get(&s.sid)
+                .copied()
+                .unwrap_or((in_now, out_now));
+            samples.push(MetricsSample {
+                network: s.net_uuid,
+                client_uuid: s.client_uuid,
+                bps_in: in_now.saturating_sub(in_prev),
+                bps_out: out_now.saturating_sub(out_prev),
+                total_in: in_now,
+                total_out: out_now,
+            });
+            self.metrics_prev.insert(s.sid, (in_now, out_now));
+        }
+        // GC dead sessions out of the prev map.
+        self.metrics_prev.retain(|sid, _| alive.contains(sid));
+
+        // Best-effort send. `broadcast::send` errors only when there
+        // are zero receivers, which is the common case (no WebUI tab
+        // open) — silently fine.
+        let _ = self.events_tx.send(HubEvent::MetricsTick { samples });
     }
 
     // ── Top-level dispatch ───────────────────────────────────────────
@@ -736,6 +830,8 @@ impl Hub {
         }
 
         let (sess_cmd_tx, sess_cmd_rx) = mpsc::channel(64);
+        let bytes_in = Arc::new(AtomicU64::new(0));
+        let bytes_out = Arc::new(AtomicU64::new(0));
         let task = SessionTask::new(
             sid,
             client_uuid,
@@ -744,6 +840,8 @@ impl Hub {
             sess_cmd_rx,
             self.evt_tx.clone(),
             Some(self.disconnect_timeout),
+            bytes_in.clone(),
+            bytes_out.clone(),
         );
         tokio::spawn(task.run(frame_tx.clone()));
 
@@ -757,6 +855,8 @@ impl Hub {
                 tap_name: tap_name.clone(),
                 tap_ip: tap_ip_str.clone(),
                 bound_conn: Some(conn),
+                bytes_in,
+                bytes_out,
             },
         );
         self.sessions_by_id.insert(sid, (client_uuid, net_uuid));

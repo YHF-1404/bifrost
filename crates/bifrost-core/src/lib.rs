@@ -19,6 +19,7 @@
 pub mod atomic_write;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod hub;
 pub mod ids;
 pub mod routes;
@@ -26,6 +27,7 @@ pub mod session;
 pub mod transport;
 
 pub use error::CoreError;
+pub use events::{HubEvent, MetricsSample};
 pub use hub::{
     ConnLink, DevicePushResult, DeviceSetResult, DeviceUpdate, Hub, HubCmd, HubHandle, HubSnapshot,
     PendingInfo, SessionInfo,

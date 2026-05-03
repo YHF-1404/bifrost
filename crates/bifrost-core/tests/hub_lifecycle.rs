@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
-use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubHandle, SessionCmd, SessionId};
+use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, SessionCmd, SessionId};
 use bifrost_net::mock::{MockBridge, MockPlatform};
 use bifrost_net::{Bridge, Platform, Tap};
 use bifrost_proto::{Frame, PROTOCOL_VERSION};
@@ -827,5 +827,60 @@ async fn make_net_persists_to_disk() {
         .networks
         .iter()
         .any(|n| n.uuid == uuid && n.name == "hml"));
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn metrics_tick_broadcasts_one_sample_per_session() {
+    // Spawn Hub with one approved client; bring a conn in; observe at
+    // least one MetricsTick on the broadcast subscription. Real-time
+    // wait — the sampler ticks at 1 Hz, so up to ~2 s.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients
+        .push(approved(client, net, "10.0.0.5/24"));
+    let h = spawn(cfg).await;
+
+    let mut events = h.hub.subscribe();
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    h.hub.join(c.id, net).await;
+    let _ = recv(&mut c.frame_rx).await; // JoinOk
+    let _ = recv_bind(&mut c.bind_rx).await;
+
+    // Wait up to 2.5 s for the first tick. Should arrive ~1 s in.
+    let evt = tokio::time::timeout(Duration::from_millis(2500), events.recv())
+        .await
+        .expect("metrics tick timed out")
+        .expect("broadcast closed");
+    match evt {
+        HubEvent::MetricsTick { samples } => {
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].network, net);
+            assert_eq!(samples[0].client_uuid, client);
+            // No traffic yet → zero deltas + zero totals.
+            assert_eq!(samples[0].bps_in, 0);
+            assert_eq!(samples[0].bps_out, 0);
+            assert_eq!(samples[0].total_in, 0);
+            assert_eq!(samples[0].total_out, 0);
+        }
+    }
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn metrics_tick_skipped_when_no_sessions() {
+    // No sessions → no events. Verify by not seeing one within 2 s.
+    let h = spawn(build_cfg(60)).await;
+    let mut events = h.hub.subscribe();
+
+    let res = tokio::time::timeout(Duration::from_millis(2000), events.recv()).await;
+    assert!(res.is_err(), "expected no events, got {:?}", res);
     h.hub.shutdown().await;
 }

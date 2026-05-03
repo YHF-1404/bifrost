@@ -6,6 +6,7 @@
 //! frames injected on the mock TAP. Internal `LoopState` is deliberately
 //! not introspected — that's an implementation detail.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,9 @@ struct Harness {
     evt_rx: mpsc::Receiver<SessionEvt>,
     conn_rx: mpsc::Receiver<Frame>,
     tap: Arc<MockTap>,
+    /// Counters shared with the running task — tests can observe.
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
     /// Held to keep the session task alive for the duration of the test.
     /// Tests don't `.await` on it because death is observed via `evt_rx`.
     #[allow(dead_code)]
@@ -34,6 +38,8 @@ fn spawn(disconnect_timeout: Option<Duration>) -> Harness {
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let (evt_tx, evt_rx) = mpsc::channel(8);
     let (conn_tx, conn_rx) = mpsc::channel::<Frame>(16);
+    let bytes_in = Arc::new(AtomicU64::new(0));
+    let bytes_out = Arc::new(AtomicU64::new(0));
 
     let task = SessionTask::new(
         SessionId(1),
@@ -43,6 +49,8 @@ fn spawn(disconnect_timeout: Option<Duration>) -> Harness {
         cmd_rx,
         evt_tx,
         disconnect_timeout,
+        bytes_in.clone(),
+        bytes_out.clone(),
     );
     let join = tokio::spawn(task.run(conn_tx));
 
@@ -51,6 +59,8 @@ fn spawn(disconnect_timeout: Option<Duration>) -> Harness {
         evt_rx,
         conn_rx,
         tap,
+        bytes_in,
+        bytes_out,
         join,
     }
 }
@@ -98,6 +108,36 @@ async fn joined_eth_in_writes_to_tap() {
 
     h.cmd_tx.send(SessionCmd::Kill).await.unwrap();
     assert_eq!(await_death(&mut h.evt_rx).await, DeathReason::HubKill);
+}
+
+#[tokio::test]
+async fn byte_counters_track_both_directions() {
+    let mut h = spawn(Some(Duration::from_secs(60)));
+
+    // Conn → TAP: 9 bytes inbound.
+    h.cmd_tx
+        .send(SessionCmd::EthIn(b"hello-tap".to_vec()))
+        .await
+        .unwrap();
+    let _ = h.tap.pop_written_timeout(SHORT).await.expect("no write");
+
+    // TAP → Conn: 11 bytes outbound.
+    h.tap.inject_frame(b"world-from!".to_vec()).await;
+    match recv_frame(&mut h.conn_rx, SHORT).await {
+        Some(Frame::Eth(e)) => assert_eq!(e, b"world-from!"),
+        other => panic!("expected Eth, got {other:?}"),
+    }
+
+    // Counters reflect payload bytes only, in atomic order.
+    assert_eq!(h.bytes_in.load(Ordering::Relaxed), 9);
+    assert_eq!(h.bytes_out.load(Ordering::Relaxed), 11);
+
+    h.cmd_tx.send(SessionCmd::Kill).await.unwrap();
+    assert_eq!(await_death(&mut h.evt_rx).await, DeathReason::HubKill);
+}
+
+async fn recv_frame(rx: &mut mpsc::Receiver<Frame>, timeout: Duration) -> Option<Frame> {
+    tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
 }
 
 #[tokio::test]

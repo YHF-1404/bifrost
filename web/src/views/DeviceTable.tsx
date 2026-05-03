@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/Badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/Table";
+import { ThroughputCell } from "@/components/ThroughputCell";
 
 function shortUuid(s: string) {
   return s.replace(/-/g, "").slice(0, 8);
@@ -50,6 +51,7 @@ export function DeviceTable() {
                   <TH>Name</TH>
                   <TH>TAP IP</TH>
                   <TH>LAN subnets</TH>
+                  <TH>Throughput</TH>
                   <TH>Client UUID</TH>
                 </TR>
               </THead>
@@ -83,6 +85,13 @@ export function DeviceTable() {
                           ))}
                         </div>
                       )}
+                    </TD>
+                    <TD>
+                      <ThroughputCell
+                        network={d.net_uuid}
+                        clientUuid={d.client_uuid}
+                        online={d.online}
+                      />
                     </TD>
                     <TD className="font-mono text-xs text-muted-foreground" title={d.client_uuid}>
                       {shortUuid(d.client_uuid)}…
