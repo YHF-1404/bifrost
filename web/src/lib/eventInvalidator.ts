@@ -33,6 +33,16 @@ export function useEventInvalidator() {
           qc.invalidateQueries({ queryKey: ["networks"] });
           break;
         }
+        case "network.created":
+        case "network.changed":
+        case "network.deleted": {
+          qc.invalidateQueries({ queryKey: ["networks"] });
+          // A delete cascades into device rows; refresh that scope too.
+          if (evt.type === "network.deleted") {
+            qc.invalidateQueries({ queryKey: ["devices", evt.network] });
+          }
+          break;
+        }
         // metrics.tick handled by the metrics store; routes.changed
         // has no cached UI surface (yet).
         default:

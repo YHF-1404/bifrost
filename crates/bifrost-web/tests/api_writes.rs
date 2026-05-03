@@ -277,3 +277,109 @@ async fn push_routes_unknown_net_is_404() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn create_network_returns_id_and_listing_includes_it() {
+    let h = spawn_with(vec![]).await;
+
+    let resp = reqwest::Client::new()
+        .post(url(&h, "/api/networks"))
+        .json(&json!({ "name": "alpha" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "alpha");
+    let new_id = body["id"].as_str().unwrap().to_string();
+
+    // The listing now includes both the seeded "n" network and the new one.
+    let resp = reqwest::Client::new()
+        .get(url(&h, "/api/networks"))
+        .send()
+        .await
+        .unwrap();
+    let arr: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"alpha"));
+    assert!(arr.as_array().unwrap().iter().any(|n| n["id"] == new_id));
+}
+
+#[tokio::test]
+async fn create_network_rejects_empty_name() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .post(url(&h, "/api/networks"))
+        .json(&json!({ "name": "   " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn rename_network_round_trips() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", h.net)))
+        .json(&json!({ "name": "renamed" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "renamed");
+}
+
+#[tokio::test]
+async fn rename_unknown_network_is_404() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", Uuid::new_v4())))
+        .json(&json!({ "name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_network_cascades_devices() {
+    // Spawn with one device row. Then delete the whole network and
+    // verify both the network and its row are gone.
+    let cid = Uuid::new_v4();
+    let h = spawn_with(vec![approved(cid, Uuid::nil(), "10.0.0.5/24", &[])]).await;
+
+    let resp = reqwest::Client::new()
+        .delete(url(&h, &format!("/api/networks/{}", h.net)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // Network gone from listing.
+    let arr: Value = reqwest::get(url(&h, "/api/networks"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| n["id"] != h.net.to_string()));
+
+    // Device list 404 since the network is gone.
+    let resp = reqwest::Client::new()
+        .get(url(&h, &format!("/api/networks/{}/devices", h.net)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}

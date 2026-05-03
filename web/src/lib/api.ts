@@ -69,6 +69,24 @@ export const api = {
   listNetworks(): Promise<Network[]> {
     return getJson<Network[]>("/api/networks");
   },
+  createNetwork(name: string): Promise<{ id: string; name: string }> {
+    return sendJson<{ id: string; name: string }>("POST", "/api/networks", {
+      name,
+    }) as Promise<{ id: string; name: string }>;
+  },
+  renameNetwork(networkId: string, name: string): Promise<{ id: string; name: string }> {
+    return sendJson<{ id: string; name: string }>(
+      "PATCH",
+      `/api/networks/${encodeURIComponent(networkId)}`,
+      { name },
+    ) as Promise<{ id: string; name: string }>;
+  },
+  deleteNetwork(networkId: string): Promise<null> {
+    return sendJson<null>(
+      "DELETE",
+      `/api/networks/${encodeURIComponent(networkId)}`,
+    ) as Promise<null>;
+  },
   listDevices(networkId: string): Promise<Device[]> {
     return getJson<Device[]>(`/api/networks/${encodeURIComponent(networkId)}/devices`);
   },

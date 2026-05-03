@@ -49,4 +49,7 @@ export type ServerEvent =
       network: string;
       routes: Array<{ dst: string; via: string }>;
       count: number;
-    };
+    }
+  | { type: "network.created"; network: string; name: string }
+  | { type: "network.changed"; network: string; name: string }
+  | { type: "network.deleted"; network: string };

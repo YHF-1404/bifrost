@@ -110,6 +110,26 @@ pub enum HubEvent {
         routes: Vec<RouteRow>,
         count: u64,
     },
+
+    /// A new virtual network was created.
+    #[serde(rename = "network.created")]
+    NetworkCreated {
+        network: Uuid,
+        name: String,
+    },
+
+    /// A network's metadata changed (name only, today).
+    #[serde(rename = "network.changed")]
+    NetworkChanged {
+        network: Uuid,
+        name: String,
+    },
+
+    /// A network was deleted, cascading to all its devices.
+    #[serde(rename = "network.deleted")]
+    NetworkDeleted {
+        network: Uuid,
+    },
 }
 
 #[cfg(test)]

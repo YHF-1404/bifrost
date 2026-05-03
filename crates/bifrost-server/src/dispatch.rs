@@ -17,6 +17,20 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
             Some(uuid) => ServerAdminResp::NetCreated { uuid },
             None => ServerAdminResp::Error("hub gone".into()),
         },
+        ServerAdminReq::RenameNet { net_uuid, name } => {
+            if hub.rename_net(net_uuid, name).await {
+                ServerAdminResp::Ok
+            } else {
+                ServerAdminResp::NotFound
+            }
+        }
+        ServerAdminReq::DeleteNet { net_uuid } => {
+            if hub.delete_net(net_uuid).await {
+                ServerAdminResp::Ok
+            } else {
+                ServerAdminResp::NotFound
+            }
+        }
         ServerAdminReq::DeviceSet {
             client_uuid,
             name,

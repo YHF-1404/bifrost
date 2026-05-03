@@ -151,6 +151,19 @@ pub enum HubCmd {
         name: String,
         ack: oneshot::Sender<Uuid>,
     },
+    /// Rename a network. Returns `true` on success, `false` if the
+    /// network UUID is unknown.
+    RenameNet {
+        net_uuid: Uuid,
+        name: String,
+        ack: oneshot::Sender<bool>,
+    },
+    /// Cascade-delete a network and every approved-client row in it.
+    /// Active sessions are killed; pending conns are dropped.
+    DeleteNet {
+        net_uuid: Uuid,
+        ack: oneshot::Sender<bool>,
+    },
     List {
         ack: oneshot::Sender<HubSnapshot>,
     },
@@ -248,6 +261,41 @@ impl HubHandle {
             .await
             .ok()?;
         rx.await.ok()
+    }
+
+    /// Rename `net_uuid` → `name`. Returns `false` if the network was
+    /// not found.
+    pub async fn rename_net(&self, net_uuid: Uuid, name: String) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(HubCmd::RenameNet {
+                net_uuid,
+                name,
+                ack: tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
+    /// Cascade-delete `net_uuid` along with every device row in it.
+    /// Active sessions are killed; conns are dropped. Returns `false`
+    /// when the network is unknown.
+    pub async fn delete_net(&self, net_uuid: Uuid) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(HubCmd::DeleteNet { net_uuid, ack: tx })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
     }
 
     pub async fn list(&self) -> Option<HubSnapshot> {
@@ -589,6 +637,12 @@ impl Hub {
             HubCmd::Join { conn, net_uuid } => self.handle_join(conn, net_uuid).await,
             HubCmd::Disconnect { conn } => self.handle_disconnect(conn).await,
             HubCmd::MakeNet { name, ack } => self.handle_make_net(name, ack).await,
+            HubCmd::RenameNet {
+                net_uuid,
+                name,
+                ack,
+            } => self.handle_rename_net(net_uuid, name, ack).await,
+            HubCmd::DeleteNet { net_uuid, ack } => self.handle_delete_net(net_uuid, ack).await,
             HubCmd::List { ack } => self.handle_list(ack),
             HubCmd::DeviceList { net_uuid, ack } => self.handle_device_list(net_uuid, ack),
             HubCmd::DeviceSet {
@@ -1009,7 +1063,88 @@ impl Hub {
         });
         self.persist().await;
         info!(%name, %uuid, "network created");
+        self.emit(HubEvent::NetworkCreated {
+            network: uuid,
+            name,
+        });
         let _ = ack.send(uuid);
+    }
+
+    async fn handle_rename_net(
+        &mut self,
+        net_uuid: Uuid,
+        name: String,
+        ack: oneshot::Sender<bool>,
+    ) {
+        let Some(rec) = self.cfg.networks.iter_mut().find(|n| n.uuid == net_uuid) else {
+            let _ = ack.send(false);
+            return;
+        };
+        rec.name = name.clone();
+        self.persist().await;
+        info!(%name, %net_uuid, "network renamed");
+        self.emit(HubEvent::NetworkChanged {
+            network: net_uuid,
+            name,
+        });
+        let _ = ack.send(true);
+    }
+
+    async fn handle_delete_net(&mut self, net_uuid: Uuid, ack: oneshot::Sender<bool>) {
+        if !self.cfg.networks.iter().any(|n| n.uuid == net_uuid) {
+            let _ = ack.send(false);
+            return;
+        }
+
+        // Kick every live session in this network. Each Kill triggers
+        // handle_session_died via the event channel; that path also
+        // emits a DeviceOffline. We fire NetworkDeleted last so
+        // listeners can scope per-device cleanup before realising the
+        // network is gone.
+        let live_keys: Vec<(Uuid, Uuid)> = self
+            .sessions
+            .keys()
+            .filter(|(_, n)| *n == net_uuid)
+            .copied()
+            .collect();
+        for key in &live_keys {
+            if let Some(session) = self.sessions.get(key) {
+                let _ = session.cmd_tx.send(SessionCmd::Kill).await;
+                if let Some(c) = session.bound_conn {
+                    self.conns.remove(&c);
+                }
+            }
+        }
+
+        // Drop pending conns in this network.
+        let pending_keys: Vec<(Uuid, Uuid)> = self
+            .pending
+            .keys()
+            .filter(|(_, n)| *n == net_uuid)
+            .copied()
+            .collect();
+        for key in &pending_keys {
+            if let Some(conn_id) = self.pending.remove(key) {
+                self.conns.remove(&conn_id);
+            }
+        }
+
+        // Drop persistent device rows for this network.
+        self.cfg
+            .approved_clients
+            .retain(|a| a.net_uuid != net_uuid);
+
+        // Drop the network record itself.
+        self.cfg.networks.retain(|n| n.uuid != net_uuid);
+
+        self.persist().await;
+        // Bridge route table no longer mentions any of this network's
+        // routes — re-sync to clean up.
+        self.sync_local_routes().await;
+        info!(%net_uuid, "network deleted");
+        self.emit(HubEvent::NetworkDeleted { network: net_uuid });
+
+        let _ = ack.send(true);
     }
 
     fn handle_device_list(

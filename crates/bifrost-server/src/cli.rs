@@ -55,6 +55,15 @@ pub enum AdminCmd {
     Mknet {
         name: String,
     },
+    /// Rename an existing network.
+    Rename {
+        net_uuid: uuid::Uuid,
+        name: String,
+    },
+    /// Delete a network and cascade-remove its devices.
+    Rmnet {
+        net_uuid: uuid::Uuid,
+    },
     /// Inspect or mutate per-device state.
     Device {
         #[command(subcommand)]

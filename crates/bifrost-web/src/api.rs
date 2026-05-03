@@ -2,6 +2,9 @@
 //!
 //! ```text
 //!   GET    /networks
+//!   POST   /networks
+//!   PATCH  /networks/:nid
+//!   DELETE /networks/:nid
 //!   GET    /networks/:nid/devices
 //!   PATCH  /networks/:nid/devices/:cid
 //!   POST   /networks/:nid/routes/push
@@ -29,7 +32,11 @@ use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/networks", get(list_networks))
+        .route("/networks", get(list_networks).post(create_network))
+        .route(
+            "/networks/:nid",
+            patch(rename_network).delete(delete_network),
+        )
         .route("/networks/:nid/devices", get(list_devices))
         .route("/networks/:nid/devices/:cid", patch(patch_device))
         .route("/networks/:nid/routes/push", post(push_routes))
@@ -77,6 +84,71 @@ async fn list_networks(State(state): State<AppState>) -> Response {
         })
         .collect();
     Json(nets).into_response()
+}
+
+/// `POST /api/networks` body — `{ "name": "..." }`.
+#[derive(Debug, Deserialize)]
+struct CreateNetworkBody {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateNetworkResp {
+    id: Uuid,
+    name: String,
+}
+
+/// `POST /api/networks` — create a new virtual network. Empty names
+/// are rejected (the WebUI shouldn't send them, but mirror the
+/// validation here).
+async fn create_network(
+    State(state): State<AppState>,
+    Json(body): Json<CreateNetworkBody>,
+) -> Response {
+    let trimmed = body.name.trim().to_string();
+    if trimmed.is_empty() {
+        return bad_request("name is required");
+    }
+    let Some(uuid) = state.hub.make_net(trimmed.clone()).await else {
+        return service_unavailable("hub gone");
+    };
+    Json(CreateNetworkResp {
+        id: uuid,
+        name: trimmed,
+    })
+    .into_response()
+}
+
+/// `PATCH /api/networks/:nid` body — `{ "name": "..." }`. Only the
+/// name is renameable for now; other config fields are config-file
+/// territory.
+#[derive(Debug, Deserialize)]
+struct RenameNetworkBody {
+    name: String,
+}
+
+async fn rename_network(
+    State(state): State<AppState>,
+    Path(nid): Path<Uuid>,
+    Json(body): Json<RenameNetworkBody>,
+) -> Response {
+    let trimmed = body.name.trim().to_string();
+    if trimmed.is_empty() {
+        return bad_request("name is required");
+    }
+    if !state.hub.rename_net(nid, trimmed.clone()).await {
+        return not_found("unknown network");
+    }
+    Json(serde_json::json!({ "id": nid, "name": trimmed })).into_response()
+}
+
+/// `DELETE /api/networks/:nid` — cascade-delete the network and every
+/// admitted/pending device row in it. Returns 204 on success.
+async fn delete_network(State(state): State<AppState>, Path(nid): Path<Uuid>) -> Response {
+    if !state.hub.delete_net(nid).await {
+        return not_found("unknown network");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn list_devices(State(state): State<AppState>, Path(nid): Path<Uuid>) -> Response {

@@ -29,6 +29,8 @@ pub const MAX_ADMIN_FRAME: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerAdminReq {
     MakeNet { name: String },
+    RenameNet { net_uuid: Uuid, name: String },
+    DeleteNet { net_uuid: Uuid },
     /// Mutate one or more fields of an approved client. `None` on a
     /// field means "leave unchanged"; setting `tap_ip = Some("")` or
     /// `lan_subnets = Some(vec![])` clears the field.
