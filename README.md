@@ -23,6 +23,11 @@ duplicative. The wire protocol is plaintext on the inside but is
 trivially carried by any of those tunnels — the SOCKS5 client is built
 in.
 
+In addition to the classic CLI, recent versions ship a **localhost-only
+WebUI** (`http://127.0.0.1:8080` by default) for inspecting networks
+and devices. The frontend is a small React app under `web/`; the
+backend is the same daemon binary. See [WebUI](#webui).
+
 ---
 
 ## Why Bifrost?
@@ -94,11 +99,13 @@ delegated to a tool that already solves them well.
 │  ├─ App  (state machine)            │         │  ├─ Hub  (single actor)             │
 │  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                    │
 │                                     │         │  ├─ SessionTask × N                 │
-└────────────────┬────────────────────┘         │  └─ admin  /run/bifrost/server.sock │
-                 │                               └──────────────────┬──────────────────┘
+│                                     │         │  ├─ admin  /run/bifrost/server.sock │
+│                                     │         │  └─ WebUI HTTP / WS  (127.0.0.1:8080)
+└────────────────┬────────────────────┘         └──────────────────┬──────────────────┘
+                 │                                                  │
                  │       postcard-framed wire protocol over TCP     │
                  │  (optionally tunneled through SOCKS5 → Xray /    │
-                 │   V2Ray / Shadowsocks / SSH -D / stunnel / ...)   │
+                 │   V2Ray / Shadowsocks / SSH -D / stunnel / ...)  │
                  └──────────────────────────────────────────────────┘
 ```
 
@@ -118,6 +125,14 @@ delegated to a tool that already solves them well.
   across transient network hiccups. Server-side it has a
   configurable disconnect timeout; client-side it never expires by
   itself.
+* **Routes are derived, not configured.** Each admitted client
+  declares the LAN subnets behind it (`lan_subnets`); the server
+  stitches them into a routing table at push time. No more global
+  `[[routes]]` to keep in sync.
+* **Two control surfaces, one source of truth.** The Unix-socket
+  admin RPC (`bifrost-server admin <cmd>`) and the localhost HTTP
+  API (`/api/...`) both go through the same `HubHandle` methods —
+  the WebUI is just another consumer of the data plane.
 
 ---
 
@@ -147,14 +162,21 @@ ssh root@<client-ip> "bifrost-client admin join <NET_UUID>"
 ssh root@<server-ip> 'bifrost-server admin list'             # find the sid
 ssh root@<server-ip> 'bifrost-server admin approve <SID>'
 
-# 6. Assign the client's TAP IP
-PREFIX=$(ssh root@<client-ip> \
-  'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2 | cut -c1-8')
-ssh root@<server-ip> "bifrost-server admin setip $PREFIX 10.0.0.2/24"
+# 6. Assign the client's TAP IP, name, and LAN subnets behind it
+CLIENT_UUID=$(ssh root@<client-ip> \
+  'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
+ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
+  --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
 
-# 7. Verify
+# 7. Push the derived route table to all members
+ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
+
+# 8. Verify
 ssh root@<server-ip> 'ping -c3 10.0.0.2'
 ```
+
+Optional — open `http://127.0.0.1:8080` (over an SSH port-forward) to
+get the same picture in a browser. See [WebUI](#webui).
 
 Subsequent reconnects auto-reuse the persisted state — both
 `approved_clients` and `joined_network` are written to TOML at the
@@ -168,8 +190,11 @@ appropriate moments.
 
 ```bash
 cargo build  --workspace
-cargo test   --workspace                                 # ~120 tests
+cargo test   --workspace                                 # ~134 tests
 cargo clippy --workspace --all-targets -- -D warnings
+
+# Frontend (optional — only if you're going to touch the WebUI)
+cd web && npm install && npm run build
 ```
 
 On macOS the binaries link against `NullPlatform` — they can run the
@@ -305,14 +330,27 @@ disconnect_timeout = 60       # seconds; how long a TAP outlives its socket
 [admin]
 socket = "/run/bifrost/server.sock"
 
+[web]                         # localhost-only by default; reach it via SSH -L
+enabled = true
+listen = "127.0.0.1:8080"
+
 [metrics]                     # reserved, not yet wired
 enabled = false
 listen = "127.0.0.1:9090"
 
-# These three sections are populated automatically by the daemon:
+# These two sections are populated automatically by the daemon:
 # [[networks]]          ← `mknet`
-# [[approved_clients]]  ← `approve` / `setip`
-# [[routes]]            ← `route add` / `route del`
+# [[approved_clients]]  ← `approve` / `device set`
+#
+# Each [[approved_clients]] row carries:
+#   client_uuid    = "..."           # set by the daemon
+#   net_uuid       = "..."           # set by the daemon
+#   tap_ip         = "10.0.0.2/24"   # `device set --ip`
+#   display_name   = "router"        # `device set --name`
+#   lan_subnets    = ["192.168.200.0/24"]   # `device set --lan`
+#
+# The server-wide route table is **derived** from `lan_subnets` —
+# there is no `[[routes]]` section any more.
 ```
 
 ### `client.toml`
@@ -353,15 +391,19 @@ which performs a single request-reply RPC and exits.
 | `mknet <name>` | Create a virtual network; returns its UUID. |
 | `approve <sid>` | Admit a pending client; allocates a TAP and adds it to the bridge. |
 | `deny <sid>` | Reject a pending client. |
-| `setip <prefix> <ip>` | Assign / clear a client's TAP IP. Pushed online if the client is currently bound. |
-| `route add <dst/cidr> via <gw>` | Persist a route in the server config. |
-| `route del <dst>` | Remove a route. |
-| `route list` | Same payload as `list`'s `routes` section. |
-| `route push` | Send the current route table to every bound client. |
-| `list` | Snapshot of networks, sessions, pending requests, and routes. |
+| `device list [<net-uuid>]` | List devices (admitted + currently pending). Filter by network if given. |
+| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | Mutate one device. Each flag is independent: omitted = no change; `--ip ""` clears; `--lan ""` clears the list. Live `SET_IP` is pushed if the device is online. |
+| `device push <net-uuid>` | Re-derive routes for the network (from every member's `lan_subnets`), install them on the server bridge, and send `SetRoutes` to each joined client. |
+| `list` | Snapshot of networks, sessions, and pending requests. |
 | `send <msg>` | Broadcast a `Frame::Text` to every connected client. |
 | `sendfile <path>` | Read a local file and broadcast it as `Frame::File`. |
 | `shutdown` | Ask the daemon to exit cleanly. |
+
+> Earlier versions had `setip` and `route add/del/push`. Both are gone:
+> the per-device `lan_subnets` field replaces the global routes table,
+> and `device set` subsumes `setip`. There is no migration path —
+> Bifrost is alpha; remove old `[[routes]]` from `server.toml` by hand
+> and re-create routes via `device set --lan`.
 
 ### `bifrost-client admin`
 
@@ -385,6 +427,58 @@ bifrost-client --repl
 
 The REPL shares the same dispatcher as the admin socket — single
 source of truth for command behavior.
+
+---
+
+## WebUI
+
+The server daemon ships a small HTTP + WebSocket API that the React
+frontend in `web/` consumes. By default it binds **`127.0.0.1:8080`**
+— that is the auth model. To use it from another host, port-forward
+over SSH:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@<server-ip>
+# then open http://127.0.0.1:8080 in your browser
+```
+
+Disable / move it via the `[web]` block in `server.toml`, or with the
+CLI flags `--web-listen <addr>` / `--no-web`.
+
+### Endpoints (read-only in v0.1)
+
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/api/networks` | List of networks with per-net `device_count` / `online_count`. |
+| `GET` | `/api/networks/:nid/devices` | Combined view of admitted + pending devices, including online state and TAP name. |
+| `GET` | `/ws` | WebSocket. v0.1 sends 25 s keepalive Pings; future phases push `metrics.tick`, `device.online`, `device.changed`, etc. |
+
+PATCH/POST endpoints (in-place edit, admit toggle, route push) land in
+the next phase.
+
+### Frontend dev workflow
+
+```bash
+cd web
+npm install
+npm run dev        # http://127.0.0.1:5173, proxies /api and /ws to backend
+```
+
+Set `BIFROST_BACKEND=http://<host>:<port>` if the server is somewhere
+other than `127.0.0.1:8080`.
+
+```bash
+npm run build      # → web/dist/
+```
+
+Today the SPA is served separately; `rust-embed`-based embedding into
+`bifrost-server` is on the roadmap. Pages currently shipping:
+
+* `/networks` — table of virtual networks, polls every 5 s.
+* `/networks/:nid` — table of devices in a network, with status badges
+  (online / offline / pending), name, TAP IP, LAN subnets, short UUID.
+* Header status badge — live / connecting / offline, driven by the
+  WebSocket connection.
 
 ---
 
@@ -434,8 +528,15 @@ bifrost/
 │  │  ├─ src/mock.rs                #   MockPlatform   (test helper, feature-gated)
 │  │  └─ src/linux/                 #   LinuxPlatform  (#[cfg(target_os="linux")])
 │  ├─ bifrost-core/                # Hub actor, Session state machine, config
+│  │  └─ src/routes.rs              #   derive routes from per-device lan_subnets
+│  ├─ bifrost-web/                 # axum HTTP / WS server consumed by web/
 │  ├─ bifrost-server/              # daemon binary + driver lib
 │  └─ bifrost-client/              # daemon binary + driver lib
+│
+├─ web/                            # React + Vite + TS + Tailwind frontend
+│  ├─ src/views/                   #   NetworkList, DeviceTable
+│  ├─ src/lib/                     #   api / ws / types / cn
+│  └─ src/components/ui/           #   Button, Card, Badge, Table primitives
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -451,24 +552,24 @@ bifrost/
 Crate dependency graph:
 
 ```
-bifrost-server     bifrost-client
-       │                 │
-       └────┬────────────┘
-            ▼
-       bifrost-core
-        │      │
-        ▼      ▼
-  bifrost-proto  bifrost-net
-                  │
-                  └─ #[cfg(target_os = "linux")]
-                       linux::{LinuxTap, LinuxBridge, LinuxPlatform}
+                     bifrost-server ──→ bifrost-web
+                          │                  │
+       bifrost-client ────┤                  │
+                          ▼                  ▼
+                     bifrost-core ←──────────┘
+                      │      │
+                      ▼      ▼
+                bifrost-proto  bifrost-net
+                                │
+                                └─ #[cfg(target_os = "linux")]
+                                     linux::{LinuxTap, LinuxBridge, LinuxPlatform}
 ```
 
 ---
 
 ## Status
 
-### Completed (P0)
+### Completed (P0 — core)
 
 * `bifrost-proto` — `Frame`, `FrameCodec`, admin RPC types
 * `bifrost-net` — `Tap` / `Bridge` traits + `MockPlatform` +
@@ -483,17 +584,33 @@ bifrost-server     bifrost-client
 * End-to-end production deployment verified against an Arch x86_64
   server and an Ubuntu 24.04 aarch64 client (tunnelling through
   Xray's SOCKS5)
-* 120 tests passing, clippy-clean with `-D warnings`
+
+### Completed (Phase 1.0–1.1 — WebUI groundwork)
+
+* **Per-device `lan_subnets`** replaces the global `[[routes]]`
+  table; route table is derived per-network at push time. CLI
+  surface migrated to `device list/set/push`.
+* **`bifrost-web` crate** — axum HTTP/WS server, default
+  `127.0.0.1:8080`, exposes `GET /api/networks` and
+  `GET /api/networks/:nid/devices` plus a `/ws` heartbeat.
+* **`web/` SPA** — React + Vite + TypeScript + Tailwind,
+  NetworkList + DeviceTable views, live status badge driven by
+  WebSocket connection state.
+* **134 tests passing**, clippy-clean with `-D warnings`.
 
 ### Roadmap
 
-| Item | Notes |
-|---|---|
-| **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
-| **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops |
-| **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |
-| **macOS / Windows clients** | `bifrost-net::macos::utun` (IP-only), `bifrost-net::windows::wintun` (full L2) |
-| **`route list` standalone formatting** | Currently piggybacks on `list`'s snapshot path |
+| Phase | Item | Notes |
+|---|---|---|
+| 1.2 | Per-session throughput + sparkline | `AtomicU64` byte counters in `SessionTask`; 1 Hz `metrics.tick` over WS; mini-graphs in the device table |
+| 1.3 | Write side: `PATCH device`, admit toggle, in-place edit, `POST routes/push` | HTTP endpoints + the React mutations behind them |
+| 1.4 | Graph view (React Flow), interchangeable with table view | Self-contained editor with optimistic updates |
+| 1.5 | Embed `web/dist/` into `bifrost-server` | Single-binary deploy via `rust-embed` + SPA fallback |
+| 2.x | Multi-network: `HubManager`, per-net `HubHandle`, network CRUD | Currently the URL paths are forward-compatible; the actor split is the actual work |
+| —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
+| —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (1.2 lays the groundwork) |
+| —   | **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |
+| —   | **macOS / Windows clients** | `bifrost-net::macos::utun` (IP-only), `bifrost-net::windows::wintun` (full L2) |
 
 ### Explicitly not planned
 

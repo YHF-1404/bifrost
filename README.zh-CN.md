@@ -18,8 +18,9 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 - **SOCKS5 出口** — 客户端可走代理穿透到服务器，便于在受限网络部署
 - **协议带版本号** — `Hello/HelloAck` 强制版本协商，未来加密升级（Noise / TLS）已经预留 `caps` bit
 - **断线复用** — Session 跨重连保 TAP，可配置 disconnect timeout 之后才回收
-- **REPL + Admin Unix socket** — daemon 默认无 REPL（适合 systemd），通过 `bifrost-{server,client} admin <cmd>` 子命令做一次性 RPC
-- **集中式 IP/路由分发** — 服务端 `setip` / `route` 命令热更新，自动落盘 + 推给在线客户端
+- **三套控制面同源** — daemon 默认起 admin Unix socket + 本机 HTTP/WS（默认 `127.0.0.1:8080`），可选前台 REPL；三者背后是同一个 `HubHandle`
+- **WebUI（v0.1 只读）** — `web/` 下的 React + Vite + Tailwind 应用；浏览网络 / 设备 / 在线状态。后续阶段加流量图表、就地编辑、节点拓扑视图
+- **路由表自动派生** — 每台设备声明背后的 `lan_subnets`，server 端 `device push` 时聚合下发，不再手维护 `[[routes]]`
 - **零外部 `ip` 命令依赖** — Linux 后端走 rtnetlink + ioctl 直连内核
 - **跨编译开箱即用** — `cross.toml` + Docker 一行编译 x86_64 / aarch64
 
@@ -34,9 +35,11 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 │  ├─ ConnTask  (TCP / SOCKS5)        │         │  ├─ TAP × N  (one per client)       │
 │  ├─ App  (state machine)            │         │  ├─ Hub  (single actor)             │
 │  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                    │
-│                                     │         │  ├─ SessionTask × N (per session)   │
-└────────────────┬────────────────────┘         │  └─ admin  /run/bifrost/server.sock │
-                 │                               └──────────────────┬──────────────────┘
+│                                     │         │  ├─ SessionTask × N                 │
+│                                     │         │  ├─ admin  /run/bifrost/server.sock │
+│                                     │         │  └─ WebUI HTTP / WS  (127.0.0.1:8080)
+└────────────────┬────────────────────┘         └──────────────────┬──────────────────┘
+                 │                                                  │
                  │     postcard-framed wire protocol over TCP       │
                  │     (optionally tunnelled through SOCKS5)        │
                  └──────────────────────────────────────────────────┘
@@ -44,9 +47,11 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 **关键设计**：
 
-- **Hub 单 actor**：所有控制态（networks / approved_clients / routes / sessions / pending / conns）由一个 `tokio::select!` 任务独占，外部只能通过 `mpsc<HubCmd>` 发命令；不再需要锁。
+- **Hub 单 actor**：所有控制态（networks / approved_clients / sessions / pending / conns）由一个 `tokio::select!` 任务独占，外部只能通过 `mpsc<HubCmd>` 发命令；不再需要锁。
 - **数据面 0 hop**：批准 join 时，Hub 把 `session_cmd_tx` 通过 `bind_tx` 推给 ConnTask，此后 ETH 帧 `socket → ConnTask → SessionTask → TAP` 直连，**不经 Hub**。
 - **Session 状态机**：`Joined → Disconnected → Dead`，server 端有 disconnect timeout，client 端用 `None` 表示"永不超时由用户控制"。
+- **路由派生而非配置**：每台 admitted client 声明 `lan_subnets`，`device push` 时由 server 聚合得出路由表，去掉了 `[[routes]]` 这个独立维度。
+- **两个控制面同源**：admin Unix socket（`bifrost-server admin <cmd>`）和本地 HTTP API（`/api/...`）背后都是 `HubHandle` 的方法；WebUI 只是另一个 consumer。
 
 ---
 
@@ -56,11 +61,14 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 120 个单测 / 集成测试
+cargo test  --workspace      # 134 个单测 / 集成测试
 cargo clippy --workspace --all-targets -- -D warnings
+
+# 前端（只在动 WebUI 时需要）
+cd web && npm install && npm run build
 ```
 
-macOS 上的二进制可以跑 daemon、admin RPC、所有协议层逻辑（用 `NullPlatform`），但 `create_tap` 会运行时报 `Unsupported`——TAP / bridge 仅 Linux 支持。
+macOS 上的二进制可以跑 daemon、admin RPC、HTTP/WS API、所有协议层逻辑（用 `NullPlatform`），但 `create_tap` 会运行时报 `Unsupported`——TAP / bridge 仅 Linux 支持。
 
 ### 交叉编译生产二进制（Linux 目标）
 
@@ -125,16 +133,22 @@ ssh root@<router-ip> 'bifrost-client admin join <NET_UUID>'
 ssh root@<server-ip> 'bifrost-server admin list'           # 看 sid
 ssh root@<server-ip> 'bifrost-server admin approve <SID>'
 
-# 给客户端分配 TAP IP（需要在 server 端 admin）
-CLIENT_PREFIX=$(ssh root@<router-ip> \
-  'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2 | cut -c1-8')
-ssh root@<server-ip> "bifrost-server admin setip $CLIENT_PREFIX 10.0.0.2/24"
+# 配置该设备：TAP IP、显示名、它背后的 LAN 网段
+CLIENT_UUID=$(ssh root@<router-ip> \
+  'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
+ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
+  --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
+
+# 重新派生路由表并下发给所有成员
+ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
 
 # 验证
 ssh root@<server-ip> 'ping -c 3 10.0.0.2'
 ```
 
 之后每次 client 重启都会用持久化的 `joined_network` 字段自动重连，server 端的 `approved_clients` 也已落盘 → 全部走自动批准路径。
+
+可选：开 `http://127.0.0.1:8080`（通过 SSH `-L` 转发）拿到同一份信息的可视化视图。详见下文 [WebUI](#webui)。
 
 ---
 
@@ -156,14 +170,26 @@ disconnect_timeout = 60       # 秒：socket 断开后 TAP 保留多久
 [admin]
 socket = "/run/bifrost/server.sock"
 
+[web]                         # 默认只绑 lo，要远程访问请走 SSH -L 隧道
+enabled = true
+listen = "127.0.0.1:8080"
+
 [metrics]                     # 暂未启用，预留
 enabled = false
 listen = "127.0.0.1:9090"
 
-# 以下三段由 daemon 自动填充，无需手编
+# 以下两段由 daemon 自动填充，无需手编
 # [[networks]]          → mknet
-# [[approved_clients]]  → approve / setip
-# [[routes]]            → route add / route del
+# [[approved_clients]]  → approve / device set
+#
+# 每个 [[approved_clients]] 行的字段：
+#   client_uuid    = "..."           # daemon 写入
+#   net_uuid       = "..."           # daemon 写入
+#   tap_ip         = "10.0.0.2/24"   # device set --ip
+#   display_name   = "router"        # device set --name
+#   lan_subnets    = ["192.168.200.0/24"]  # device set --lan
+#
+# 服务端的路由表是从 lan_subnets 派生出来的，不再有独立的 [[routes]] 段。
 ```
 
 ### `client.toml`
@@ -203,15 +229,15 @@ socket = "/run/bifrost/client.sock"
 | `mknet <name>` | 创建虚拟网络，返回 UUID |
 | `approve <sid>` | 批准 pending join；建 TAP + 入桥 + 发 JoinOk |
 | `deny <sid>` | 拒绝 pending join；发 JoinDeny |
-| `setip <prefix> <ip>` | 按 client UUID 前缀更新 TAP IP；在线客户端立即收到 SetIp |
-| `route add <dst/cidr> via <gw>` | 加路由（落盘） |
-| `route del <dst>` | 删路由 |
-| `route list` | 等同 `list` 中的 routes 段 |
-| `route push` | 把当前路由表推给所有 bound 客户端 |
-| `list` | networks / sessions / pending / routes 全量 snapshot |
+| `device list [<net-uuid>]` | 列设备（已 admit 的 + 当前 pending 的），可按 net 过滤 |
+| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | 改一台设备的字段。每个 flag 独立：缺省 = 不动；`--ip ""` 清空；`--lan ""` 清空 LAN 列表。在线设备会立即收到 `SET_IP` |
+| `device push <net-uuid>` | 重新从所有成员的 `lan_subnets` 派生路由表，本机 bridge 上 apply 一遍，并下发 `SetRoutes` 给该网络内所有 joined 客户端 |
+| `list` | networks / sessions / pending 全量 snapshot |
 | `send <msg>` | 向所有连入客户端广播文本 |
 | `sendfile <path>` | 把本地文件广播给所有客户端 |
 | `shutdown` | 让 daemon 优雅退出 |
+
+> 旧版本里的 `setip` 与 `route add/del/push` 已经全部移除。`device set --ip` 取代 `setip`；`route` 被 per-device `lan_subnets` + `device push` 取代。alpha 阶段，没有迁移路径——直接手工删除老 `server.toml` 里的 `[[routes]]` 段，然后 `device set --lan` 重建。
 
 ### `bifrost-client admin`
 
@@ -238,6 +264,53 @@ REPL 命令与 admin 子命令对齐。
 
 ---
 
+## WebUI
+
+server daemon 自带一个本机 HTTP + WebSocket 服务，前端在 `web/`，
+用 React + Vite + Tailwind 写。默认只绑 **`127.0.0.1:8080`**——这是
+鉴权模型本身。要从别的机器访问，请走 SSH 端口转发：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@<server-ip>
+# 浏览器打开 http://127.0.0.1:8080
+```
+
+`server.toml` 的 `[web]` 段可以改 listen 或彻底关掉；命令行也支持
+`--web-listen <addr>` / `--no-web` 临时覆盖。
+
+### Endpoints（v0.1 只读）
+
+| Method | Path | 返回 |
+|---|---|---|
+| `GET` | `/api/networks` | 网络列表 + 每网的 `device_count` / `online_count` |
+| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备的合并视图，含在线状态、TAP 名等 |
+| `GET` | `/ws` | WebSocket。v0.1 仅做 25 秒 keepalive；后续阶段会推 `metrics.tick` / `device.online` / `device.changed` |
+
+写入端点（就地编辑、admit 开关、`routes/push` 按钮）下一阶段添加。
+
+### 前端 dev 工作流
+
+```bash
+cd web
+npm install
+npm run dev        # http://127.0.0.1:5173；/api 与 /ws 自动 proxy 到 8080
+```
+
+如果 backend 不在 `127.0.0.1:8080`，设 `BIFROST_BACKEND=http://host:port`。
+
+```bash
+npm run build      # → web/dist/
+```
+
+当前 SPA 是单独 serve 的；`rust-embed` 把产物嵌进 `bifrost-server`
+单二进制是 1.5 阶段的事。当前能用的页面：
+
+- `/networks`：虚拟网络列表，5 秒轮询
+- `/networks/:nid`：该网下所有设备，行内显示状态徽章（online / offline / pending）、名字、TAP IP、LAN 子网、短 UUID
+- 顶栏的连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动
+
+---
+
 ## Project layout
 
 ```
@@ -257,10 +330,16 @@ bifrost/
 │  │                                #     LinuxBridge = rtnetlink
 │  │
 │  ├─ bifrost-core/                # 控制面：Hub + Session + Config + transport
-│  │                                #   纯逻辑，跨平台编译，覆盖率最高
+│  │  └─ src/routes.rs              #   per-network 路由派生（lan_subnets → RouteEntry）
 │  │
+│  ├─ bifrost-web/                 # axum HTTP/WS 服务，给前端用
 │  ├─ bifrost-server/              # 二进制 + lib：accept_loop / ConnTask / admin / repl
 │  └─ bifrost-client/              # 二进制 + lib：ConnTask 重连 / App / admin / repl
+│
+├─ web/                            # React + Vite + TS + Tailwind 前端
+│  ├─ src/views/                   #   NetworkList、DeviceTable
+│  ├─ src/lib/                     #   api / ws / types / cn
+│  └─ src/components/ui/           #   Button、Card、Badge、Table
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -278,17 +357,17 @@ bifrost/
 ### Crate 依赖图
 
 ```
-bifrost-server     bifrost-client
-       │                 │
-       └────┬────────────┘
-            ▼
-       bifrost-core
-        │      │
-        ▼      ▼
-  bifrost-proto  bifrost-net
-                  │
-                  └─ #[cfg(target_os = "linux")]
-                       linux:: { LinuxTap, LinuxBridge, LinuxPlatform }
+                     bifrost-server ──→ bifrost-web
+                          │                  │
+       bifrost-client ────┤                  │
+                          ▼                  ▼
+                     bifrost-core ←──────────┘
+                      │      │
+                      ▼      ▼
+                bifrost-proto  bifrost-net
+                                │
+                                └─ #[cfg(target_os = "linux")]
+                                     linux:: { LinuxTap, LinuxBridge, LinuxPlatform }
 ```
 
 ---
@@ -328,24 +407,35 @@ Admin RPC 是另一份独立协议：
 
 ## Status
 
-### 已完成（P0）
+### 已完成（P0 — core）
 
-- ✅ `bifrost-proto` — Frame + Codec + admin RPC types（24 单测）
+- ✅ `bifrost-proto` — Frame + Codec + admin RPC types
 - ✅ `bifrost-net` — Tap / Bridge trait + mock + null + Linux 后端（rtnetlink）
 - ✅ `bifrost-core` — Hub actor + Session 状态机 + config 持久化
 - ✅ `bifrost-server` / `bifrost-client` — daemon + admin Unix socket + 可选 REPL
 - ✅ 跨编译：x86_64-linux-gnu + aarch64-linux-gnu via `cross`
 - ✅ systemd unit + 部署脚本，已在生产 Arch + Ubuntu aarch64 跑通端到端
-- ✅ 测试：120 通过 + 1 ignored doctest
 
-### Roadmap（按优先级）
+### 已完成（Phase 1.0–1.1 — WebUI 基础）
 
-- ⏳ **Noise XX 加密 transport** — `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动
-- ⏳ **Prometheus metrics endpoint** — `metrics-exporter-prometheus`，命名规则见 `docs`（暂未恢复）
-- ⏳ **per-session pcap dump** — `pcap-file` crate，`SessionCmd::PcapStart/Stop` 已经定义，只缺实现
-- ⏳ **macOS / Windows 客户端** — `bifrost-net::macos::utun`（IP-only，需协议层补 L3 fallback）；`bifrost-net::windows::wintun`
-- ⏳ **`route list` 单独输出** — 当前 admin 复用 List 拿全量 snapshot，UX 上 `route list` 应该只打路由
-- ⏳ **`SetIp` 后客户端 `App.joined_tap_ip` 没更新** — `admin status` 显示 `tap_ip: -`，但内核里其实正确
+- ✅ **per-device `lan_subnets`** 取代全局 `[[routes]]`；路由表按需派生。CLI 改为 `device list/set/push`。
+- ✅ **`bifrost-web` crate** — axum HTTP/WS server，默认 `127.0.0.1:8080`，提供 `GET /api/networks` 与 `GET /api/networks/:nid/devices`，外加 `/ws` 心跳。
+- ✅ **`web/` SPA** — React + Vite + TypeScript + Tailwind，NetworkList + DeviceTable，顶栏连接状态实时反映 WebSocket 状态。
+- ✅ **134 个测试**通过，clippy `-D warnings` 干净。
+
+### Roadmap（按阶段）
+
+| 阶段 | 内容 | 备注 |
+|---|---|---|
+| 1.2 | per-session 流量计数 + sparkline | `SessionTask` 加 `AtomicU64` 字节计数；1 Hz `metrics.tick` 经 WS 下发；表格里画 mini 图 |
+| 1.3 | 写入侧：`PATCH device`、admit 开关、就地编辑、`POST routes/push` | HTTP 端点 + 前端 mutation |
+| 1.4 | 节点图视图（React Flow），与表格视图互通 | 自带就地编辑，乐观更新 |
+| 1.5 | `web/dist/` 嵌进 `bifrost-server` 单二进制 | `rust-embed` + SPA fallback |
+| 2.x | 多虚拟网：`HubManager`、per-net `HubHandle`、网络 CRUD | URL 已经是 `/api/networks/:nid/...`，主要工作是 actor 拆分 |
+| —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
+| —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基） |
+| —   | **per-session pcap dump** | `SessionCmd::PcapStart/Stop` 已经定义，只缺实现 |
+| —   | **macOS / Windows 客户端** | `bifrost-net::macos::utun`（IP-only）；`bifrost-net::windows::wintun`（完整 L2） |
 
 ### 不做
 
@@ -361,9 +451,10 @@ Admin RPC 是另一份独立协议：
 |---|---|
 | `bifrost-server.service: status=1/FAILURE` 启动后 `create bridge: No such device` | 内核没加载 `bridge` 模块。`modprobe bridge` 然后 `systemctl restart bifrost-server` |
 | `[!] connect failed: Connection refused` 客户端反复重试 | 服务端没起 / 防火墙 / SOCKS5 代理路径不通；`bifrost-client admin status` 看 `connected` |
-| `bifrost-server admin ...` 报 `[*] generated client uuid:` | 旧版本 bug，admin 路径会写 config。升级 client 二进制 |
+| 浏览器打开 `http://<server-ip>:8080` 看到 connection reset | WebUI 默认只绑 `127.0.0.1`。`ssh -L 8080:127.0.0.1:8080 root@<server-ip>` 转发即可，或者改 `[web].listen` |
 | `scp: dest open ...: Failure` | ETXTBSY，二进制正在跑。deploy 脚本应该已经处理；如果手动覆盖记得先 `systemctl stop` |
 | `WARN Specified IFLA_INET6_CONF NLA attribute holds more...` | `netlink-packet-route 0.19` 的良性兼容警告，新 kernel 加了字段。可忽略 |
+| 升级后老 `server.toml` 里仍有 `[[routes]]` | 这一段已被删除，新 daemon 加载时直接忽略；下一次保存会丢弃。要保留之前的路由信息，对照其 `via`，在对应 client 的行加 `lan_subnets = [...]` |
 
 ---
 
