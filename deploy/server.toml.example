@@ -15,6 +15,15 @@ listen = "127.0.0.1:9090"
 [admin]
 socket = "/run/bifrost/server.sock"
 
+# WebUI HTTP listener. The default in code is `127.0.0.1:8080` — safe
+# anywhere. On a VPS that's behind an external firewall (only the VPS
+# operator can reach 8080), bind to `0.0.0.0:8080` so the page loads
+# directly without an SSH tunnel. Do NOT bind publicly without a
+# firewall: there is no auth on the WebUI.
+[web]
+enabled = true
+listen = "0.0.0.0:8080"
+
 # `mknet` populates [[networks]] entries.
 # `approve` populates [[approved_clients]] entries.
 # `route add/del` populates [[routes]] entries.

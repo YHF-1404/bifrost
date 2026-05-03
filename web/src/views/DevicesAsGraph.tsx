@@ -152,29 +152,41 @@ export function DevicesAsGraph(props: DeviceViewProps) {
   return (
     // `flex-1` + `min-h-0` lets us fill whatever vertical space the
     // ancestor flex column has. `w-full` does the same horizontally.
-    <div className="min-h-0 w-full flex-1 rounded-lg border border-border">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        fitView
-        fitViewOptions={{ padding: 0.2, maxZoom: 1.1 }}
-        nodesConnectable={false}
-        nodesDraggable
-        edgesFocusable={false}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background variant={BackgroundVariant.Dots} gap={20} />
-        <Controls showInteractive={false} />
-        <MiniMap
-          pannable
-          zoomable
-          ariaLabel="Mini-map of devices in the network"
-          nodeColor={(n) => (n.type === "server" ? "#0f172a" : "#10b981")}
-        />
-      </ReactFlow>
+    //
+    // The inner `absolute inset-0` wrapper is load-bearing: ReactFlow
+    // renders its root with inline `height: 100%`, but a percentage
+    // height only resolves against a parent whose height is *definite*
+    // in CSS terms — and a flex item's used size, while pixel-precise
+    // at layout time, still has computed `height: auto` for percentage
+    // resolution. An absolutely-positioned div with all four offsets
+    // pinned to 0 *does* have a definite pixel size, so ReactFlow's
+    // 100% can finally resolve. Without this, the canvas collapses to
+    // 0px tall and the page looks blank.
+    <div className="relative min-h-0 w-full flex-1 rounded-lg border border-border">
+      <div className="absolute inset-0">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          fitView
+          fitViewOptions={{ padding: 0.2, maxZoom: 1.1 }}
+          nodesConnectable={false}
+          nodesDraggable
+          edgesFocusable={false}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background variant={BackgroundVariant.Dots} gap={20} />
+          <Controls showInteractive={false} />
+          <MiniMap
+            pannable
+            zoomable
+            ariaLabel="Mini-map of devices in the network"
+            nodeColor={(n) => (n.type === "server" ? "#0f172a" : "#10b981")}
+          />
+        </ReactFlow>
+      </div>
     </div>
   );
 }
