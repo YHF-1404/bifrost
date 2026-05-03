@@ -71,6 +71,7 @@ async fn networks_endpoint_returns_array() {
         tap_ip: "10.0.0.5/24".into(),
         display_name: "router".into(),
         lan_subnets: vec!["192.168.10.0/24".into()],
+        admitted: true,
     });
 
     let h = spawn(cfg).await;
@@ -101,6 +102,7 @@ async fn devices_endpoint_returns_approved() {
         tap_ip: "10.0.0.5/24".into(),
         display_name: "router".into(),
         lan_subnets: vec!["192.168.10.0/24".into()],
+        admitted: true,
     });
 
     let h = spawn(cfg).await;

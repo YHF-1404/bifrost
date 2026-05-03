@@ -34,7 +34,7 @@ pub fn run_blocking(tx: mpsc::Sender<(ServerAdminReq, oneshot::Sender<String>)>)
 
     println!(
         "REPL — same commands as `bifrost-server admin <cmd>`:\n  \
-         mknet <name> | approve <sid> | deny <sid> |\n  \
+         mknet <name> |\n  \
          device list [<net-uuid>] |\n  \
          device set <client-uuid> [name=X] [ip=Y/CIDR] [admit=true|false] [lan=A,B,...] |\n  \
          device push <net-uuid> |\n  \
@@ -88,12 +88,6 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
                 name: rest.to_string(),
             }
         }
-        "approve" => ServerAdminReq::Approve {
-            sid: parse_u64(rest)?,
-        },
-        "deny" => ServerAdminReq::Deny {
-            sid: parse_u64(rest)?,
-        },
         "device" => parse_device(rest)?,
         "list" => ServerAdminReq::List,
         "send" => {
@@ -123,10 +117,6 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
         other => return Err(format!("unknown command {other:?}")),
     };
     Ok(ReplCmd::Req(req))
-}
-
-fn parse_u64(s: &str) -> Result<u64, String> {
-    s.parse().map_err(|_| format!("expected integer, got {s:?}"))
 }
 
 /// `device list [<net-uuid>]`
@@ -214,14 +204,6 @@ mod tests {
             parse("mknet hml").unwrap(),
             ReplCmd::Req(ServerAdminReq::MakeNet { name: "hml".into() })
         );
-        assert_eq!(
-            parse("approve 7").unwrap(),
-            ReplCmd::Req(ServerAdminReq::Approve { sid: 7 })
-        );
-        assert_eq!(
-            parse("deny 9").unwrap(),
-            ReplCmd::Req(ServerAdminReq::Deny { sid: 9 })
-        );
         assert_eq!(parse("list").unwrap(), ReplCmd::Req(ServerAdminReq::List));
         assert_eq!(
             parse("send hi there").unwrap(),
@@ -300,7 +282,7 @@ mod tests {
     #[test]
     fn rejects_malformed() {
         assert_eq!(parse("garbage"), Err("unknown command \"garbage\"".into()));
-        assert!(parse("approve abc").is_err());
+        assert!(parse("approve 7").is_err()); // command removed
         assert!(parse("device").is_err());
         assert!(parse("device push not-a-uuid").is_err());
         assert!(parse("device set not-a-uuid").is_err());

@@ -74,8 +74,6 @@ async fn resolve_admin_socket(socket: Option<PathBuf>, config: &PathBuf) -> Resu
 async fn admin_client(socket: PathBuf, cmd: AdminCmd) -> Result<()> {
     let req = match cmd {
         AdminCmd::Mknet { name } => ServerAdminReq::MakeNet { name },
-        AdminCmd::Approve { sid } => ServerAdminReq::Approve { sid },
-        AdminCmd::Deny { sid } => ServerAdminReq::Deny { sid },
         AdminCmd::Device { action } => match action {
             DeviceAction::List { net_uuid } => ServerAdminReq::DeviceList { net_uuid },
             DeviceAction::Push { net_uuid } => ServerAdminReq::DevicePush { net_uuid },

@@ -29,8 +29,6 @@ pub const MAX_ADMIN_FRAME: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerAdminReq {
     MakeNet { name: String },
-    Approve { sid: u64 },
-    Deny { sid: u64 },
     /// Mutate one or more fields of an approved client. `None` on a
     /// field means "leave unchanged"; setting `tap_ip = Some("")` or
     /// `lan_subnets = Some(vec![])` clears the field.
@@ -120,7 +118,6 @@ pub struct SessionEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEntry {
-    pub sid: u64,
     pub client_uuid: Uuid,
     pub net_uuid: Uuid,
 }

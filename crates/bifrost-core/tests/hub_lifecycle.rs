@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
-use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, SessionCmd, SessionId};
+use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, SessionCmd};
 use bifrost_net::mock::{MockBridge, MockPlatform};
 use bifrost_net::{Bridge, Platform, Tap};
 use bifrost_proto::{Frame, PROTOCOL_VERSION};
@@ -48,6 +48,7 @@ fn approved(client_uuid: Uuid, net_uuid: Uuid, tap_ip: &str) -> ApprovedClient {
         tap_ip: tap_ip.to_string(),
         display_name: String::new(),
         lan_subnets: Vec::new(),
+        admitted: true,
     }
 }
 
@@ -63,6 +64,7 @@ fn approved_with_lan(
         tap_ip: tap_ip.to_string(),
         display_name: String::new(),
         lan_subnets: lan.iter().map(|s| s.to_string()).collect(),
+        admitted: true,
     }
 }
 
@@ -208,7 +210,10 @@ async fn join_without_hello_is_denied() {
 }
 
 #[tokio::test]
-async fn pending_then_approve_yields_join_ok() {
+async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
+    // No row exists for this client yet. handle_join creates one with
+    // admitted=false and parks the conn in pending — no JoinOk or
+    // JoinDeny is sent.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -222,18 +227,55 @@ async fn pending_then_approve_yields_join_ok() {
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
     h.hub.join(c.id, net).await;
 
-    // No frame should arrive — hub is waiting for admin to approve.
-    assert!(try_recv_silent(&mut c.frame_rx, Duration::from_millis(50))
+    // No frame should arrive — server holds the conn in pending state.
+    assert!(try_recv_silent(&mut c.frame_rx, Duration::from_millis(80))
         .await
         .is_none());
 
-    // Find the pending sid via list().
     let snap = h.hub.list().await.unwrap();
     assert_eq!(snap.pending.len(), 1);
-    let pending_sid = snap.pending[0].sid;
+    assert_eq!(snap.pending[0].client_uuid, client);
 
-    let approved = h.hub.approve(pending_sid).await;
-    assert!(approved);
+    // The device list shows the row in pending state (admitted=false,
+    // online=true).
+    let devices = h.hub.device_list(Some(net)).await;
+    assert_eq!(devices.len(), 1);
+    assert!(!devices[0].admitted);
+    assert!(devices[0].online);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn admit_toggle_on_promotes_pending_to_session() {
+    // Same as above, then admin flips admitted=true and a real session
+    // spawns; the conn finally gets JoinOk.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    let h = spawn(cfg).await;
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    h.hub.join(c.id, net).await;
+
+    // Flip admitted on.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                admitted: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
 
     match recv(&mut c.frame_rx).await {
         Frame::JoinOk { .. } => {}
@@ -245,37 +287,58 @@ async fn pending_then_approve_yields_join_ok() {
 }
 
 #[tokio::test]
-async fn pending_then_deny_yields_join_deny() {
+async fn admit_toggle_off_kicks_session_keeps_row_in_pending() {
+    // Admitted device with a live session. Flipping admitted=false
+    // should kick the session, drop the conn, and leave the row in
+    // approved_clients with admitted=false.
     let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
     cfg.networks.push(NetRecord {
         name: "n".into(),
         uuid: net,
     });
+    cfg.approved_clients
+        .push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
-    h.hub.hello(c.id, Uuid::new_v4(), PROTOCOL_VERSION).await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
     h.hub.join(c.id, net).await;
+    let _ = recv(&mut c.frame_rx).await; // JoinOk
+    let _ = recv_bind(&mut c.bind_rx).await;
+
+    // Live session.
+    let snap = h.hub.list().await.unwrap();
+    assert_eq!(snap.sessions.len(), 1);
+
+    // Kick.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                admitted: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
+
+    // Wait briefly for the session-died → handle_session_died cleanup
+    // path to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let snap = h.hub.list().await.unwrap();
-    let sid = snap.pending[0].sid;
-    assert!(h.hub.deny(sid).await);
+    assert_eq!(snap.sessions.len(), 0, "session must be killed");
 
-    match recv(&mut c.frame_rx).await {
-        Frame::JoinDeny { reason } => assert_eq!(reason, "denied_by_admin"),
-        other => panic!("expected JoinDeny, got {other:?}"),
-    }
-    assert_eq!(h.platform.taps_count().await, 0);
+    // The row remains in the device list with admitted=false.
+    let devices = h.hub.device_list(Some(net)).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].client_uuid, client);
+    assert!(!devices[0].admitted);
 
-    h.hub.shutdown().await;
-}
-
-#[tokio::test]
-async fn approve_unknown_sid_returns_false() {
-    let h = spawn(build_cfg(60)).await;
-    assert!(!h.hub.approve(SessionId(999)).await);
-    assert!(!h.hub.deny(SessionId(999)).await);
     h.hub.shutdown().await;
 }
 
@@ -910,8 +973,8 @@ where
 }
 
 #[tokio::test]
-async fn approve_emits_device_online() {
-    // Pending → approve → DeviceOnline.
+async fn admit_toggle_emits_device_online() {
+    // Pending join → admit toggle ON → DeviceOnline.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -934,9 +997,17 @@ async fn approve_emits_device_online() {
     .expect("expected DevicePending");
     assert!(matches!(pending, HubEvent::DevicePending { network, .. } if network == net));
 
-    // Find the sid + approve.
-    let sid = h.hub.list().await.unwrap().pending[0].sid;
-    h.hub.approve(sid).await;
+    // Flip admitted on via device_set.
+    h.hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                admitted: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
 
     // DeviceOnline should follow.
     let online = next_matching(&mut events, Duration::from_millis(500), |e| {
@@ -955,7 +1026,10 @@ async fn approve_emits_device_online() {
 }
 
 #[tokio::test]
-async fn device_set_emits_changed_then_remove() {
+async fn device_set_emits_changed_on_each_edit() {
+    // After the admit-toggle refactor, kick (admitted=false) emits
+    // `device.changed { admitted: false }`, NOT `device.removed`. Rows
+    // never disappear from the list — they just toggle admitted.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -982,10 +1056,11 @@ async fn device_set_emits_changed_then_remove() {
         matches!(e, HubEvent::DeviceChanged { .. })
     })
     .await
-    .expect("expected DeviceChanged");
+    .expect("expected DeviceChanged after rename");
     if let HubEvent::DeviceChanged { network, device } = changed {
         assert_eq!(network, net);
         assert_eq!(device.display_name, "router");
+        assert!(device.admitted);
     }
 
     // Kick.
@@ -999,13 +1074,16 @@ async fn device_set_emits_changed_then_remove() {
             },
         )
         .await;
-    let removed = next_matching(&mut events, Duration::from_millis(500), |e| {
-        matches!(e, HubEvent::DeviceRemoved { .. })
+    let kicked = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::DeviceChanged { device, .. } if !device.admitted)
     })
     .await
-    .expect("expected DeviceRemoved");
-    assert!(matches!(removed, HubEvent::DeviceRemoved { network, client_uuid }
-        if network == net && client_uuid == client));
+    .expect("expected DeviceChanged with admitted=false after kick");
+    if let HubEvent::DeviceChanged { network, device } = kicked {
+        assert_eq!(network, net);
+        assert_eq!(device.client_uuid, client);
+        assert!(!device.admitted);
+    }
 
     h.hub.shutdown().await;
 }

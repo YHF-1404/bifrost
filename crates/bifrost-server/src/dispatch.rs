@@ -4,7 +4,7 @@
 //! admin server route requests through [`dispatch`] so behavior stays
 //! identical between the two paths.
 
-use bifrost_core::{DevicePushResult, DeviceSetResult, DeviceUpdate, HubHandle, SessionId};
+use bifrost_core::{DevicePushResult, DeviceSetResult, DeviceUpdate, HubHandle};
 use bifrost_proto::admin::{
     NetEntry, PendingEntry, RouteRow, ServerAdminReq, ServerAdminResp, SessionEntry, SnapshotData,
 };
@@ -17,20 +17,6 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
             Some(uuid) => ServerAdminResp::NetCreated { uuid },
             None => ServerAdminResp::Error("hub gone".into()),
         },
-        ServerAdminReq::Approve { sid } => {
-            if hub.approve(SessionId(sid)).await {
-                ServerAdminResp::Ok
-            } else {
-                ServerAdminResp::NotFound
-            }
-        }
-        ServerAdminReq::Deny { sid } => {
-            if hub.deny(SessionId(sid)).await {
-                ServerAdminResp::Ok
-            } else {
-                ServerAdminResp::NotFound
-            }
-        }
         ServerAdminReq::DeviceSet {
             client_uuid,
             name,
@@ -100,7 +86,6 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
                     .pending
                     .iter()
                     .map(|p| PendingEntry {
-                        sid: p.sid.0,
                         client_uuid: p.client_uuid,
                         net_uuid: p.net_uuid,
                     })
@@ -232,8 +217,7 @@ pub fn format_resp(resp: &ServerAdminResp) -> String {
             for p in &snap.pending {
                 let _ = writeln!(
                     s,
-                    "  sid={} client={} net={}",
-                    p.sid,
+                    "  client={} net={}",
                     short(&p.client_uuid),
                     short(&p.net_uuid),
                 );

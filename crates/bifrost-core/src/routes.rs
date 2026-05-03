@@ -39,7 +39,13 @@ pub fn derive_routes_for_network(cfg: &ServerConfig, nid: Uuid) -> Vec<WireRoute
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for ac in cfg.approved_clients.iter().filter(|c| c.net_uuid == nid) {
+    for ac in cfg
+        .approved_clients
+        .iter()
+        // Pending rows (admitted=false) carry no usable via — they
+        // contribute nothing to the route table. Skip them.
+        .filter(|c| c.net_uuid == nid && c.admitted)
+    {
         // Strip the prefix off `tap_ip` to get just the bare address —
         // that's what goes in `via`. Skip clients without an IP.
         let Ok(tap_net) = IpNet::from_str(&ac.tap_ip) else {
@@ -110,6 +116,7 @@ mod tests {
             tap_ip: "10.0.0.2/24".into(),
             display_name: String::new(),
             lan_subnets: vec!["192.168.10.0/24".into(), "192.168.20.0/24".into()],
+            admitted: true,
         }]);
         let routes = derive_routes_for_network(&cfg, net);
         assert_eq!(routes.len(), 2);
@@ -125,6 +132,7 @@ mod tests {
             tap_ip: String::new(),
             display_name: String::new(),
             lan_subnets: vec!["192.168.10.0/24".into()],
+            admitted: true,
         }]);
         assert!(derive_routes_for_network(&cfg, net).is_empty());
     }
@@ -139,6 +147,7 @@ mod tests {
             tap_ip: "10.0.0.2/24".into(),
             display_name: String::new(),
             lan_subnets: vec!["192.168.10.0/24".into()],
+            admitted: true,
         }]);
         assert!(derive_routes_for_network(&cfg, net_a).is_empty());
     }
@@ -153,6 +162,7 @@ mod tests {
                 tap_ip: "10.0.0.2/24".into(),
                 display_name: String::new(),
                 lan_subnets: vec!["192.168.10.0/24".into()],
+                admitted: true,
             },
             ApprovedClient {
                 client_uuid: Uuid::new_v4(),
@@ -160,6 +170,7 @@ mod tests {
                 tap_ip: "10.0.0.3/24".into(),
                 display_name: String::new(),
                 lan_subnets: vec!["192.168.10.0/24".into()],
+                admitted: true,
             },
         ]);
         let routes = derive_routes_for_network(&cfg, net);
@@ -177,6 +188,7 @@ mod tests {
             display_name: String::new(),
             // 10.0.0.0/24 contains 10.0.0.2 — the via is inside dst.
             lan_subnets: vec!["10.0.0.0/24".into()],
+            admitted: true,
         }]);
         assert!(derive_routes_for_network(&cfg, net).is_empty());
     }
@@ -190,10 +202,25 @@ mod tests {
             tap_ip: "10.0.0.2/24".into(),
             display_name: String::new(),
             lan_subnets: vec!["not-a-cidr".into(), "192.168.10.0/24".into()],
+            admitted: true,
         }]);
         let routes = derive_routes_for_network(&cfg, net);
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].dst, "192.168.10.0/24");
+    }
+
+    #[test]
+    fn pending_rows_contribute_no_routes() {
+        let net = Uuid::new_v4();
+        let cfg = cfg_with(vec![ApprovedClient {
+            client_uuid: Uuid::new_v4(),
+            net_uuid: net,
+            tap_ip: "10.0.0.5/24".into(),
+            display_name: String::new(),
+            lan_subnets: vec!["192.168.10.0/24".into()],
+            admitted: false,
+        }]);
+        assert!(derive_routes_for_network(&cfg, net).is_empty());
     }
 
     #[test]

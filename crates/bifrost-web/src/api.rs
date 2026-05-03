@@ -4,10 +4,12 @@
 //!   GET    /networks
 //!   GET    /networks/:nid/devices
 //!   PATCH  /networks/:nid/devices/:cid
-//!   POST   /networks/:nid/devices/:cid/approve
-//!   POST   /networks/:nid/devices/:cid/deny
 //!   POST   /networks/:nid/routes/push
 //! ```
+//!
+//! Admit / kick are not separate endpoints — they're a field on PATCH:
+//! `{ "admitted": true }` admits, `{ "admitted": false }` kicks the
+//! device back to pending state without removing its row.
 //!
 //! Errors share a small JSON envelope: `{ "error": "<message>" }`.
 //! 4xx is for caller-fixable mistakes (unknown network, invalid CIDR,
@@ -18,7 +20,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use bifrost_core::{DeviceSetResult, DeviceUpdate, SessionId};
+use bifrost_core::{DeviceSetResult, DeviceUpdate};
 use bifrost_proto::admin::DeviceEntry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -30,11 +32,6 @@ pub fn router() -> Router<AppState> {
         .route("/networks", get(list_networks))
         .route("/networks/:nid/devices", get(list_devices))
         .route("/networks/:nid/devices/:cid", patch(patch_device))
-        .route(
-            "/networks/:nid/devices/:cid/approve",
-            post(approve_device),
-        )
-        .route("/networks/:nid/devices/:cid/deny", post(deny_device))
         .route("/networks/:nid/routes/push", post(push_routes))
 }
 
@@ -112,8 +109,11 @@ struct DeviceUpdateBody {
     lan_subnets: Option<Vec<String>>,
 }
 
-/// `PATCH /api/networks/:nid/devices/:cid` — mutate one already-admitted
-/// device. Pending devices use `/approve` or `/deny` instead.
+/// `PATCH /api/networks/:nid/devices/:cid` — mutate one device row.
+/// `admitted=true` promotes a pending row (and admits any waiting
+/// conn); `admitted=false` kicks an active session, dropping its
+/// conn and leaving the row in the list with admitted=false. Other
+/// fields edit metadata regardless of admit state.
 async fn patch_device(
     State(state): State<AppState>,
     Path((nid, cid)): Path<(Uuid, Uuid)>,
@@ -134,51 +134,6 @@ async fn patch_device(
         DeviceSetResult::InvalidIp => bad_request("invalid IP/CIDR"),
         DeviceSetResult::Conflict { msg } => conflict(msg),
     }
-}
-
-/// `POST /api/networks/:nid/devices/:cid/approve` — admit a currently-
-/// pending device. The body is empty; subsequent edits go through
-/// `PATCH`. The device must be in the network's pending list.
-async fn approve_device(
-    State(state): State<AppState>,
-    Path((nid, cid)): Path<(Uuid, Uuid)>,
-) -> Response {
-    if !network_exists(&state, nid).await {
-        return not_found("unknown network");
-    }
-    let sid = match find_pending_sid(&state, nid, cid).await {
-        Some(sid) => sid,
-        None => return not_found("no pending session for this device"),
-    };
-    if !state.hub.approve(SessionId(sid)).await {
-        return conflict("approve raced — pending session is gone");
-    }
-    // After approval, return the freshly-admitted device record (may
-    // have just landed in the approved_clients list).
-    let devs = state.hub.device_list(Some(nid)).await;
-    match devs.into_iter().find(|d| d.client_uuid == cid) {
-        Some(d) => Json(d).into_response(),
-        None => no_content(),
-    }
-}
-
-/// `POST /api/networks/:nid/devices/:cid/deny` — reject a pending
-/// device. No row is created in `approved_clients`.
-async fn deny_device(
-    State(state): State<AppState>,
-    Path((nid, cid)): Path<(Uuid, Uuid)>,
-) -> Response {
-    if !network_exists(&state, nid).await {
-        return not_found("unknown network");
-    }
-    let sid = match find_pending_sid(&state, nid, cid).await {
-        Some(sid) => sid,
-        None => return not_found("no pending session for this device"),
-    };
-    if !state.hub.deny(SessionId(sid)).await {
-        return conflict("deny raced — pending session is gone");
-    }
-    no_content()
 }
 
 /// Body of `POST /api/networks/:nid/routes/push`. Empty for now; left
@@ -223,14 +178,6 @@ async fn network_exists(state: &AppState, nid: Uuid) -> bool {
         .is_some_and(|s| s.networks.iter().any(|n| n.uuid == nid))
 }
 
-async fn find_pending_sid(state: &AppState, nid: Uuid, cid: Uuid) -> Option<u64> {
-    let snap = state.hub.list().await?;
-    snap.pending
-        .into_iter()
-        .find(|p| p.net_uuid == nid && p.client_uuid == cid)
-        .map(|p| p.sid.0)
-}
-
 fn service_unavailable(msg: &str) -> Response {
     err(StatusCode::SERVICE_UNAVAILABLE, msg)
 }
@@ -246,10 +193,6 @@ fn bad_request(msg: &str) -> Response {
 fn conflict(msg: impl Into<String>) -> Response {
     let m = msg.into();
     err(StatusCode::CONFLICT, &m)
-}
-
-fn no_content() -> Response {
-    StatusCode::NO_CONTENT.into_response()
 }
 
 fn err(status: StatusCode, msg: &str) -> Response {

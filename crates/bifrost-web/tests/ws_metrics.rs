@@ -32,6 +32,7 @@ async fn spawn_server() -> (SocketAddr, bifrost_core::HubHandle) {
         tap_ip: "10.0.0.5/24".into(),
         display_name: String::new(),
         lan_subnets: Vec::new(),
+        admitted: true,
     });
 
     let platform = MockPlatform::new();

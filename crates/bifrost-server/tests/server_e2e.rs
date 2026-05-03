@@ -57,6 +57,7 @@ async fn spawn_hub(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Ha
             tap_ip: ip.to_string(),
             display_name: String::new(),
             lan_subnets: Vec::new(),
+            admitted: true,
         });
     }
     let platform = MockPlatform::new();

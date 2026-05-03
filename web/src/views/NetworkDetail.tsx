@@ -20,8 +20,6 @@ export interface DeviceViewProps {
   networkId: string;
   devices: Device[];
   onUpdate: (cid: string, body: DeviceUpdateBody) => void;
-  onApprove: (cid: string) => void;
-  onDeny: (cid: string) => void;
 }
 
 const VIEW_MODE_KEY = "bifrost.viewMode";
@@ -81,20 +79,6 @@ export function NetworkDetail() {
     onSettled: () => qc.invalidateQueries({ queryKey }),
   });
 
-  const approveDevice = useMutation({
-    mutationFn: (cid: string) => api.approveDevice(nid!, cid),
-    onSuccess: () => pushToast("success", "device admitted"),
-    onError: (e) => pushToast("error", `approve failed: ${fmtErr(e)}`),
-    onSettled: () => qc.invalidateQueries({ queryKey }),
-  });
-
-  const denyDevice = useMutation({
-    mutationFn: (cid: string) => api.denyDevice(nid!, cid),
-    onSuccess: () => pushToast("info", "device denied"),
-    onError: (e) => pushToast("error", `deny failed: ${fmtErr(e)}`),
-    onSettled: () => qc.invalidateQueries({ queryKey }),
-  });
-
   const [pushing, setPushing] = useState(false);
   const pushRoutes = async () => {
     if (!nid) return;
@@ -128,8 +112,6 @@ export function NetworkDetail() {
         networkId: nid,
         devices: q.data ?? [],
         onUpdate: (cid, body) => updateDevice.mutate({ cid, body }),
-        onApprove: (cid) => approveDevice.mutate(cid),
-        onDeny: (cid) => denyDevice.mutate(cid),
       }
     : null;
 

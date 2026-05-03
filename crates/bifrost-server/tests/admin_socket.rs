@@ -48,6 +48,7 @@ async fn spawn(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Harnes
             tap_ip: ip.to_string(),
             display_name: String::new(),
             lan_subnets: Vec::new(),
+            admitted: true,
         });
     }
     let platform = MockPlatform::new();
@@ -173,13 +174,6 @@ async fn device_set_validates_invalid_subnet() {
     )
     .await;
     assert!(matches!(resp, ServerAdminResp::InvalidIp), "got {resp:?}");
-}
-
-#[tokio::test]
-async fn approve_unknown_returns_not_found() {
-    let h = spawn(vec![], vec![]).await;
-    let resp = rpc(&h.socket, ServerAdminReq::Approve { sid: 999 }).await;
-    assert!(matches!(resp, ServerAdminResp::NotFound));
 }
 
 #[tokio::test]

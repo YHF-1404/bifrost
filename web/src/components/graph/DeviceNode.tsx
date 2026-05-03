@@ -4,17 +4,15 @@ import { isCidr, shortUuid } from "@/lib/format";
 import { useDeviceMetrics } from "@/lib/metrics";
 import type { Device } from "@/lib/types";
 import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
 import { InlineEdit } from "@/components/InlineEdit";
 import { Sparkline } from "@/components/Sparkline";
+import { Switch } from "@/components/ui/Switch";
 
 // Same `Record<string, unknown>` extension as ServerNodeData — see
 // the comment there.
 export type DeviceNodeData = {
   device: Device;
   onUpdate: (cid: string, body: DeviceUpdateBody) => void;
-  onApprove: (cid: string) => void;
-  onDeny: (cid: string) => void;
 } & Record<string, unknown>;
 
 interface Props {
@@ -27,13 +25,14 @@ interface Props {
  *   - editable display_name and tap_ip (admitted only)
  *   - LAN subnets as tag chips
  *   - twin sparklines (in / out) over the last 60 s
- *   - admit/deny buttons for pending; kick for admitted
+ *   - per-node Switch that flips admitted on/off (same model as the
+ *     table view's switch).
  *
  * All edits go through the same `onUpdate` callback the table uses,
  * so cache + invalidation behavior is identical between views.
  */
 export function DeviceNode({ data }: Props) {
-  const { device: d, onUpdate, onApprove, onDeny } = data;
+  const { device: d, onUpdate } = data;
   const m = useDeviceMetrics(d.net_uuid, d.client_uuid);
   const live = d.online && d.admitted;
   const inSeries = m?.samples.map((s) => s.bps_in) ?? [];
@@ -57,10 +56,12 @@ export function DeviceNode({ data }: Props) {
       <div className="flex items-center gap-2">
         {live ? (
           <Badge variant="success">online</Badge>
-        ) : d.admitted ? (
-          <Badge variant="muted">offline</Badge>
-        ) : (
+        ) : !d.admitted && d.online ? (
           <Badge variant="default">pending</Badge>
+        ) : !d.admitted ? (
+          <Badge variant="muted">pending · offline</Badge>
+        ) : (
+          <Badge variant="muted">offline</Badge>
         )}
         <span
           className="ml-auto truncate font-mono text-[10px] text-muted-foreground"
@@ -70,62 +71,52 @@ export function DeviceNode({ data }: Props) {
         </span>
       </div>
 
-      {d.admitted ? (
-        <InlineEdit
-          value={d.display_name}
-          placeholder="click to name"
-          className="text-sm font-medium"
-          onCommit={(v) => onUpdate(d.client_uuid, { name: v })}
-        />
-      ) : (
-        <span className="text-sm italic text-muted-foreground">unnamed</span>
-      )}
+      <InlineEdit
+        value={d.display_name}
+        placeholder="click to name"
+        className="text-sm font-medium"
+        onCommit={(v) => onUpdate(d.client_uuid, { name: v })}
+      />
 
-      {d.admitted ? (
-        <InlineEdit
-          value={d.tap_ip ?? ""}
-          placeholder="click to set IP"
-          className="font-mono text-xs"
-          inputClassName="w-full font-mono text-xs"
-          validate={(v) => (v === "" || isCidr(v) ? null : "expected x.x.x.x/N")}
-          onCommit={(v) => onUpdate(d.client_uuid, { tap_ip: v })}
-        />
-      ) : (
-        <span className="font-mono text-xs text-muted-foreground">—</span>
-      )}
+      <InlineEdit
+        value={d.tap_ip ?? ""}
+        placeholder="click to set IP"
+        className="font-mono text-xs"
+        inputClassName="w-full font-mono text-xs"
+        validate={(v) => (v === "" || isCidr(v) ? null : "expected x.x.x.x/N")}
+        onCommit={(v) => onUpdate(d.client_uuid, { tap_ip: v })}
+      />
 
-      {d.admitted && (
-        <InlineEdit
-          value={d.lan_subnets.join(", ")}
-          placeholder="LAN subnets"
-          className="text-xs"
-          inputClassName="w-full font-mono text-xs"
-          display={(v) =>
-            v === "" ? (
-              <span className="text-xs italic text-muted-foreground">no LAN</span>
-            ) : (
-              <div className="flex flex-wrap gap-1">
-                {v.split(/\s*,\s*/).map((s) => (
-                  <Badge key={s} variant="outline" className="font-mono text-[10px]">
-                    {s}
-                  </Badge>
-                ))}
-              </div>
-            )
+      <InlineEdit
+        value={d.lan_subnets.join(", ")}
+        placeholder="LAN subnets"
+        className="text-xs"
+        inputClassName="w-full font-mono text-xs"
+        display={(v) =>
+          v === "" ? (
+            <span className="text-xs italic text-muted-foreground">no LAN</span>
+          ) : (
+            <div className="flex flex-wrap gap-1">
+              {v.split(/\s*,\s*/).map((s) => (
+                <Badge key={s} variant="outline" className="font-mono text-[10px]">
+                  {s}
+                </Badge>
+              ))}
+            </div>
+          )
+        }
+        validate={(v) => {
+          if (v === "") return null;
+          for (const p of v.split(/\s*,\s*/)) {
+            if (!isCidr(p)) return `bad CIDR: ${p}`;
           }
-          validate={(v) => {
-            if (v === "") return null;
-            for (const p of v.split(/\s*,\s*/)) {
-              if (!isCidr(p)) return `bad CIDR: ${p}`;
-            }
-            return null;
-          }}
-          onCommit={(v) => {
-            const list = v === "" ? [] : v.split(/\s*,\s*/).filter(Boolean);
-            onUpdate(d.client_uuid, { lan_subnets: list });
-          }}
-        />
-      )}
+          return null;
+        }}
+        onCommit={(v) => {
+          const list = v === "" ? [] : v.split(/\s*,\s*/).filter(Boolean);
+          onUpdate(d.client_uuid, { lan_subnets: list });
+        }}
+      />
 
       {live && (
         <div className="flex items-center gap-1.5">
@@ -158,25 +149,16 @@ export function DeviceNode({ data }: Props) {
         </div>
       )}
 
-      <div className="mt-1 flex justify-end gap-1">
-        {d.admitted ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => onUpdate(d.client_uuid, { admitted: false })}
-          >
-            Kick
-          </Button>
-        ) : (
-          <>
-            <Button size="sm" onClick={() => onApprove(d.client_uuid)}>
-              Approve
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => onDeny(d.client_uuid)}>
-              Deny
-            </Button>
-          </>
-        )}
+      <div className="mt-1 flex items-center gap-2">
+        <Switch
+          size="sm"
+          checked={d.admitted}
+          onChange={(next) => onUpdate(d.client_uuid, { admitted: next })}
+          label={d.admitted ? "Kick" : "Admit"}
+        />
+        <span className="text-[11px] text-muted-foreground">
+          {d.admitted ? "admitted" : "not admitted"}
+        </span>
       </div>
     </div>
   );

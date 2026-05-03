@@ -55,14 +55,6 @@ pub enum AdminCmd {
     Mknet {
         name: String,
     },
-    /// Approve a pending join request by session id.
-    Approve {
-        sid: u64,
-    },
-    /// Deny a pending join request by session id.
-    Deny {
-        sid: u64,
-    },
     /// Inspect or mutate per-device state.
     Device {
         #[command(subcommand)]

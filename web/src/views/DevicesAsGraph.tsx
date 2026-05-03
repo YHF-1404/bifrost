@@ -30,7 +30,7 @@ const nodeTypes = {
 };
 
 export function DevicesAsGraph(props: DeviceViewProps) {
-  const { devices, networkId, onUpdate, onApprove, onDeny } = props;
+  const { devices, networkId, onUpdate } = props;
 
   // Build nodes + edges. `useMemo` keyed on the IDs so changes that
   // don't add / remove devices skip the recomputation; positions are
@@ -64,14 +64,14 @@ export function DevicesAsGraph(props: DeviceViewProps) {
       id: `device:${d.client_uuid}`,
       type: "device",
       position: positions[i],
-      data: { device: d, onUpdate, onApprove, onDeny },
+      data: { device: d, onUpdate },
     }));
 
     return [serverNode, ...deviceNodes];
     // The mutation handlers come from a stable parent — but we
     // include them so a new closure forces re-render too.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idsKey, devices, networkId, onUpdate, onApprove, onDeny]);
+  }, [idsKey, devices, networkId, onUpdate]);
 
   const edges: Edge[] = useMemo(
     () =>

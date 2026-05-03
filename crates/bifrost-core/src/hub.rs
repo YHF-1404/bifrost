@@ -81,7 +81,6 @@ pub struct SessionInfo {
 
 #[derive(Debug, Clone)]
 pub struct PendingInfo {
-    pub sid: SessionId,
     pub client_uuid: Uuid,
     pub net_uuid: Uuid,
     pub conn: ConnId,
@@ -151,14 +150,6 @@ pub enum HubCmd {
     MakeNet {
         name: String,
         ack: oneshot::Sender<Uuid>,
-    },
-    Approve {
-        sid: SessionId,
-        ack: oneshot::Sender<bool>,
-    },
-    Deny {
-        sid: SessionId,
-        ack: oneshot::Sender<bool>,
     },
     List {
         ack: oneshot::Sender<HubSnapshot>,
@@ -257,27 +248,6 @@ impl HubHandle {
             .await
             .ok()?;
         rx.await.ok()
-    }
-
-    pub async fn approve(&self, sid: SessionId) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(HubCmd::Approve { sid, ack: tx })
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        rx.await.unwrap_or(false)
-    }
-
-    pub async fn deny(&self, sid: SessionId) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(HubCmd::Deny { sid, ack: tx }).await.is_err() {
-            return false;
-        }
-        rx.await.unwrap_or(false)
     }
 
     pub async fn list(&self) -> Option<HubSnapshot> {
@@ -407,13 +377,6 @@ struct SessionEntry {
     bytes_out: Arc<AtomicU64>,
 }
 
-struct PendingApproval {
-    sid: SessionId,
-    client_uuid: Uuid,
-    net_uuid: Uuid,
-    conn: ConnId,
-}
-
 // ─── Hub ─────────────────────────────────────────────────────────────────
 
 pub struct Hub {
@@ -428,7 +391,10 @@ pub struct Hub {
     conns: HashMap<ConnId, ConnEntry>,
     sessions: HashMap<(Uuid, Uuid), SessionEntry>,
     sessions_by_id: HashMap<SessionId, (Uuid, Uuid)>,
-    pending: HashMap<SessionId, PendingApproval>,
+    /// Conns that sent `Join` for a `(client, net)` row whose
+    /// `admitted=false`. The conn is held open silently; flipping the
+    /// switch to `admitted=true` promotes it into a real session.
+    pending: HashMap<(Uuid, Uuid), ConnId>,
 
     ids: IdAllocator,
 
@@ -623,8 +589,6 @@ impl Hub {
             HubCmd::Join { conn, net_uuid } => self.handle_join(conn, net_uuid).await,
             HubCmd::Disconnect { conn } => self.handle_disconnect(conn).await,
             HubCmd::MakeNet { name, ack } => self.handle_make_net(name, ack).await,
-            HubCmd::Approve { sid, ack } => self.handle_approve(sid, ack).await,
-            HubCmd::Deny { sid, ack } => self.handle_deny(sid, ack).await,
             HubCmd::List { ack } => self.handle_list(ack),
             HubCmd::DeviceList { net_uuid, ack } => self.handle_device_list(net_uuid, ack),
             HubCmd::DeviceSet {
@@ -687,8 +651,22 @@ impl Hub {
             }
         }
 
-        // Drop any pending approvals tied to this conn.
-        self.pending.retain(|_, p| p.conn != conn);
+        // If this conn was holding a pending row, release it. The row
+        // itself stays — the device just goes "offline + pending" in
+        // the UI until the client reconnects.
+        let dropped: Vec<(Uuid, Uuid)> = self
+            .pending
+            .iter()
+            .filter(|(_, c)| **c == conn)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in dropped {
+            self.pending.remove(&k);
+            self.emit(HubEvent::DeviceOffline {
+                network: k.1,
+                client_uuid: k.0,
+            });
+        }
     }
 
     // ── Join flow ────────────────────────────────────────────────────
@@ -766,41 +744,87 @@ impl Hub {
             return;
         }
 
-        // ── New session ───────────────────────────────────────────
-        let sid = self.ids.next_session();
-        let approved = self
+        // ── New (or returning) join ───────────────────────────────
+        // Look for an existing row, or create one with admitted=false
+        // so the device is now visible in the device list (in pending
+        // state) even before any admin action.
+        let key = (client_uuid, net_uuid);
+        let row_idx = self
             .cfg
             .approved_clients
             .iter()
-            .any(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid);
+            .position(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid);
 
-        if approved {
-            self.do_approve(sid, conn, client_uuid, net_uuid).await;
-        } else {
-            self.pending.insert(
-                sid,
-                PendingApproval {
-                    sid,
+        let (admitted, fresh_row) = match row_idx {
+            Some(i) => (self.cfg.approved_clients[i].admitted, false),
+            None => {
+                self.cfg.approved_clients.push(ApprovedClient {
                     client_uuid,
                     net_uuid,
-                    conn,
-                },
-            );
-            info!(?sid, %client_uuid, %net_uuid, "join awaiting approval");
-            self.emit(HubEvent::DevicePending {
-                network: net_uuid,
-                device: DeviceEntry {
-                    client_uuid,
-                    net_uuid,
+                    tap_ip: String::new(),
                     display_name: String::new(),
-                    admitted: false,
-                    tap_ip: None,
                     lan_subnets: Vec::new(),
-                    online: true,
-                    sid: Some(sid.0),
-                    tap_name: None,
-                },
-            });
+                    admitted: false,
+                });
+                self.persist().await;
+                (false, true)
+            }
+        };
+
+        if admitted {
+            // Row says auto-admit. Spin up a real session.
+            let sid = self.ids.next_session();
+            self.do_approve(sid, conn, client_uuid, net_uuid).await;
+            return;
+        }
+
+        // Row says pending. Hold the conn quietly. NO JoinDeny — the
+        // client is meant to be left waiting until an admin flips
+        // admitted to true (or until it disconnects on its own).
+        let was_already_pending = self.pending.contains_key(&key);
+        self.pending.insert(key, conn);
+        info!(?conn, %client_uuid, %net_uuid, "join awaiting admission");
+
+        // Emit DevicePending only when the row is genuinely new to the
+        // WebUI — either freshly created here, or it existed but had no
+        // pending conn before. (Reconnect of a known-pending device:
+        // emit DeviceChanged instead so the existing row's online
+        // state flips back to true.)
+        if fresh_row || !was_already_pending {
+            let device = DeviceEntry {
+                client_uuid,
+                net_uuid,
+                display_name: self
+                    .cfg
+                    .approved_clients
+                    .iter()
+                    .find(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid)
+                    .map(|a| a.display_name.clone())
+                    .unwrap_or_default(),
+                admitted: false,
+                tap_ip: None,
+                lan_subnets: self
+                    .cfg
+                    .approved_clients
+                    .iter()
+                    .find(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid)
+                    .map(|a| a.lan_subnets.clone())
+                    .unwrap_or_default(),
+                online: true,
+                sid: None,
+                tap_name: None,
+            };
+            if fresh_row {
+                self.emit(HubEvent::DevicePending {
+                    network: net_uuid,
+                    device,
+                });
+            } else {
+                self.emit(HubEvent::DeviceChanged {
+                    network: net_uuid,
+                    device,
+                });
+            }
         }
     }
 
@@ -898,14 +922,38 @@ impl Hub {
             let _ = c.link.bind_tx.send(Some(sess_cmd_tx)).await;
         }
 
-        // Persist whitelist entry so subsequent reconnects auto-approve.
-        if approved_entry.is_none() {
+        // Make sure the row is admitted — it may have been freshly
+        // created with admitted=false in handle_join (this code path
+        // also runs on the admit-flip-on-pending path in
+        // handle_device_set, where the row is always already true).
+        if let Some(row) = self
+            .cfg
+            .approved_clients
+            .iter_mut()
+            .find(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid)
+        {
+            if !row.admitted {
+                row.admitted = true;
+                self.persist().await;
+            }
+        }
+        // Belt-and-braces: if no row exists at all (shouldn't happen —
+        // handle_join always creates one — but be defensive), insert
+        // an admitted row.
+        if approved_entry.is_none()
+            && !self
+                .cfg
+                .approved_clients
+                .iter()
+                .any(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid)
+        {
             self.cfg.approved_clients.push(ApprovedClient {
                 client_uuid,
                 net_uuid,
                 tap_ip: String::new(),
                 display_name: String::new(),
                 lan_subnets: Vec::new(),
+                admitted: true,
             });
             self.persist().await;
         }
@@ -972,57 +1020,37 @@ impl Hub {
         let _ = ack.send(self.collect_devices(net_uuid));
     }
 
-    /// Build the combined view of every (client, net) — the union of
-    /// persisted `approved_clients` rows and currently-pending sessions.
+    /// Build the device list from `approved_clients` rows. Each row is
+    /// either admitted or pending; live runtime state (active session
+    /// or pending conn) layers on top of the persistent record.
     fn collect_devices(&self, filter_net: Option<Uuid>) -> Vec<DeviceEntry> {
-        let mut out = Vec::new();
-
-        // Approved (persistent) rows. May be online or offline.
-        for ac in self.cfg.approved_clients.iter() {
-            if let Some(want) = filter_net {
-                if ac.net_uuid != want {
-                    continue;
+        self.cfg
+            .approved_clients
+            .iter()
+            .filter(|ac| filter_net.is_none_or(|w| ac.net_uuid == w))
+            .map(|ac| {
+                let live = self.sessions.get(&(ac.client_uuid, ac.net_uuid));
+                let pending_conn = self.pending.contains_key(&(ac.client_uuid, ac.net_uuid));
+                DeviceEntry {
+                    client_uuid: ac.client_uuid,
+                    net_uuid: ac.net_uuid,
+                    display_name: ac.display_name.clone(),
+                    admitted: ac.admitted,
+                    tap_ip: if ac.tap_ip.is_empty() {
+                        None
+                    } else {
+                        Some(ac.tap_ip.clone())
+                    },
+                    lan_subnets: ac.lan_subnets.clone(),
+                    // "Online" means the client is connected. That's
+                    // either a real session (admitted) or a pending
+                    // conn awaiting admission.
+                    online: live.is_some() || pending_conn,
+                    sid: live.map(|s| s.sid.0),
+                    tap_name: live.map(|s| s.tap_name.clone()),
                 }
-            }
-            let live = self.sessions.get(&(ac.client_uuid, ac.net_uuid));
-            out.push(DeviceEntry {
-                client_uuid: ac.client_uuid,
-                net_uuid: ac.net_uuid,
-                display_name: ac.display_name.clone(),
-                admitted: true,
-                tap_ip: if ac.tap_ip.is_empty() {
-                    None
-                } else {
-                    Some(ac.tap_ip.clone())
-                },
-                lan_subnets: ac.lan_subnets.clone(),
-                online: live.is_some(),
-                sid: live.map(|s| s.sid.0),
-                tap_name: live.map(|s| s.tap_name.clone()),
-            });
-        }
-
-        // Pending sessions — clients connected but not yet admitted.
-        for p in self.pending.values() {
-            if let Some(want) = filter_net {
-                if p.net_uuid != want {
-                    continue;
-                }
-            }
-            out.push(DeviceEntry {
-                client_uuid: p.client_uuid,
-                net_uuid: p.net_uuid,
-                display_name: String::new(),
-                admitted: false,
-                tap_ip: None,
-                lan_subnets: Vec::new(),
-                online: true,
-                sid: Some(p.sid.0),
-                tap_name: None,
-            });
-        }
-
-        out
+            })
+            .collect()
     }
 
     async fn handle_device_set(
@@ -1068,66 +1096,26 @@ impl Hub {
             }
         }
 
-        // Locate (or create, on `admitted = Some(true)`) the row.
-        let idx = self
+        // Row must already exist — handle_join created one with
+        // admitted=false on first contact, and admin actions only target
+        // visible devices. There's no "create from nothing" UX anymore.
+        let idx = match self
             .cfg
             .approved_clients
             .iter()
-            .position(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid);
-
-        let want_admit = update.admitted.unwrap_or(false);
-        let idx = match idx {
+            .position(|a| a.client_uuid == client_uuid && a.net_uuid == net_uuid)
+        {
             Some(i) => i,
             None => {
-                if !want_admit {
-                    let _ = ack.send(DeviceSetResult::NotFound);
-                    return;
-                }
-                self.cfg.approved_clients.push(ApprovedClient {
-                    client_uuid,
-                    net_uuid,
-                    tap_ip: String::new(),
-                    display_name: String::new(),
-                    lan_subnets: Vec::new(),
-                });
-                self.cfg.approved_clients.len() - 1
+                let _ = ack.send(DeviceSetResult::NotFound);
+                return;
             }
         };
 
-        // `admitted = Some(false)` removes the persistent row. The
-        // running session (if any) keeps going until the next disconnect;
-        // any subsequent re-join will land in pending again.
-        if let Some(false) = update.admitted {
-            self.cfg.approved_clients.remove(idx);
-            self.persist().await;
-            // Routes may have changed (this device's lan_subnets are gone).
-            self.sync_local_routes().await;
-            let _ = ack.send(DeviceSetResult::Ok(DeviceEntry {
-                client_uuid,
-                net_uuid,
-                display_name: String::new(),
-                admitted: false,
-                tap_ip: None,
-                lan_subnets: Vec::new(),
-                online: self.sessions.contains_key(&(client_uuid, net_uuid)),
-                sid: self
-                    .sessions
-                    .get(&(client_uuid, net_uuid))
-                    .map(|s| s.sid.0),
-                tap_name: self
-                    .sessions
-                    .get(&(client_uuid, net_uuid))
-                    .map(|s| s.tap_name.clone()),
-            }));
-            self.emit(HubEvent::DeviceRemoved {
-                network: net_uuid,
-                client_uuid,
-            });
-            return;
-        }
-
-        // Apply field updates.
+        // Apply non-admit field updates first (these are independent
+        // of session state).
         let row = &mut self.cfg.approved_clients[idx];
+        let prev_admitted = row.admitted;
         if let Some(name) = update.name {
             row.display_name = name;
         }
@@ -1151,6 +1139,10 @@ impl Hub {
         } else {
             false
         };
+
+        // Admit toggle handling. `None` = leave admitted as-is.
+        let new_admitted = update.admitted.unwrap_or(prev_admitted);
+        row.admitted = new_admitted;
 
         // Capture cloned scalars for use after we drop the &mut row.
         let display_name = row.display_name.clone();
@@ -1185,19 +1177,57 @@ impl Hub {
         }
         let _ = lan_changed; // currently no immediate side effect
 
+        // Now act on the admit transition.
+        match (prev_admitted, new_admitted) {
+            (false, true) => {
+                // Flip ON: if there's a pending conn, promote it to a
+                // real session right now. Otherwise the next join from
+                // this client lands directly in `do_approve`.
+                if let Some(conn) = self.pending.remove(&(client_uuid, net_uuid)) {
+                    let sid = self.ids.next_session();
+                    self.do_approve(sid, conn, client_uuid, net_uuid).await;
+                }
+            }
+            (true, false) => {
+                // Flip OFF (kick): kill the live session and drop the
+                // bound conn. The client's reconnect loop fires; on
+                // reconnect, handle_join sees admitted=false and lands
+                // it back in pending — which is what the user expects.
+                let kick_target = self
+                    .sessions
+                    .get(&(client_uuid, net_uuid))
+                    .map(|s| (s.cmd_tx.clone(), s.bound_conn));
+                if let Some((cmd_tx, bound_conn)) = kick_target {
+                    let _ = cmd_tx.send(SessionCmd::Kill).await;
+                    if let Some(c_id) = bound_conn {
+                        // Removing the entry drops its frame_tx, so
+                        // ConnTask exits cleanly.
+                        self.conns.remove(&c_id);
+                    }
+                }
+                // Drop any pending conn too, so the new model is
+                // fully off:
+                if let Some(conn_id) = self.pending.remove(&(client_uuid, net_uuid)) {
+                    self.conns.remove(&conn_id);
+                }
+            }
+            // No transition.
+            _ => {}
+        }
+
         let live = self.sessions.get(&(client_uuid, net_uuid));
         let entry = DeviceEntry {
             client_uuid,
             net_uuid,
             display_name,
-            admitted: true,
+            admitted: new_admitted,
             tap_ip: if tap_ip_str.is_empty() {
                 None
             } else {
                 Some(tap_ip_str)
             },
             lan_subnets,
-            online: live.is_some(),
+            online: live.is_some() || self.pending.contains_key(&(client_uuid, net_uuid)),
             sid: live.map(|s| s.sid.0),
             tap_name: live.map(|s| s.tap_name.clone()),
         };
@@ -1295,39 +1325,6 @@ impl Hub {
         let _ = ack.send(count);
     }
 
-    async fn handle_approve(&mut self, sid: SessionId, ack: oneshot::Sender<bool>) {
-        let Some(p) = self.pending.remove(&sid) else {
-            let _ = ack.send(false);
-            return;
-        };
-        self.do_approve(p.sid, p.conn, p.client_uuid, p.net_uuid).await;
-        let _ = ack.send(true);
-    }
-
-    async fn handle_deny(&mut self, sid: SessionId, ack: oneshot::Sender<bool>) {
-        let Some(p) = self.pending.remove(&sid) else {
-            let _ = ack.send(false);
-            return;
-        };
-        if let Some(c) = self.conns.get(&p.conn) {
-            let _ = c
-                .link
-                .frame_tx
-                .send(Frame::JoinDeny {
-                    reason: "denied_by_admin".into(),
-                })
-                .await;
-        }
-        // The pending row simply disappears — no `[[approved_clients]]`
-        // entry was created — but the WebUI was rendering it as a
-        // "pending" device, so emit a removed event to clear that row.
-        self.emit(HubEvent::DeviceRemoved {
-            network: p.net_uuid,
-            client_uuid: p.client_uuid,
-        });
-        let _ = ack.send(true);
-    }
-
     fn handle_list(&self, ack: oneshot::Sender<HubSnapshot>) {
         let snap = HubSnapshot {
             networks: self.cfg.networks.clone(),
@@ -1345,12 +1342,11 @@ impl Hub {
                 .collect(),
             pending: self
                 .pending
-                .values()
-                .map(|p| PendingInfo {
-                    sid: p.sid,
-                    client_uuid: p.client_uuid,
-                    net_uuid: p.net_uuid,
-                    conn: p.conn,
+                .iter()
+                .map(|((cuid, nuid), conn)| PendingInfo {
+                    client_uuid: *cuid,
+                    net_uuid: *nuid,
+                    conn: *conn,
                 })
                 .collect(),
         };

@@ -83,18 +83,6 @@ export const api = {
       body,
     ) as Promise<Device>;
   },
-  approveDevice(networkId: string, clientUuid: string): Promise<Device> {
-    return sendJson<Device>(
-      "POST",
-      `/api/networks/${encodeURIComponent(networkId)}/devices/${encodeURIComponent(clientUuid)}/approve`,
-    ) as Promise<Device>;
-  },
-  denyDevice(networkId: string, clientUuid: string): Promise<null> {
-    return sendJson<null>(
-      "POST",
-      `/api/networks/${encodeURIComponent(networkId)}/devices/${encodeURIComponent(clientUuid)}/deny`,
-    ) as Promise<null>;
-  },
   pushRoutes(networkId: string): Promise<PushRoutesResp> {
     return sendJson<PushRoutesResp>(
       "POST",

@@ -144,6 +144,10 @@ pub struct NetRecord {
     pub uuid: Uuid,
 }
 
+/// One known `(client, net)` pair. Despite the historical name, a row
+/// here can be either currently *admitted* or *pending* (admitted=false)
+/// — see [`Self::admitted`]. The table is the union of "every device
+/// the admin has ever seen for this network."
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovedClient {
     pub client_uuid: Uuid,
@@ -159,6 +163,17 @@ pub struct ApprovedClient {
     /// `{ dst: subnet, via: tap_ip.addr() }`. See `crate::routes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lan_subnets: Vec<String>,
+    /// `true` = admitted to the network (gets a TAP, frames flow).
+    /// `false` = pending: the row is known but the device is held in
+    /// the join queue. Flipping this controls admission. Defaults to
+    /// `true` so configs from before the introduction of pending rows
+    /// load with their existing admit semantics.
+    #[serde(default = "default_admitted")]
+    pub admitted: bool,
+}
+
+fn default_admitted() -> bool {
+    true
 }
 
 /// Route as it appears on disk (client config) and on the wire — strings
@@ -318,6 +333,7 @@ mod tests {
             tap_ip: "10.0.0.2/24".to_owned(),
             display_name: "router".to_owned(),
             lan_subnets: vec!["192.168.10.0/24".to_owned()],
+            admitted: true,
         });
 
         cfg.save(&path).await.unwrap();
