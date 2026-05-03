@@ -69,6 +69,7 @@ export function DevicesAsTable({ devices, onUpdate }: DeviceViewProps) {
                     <InlineEdit
                       value={d.tap_ip ?? ""}
                       placeholder="click to set"
+                      examplePlaceholder="e.g. 10.0.0.5/24"
                       inputClassName="w-32 font-mono"
                       validate={(v) =>
                         v === "" || isCidr(v) ? null : "expected x.x.x.x/N"
@@ -80,6 +81,7 @@ export function DevicesAsTable({ devices, onUpdate }: DeviceViewProps) {
                     <InlineEdit
                       value={d.lan_subnets.join(", ")}
                       placeholder="comma-separated CIDRs"
+                      examplePlaceholder="e.g. 192.168.1.0/24, 10.0.0.0/16"
                       inputClassName="w-64 font-mono"
                       display={(v) =>
                         v === "" ? (

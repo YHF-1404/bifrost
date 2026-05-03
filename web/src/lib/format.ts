@@ -20,3 +20,20 @@ export function fmtErr(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
 }
+
+const BPS_UNITS = ["B/s", "KB/s", "MB/s", "GB/s"];
+
+/** Human-readable bytes-per-second, e.g. `1.2 MB/s`. The threshold is
+ *  1000 (decimal SI) so the numbers match the raw byte counters; we
+ *  switch to integer formatting once we exceed three digits to keep
+ *  the column width stable. */
+export function fmtBps(n: number): string {
+  if (n < 1) return "0";
+  let i = 0;
+  let v = n;
+  while (v >= 1000 && i < BPS_UNITS.length - 1) {
+    v /= 1000;
+    i += 1;
+  }
+  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${BPS_UNITS[i]}`;
+}

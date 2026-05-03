@@ -1,18 +1,6 @@
+import { fmtBps } from "@/lib/format";
 import { useDeviceMetrics } from "@/lib/metrics";
 import { Sparkline } from "./Sparkline";
-
-const UNITS = ["B/s", "KB/s", "MB/s", "GB/s"];
-
-function fmtBps(n: number): string {
-  if (n < 1) return "0";
-  let i = 0;
-  let v = n;
-  while (v >= 1000 && i < UNITS.length - 1) {
-    v /= 1000;
-    i += 1;
-  }
-  return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${UNITS[i]}`;
-}
 
 interface Props {
   network: string;

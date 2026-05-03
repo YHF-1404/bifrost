@@ -1,6 +1,6 @@
 import { Handle, Position } from "@xyflow/react";
 import type { DeviceUpdateBody } from "@/lib/api";
-import { isCidr, shortUuid } from "@/lib/format";
+import { fmtBps, isCidr, shortUuid } from "@/lib/format";
 import { useDeviceMetrics } from "@/lib/metrics";
 import type { Device } from "@/lib/types";
 import { Badge } from "@/components/ui/Badge";
@@ -38,6 +38,7 @@ export function DeviceNode({ data }: Props) {
   const inSeries = m?.samples.map((s) => s.bps_in) ?? [];
   const outSeries = m?.samples.map((s) => s.bps_out) ?? [];
   const yMax = Math.max(16, ...inSeries, ...outSeries);
+  const last = m?.samples[m.samples.length - 1];
 
   return (
     <div
@@ -46,12 +47,13 @@ export function DeviceNode({ data }: Props) {
         live ? "border-emerald-300" : d.admitted ? "border-border" : "border-primary/40",
       ].join(" ")}
     >
-      <Handle
-        type="target"
-        position={Position.Top}
-        className="!h-0 !w-0 !border-0 !bg-transparent"
-        isConnectable={false}
-      />
+      {/* Four invisible handles, one per side. FloatingEdge picks the
+          closest pair on render; we don't want any of them to be
+          interactively connectable. */}
+      <SideHandle id="tgt-top" position={Position.Top} type="target" />
+      <SideHandle id="tgt-right" position={Position.Right} type="target" />
+      <SideHandle id="tgt-bottom" position={Position.Bottom} type="target" />
+      <SideHandle id="tgt-left" position={Position.Left} type="target" />
 
       <div className="flex items-center gap-2">
         {live ? (
@@ -81,6 +83,7 @@ export function DeviceNode({ data }: Props) {
       <InlineEdit
         value={d.tap_ip ?? ""}
         placeholder="click to set IP"
+        examplePlaceholder="e.g. 10.0.0.5/24"
         className="font-mono text-xs"
         inputClassName="w-full font-mono text-xs"
         validate={(v) => (v === "" || isCidr(v) ? null : "expected x.x.x.x/N")}
@@ -90,6 +93,7 @@ export function DeviceNode({ data }: Props) {
       <InlineEdit
         value={d.lan_subnets.join(", ")}
         placeholder="LAN subnets"
+        examplePlaceholder="e.g. 192.168.1.0/24, 10.0.0.0/16"
         className="text-xs"
         inputClassName="w-full font-mono text-xs"
         display={(v) =>
@@ -119,31 +123,37 @@ export function DeviceNode({ data }: Props) {
       />
 
       {live && (
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 font-mono text-[11px]">
           <span className="text-emerald-600" aria-hidden>
             ▼
+          </span>
+          <span className="w-16 tabular-nums text-right text-foreground">
+            {fmtBps(last?.bps_in ?? 0)}
           </span>
           <Sparkline
             values={inSeries}
             variant="fill"
             yMax={yMax}
-            width={120}
-            height={16}
+            width={80}
+            height={14}
             className="text-emerald-600"
           />
         </div>
       )}
       {live && (
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 font-mono text-[11px]">
           <span className="text-sky-600" aria-hidden>
             ▲
+          </span>
+          <span className="w-16 tabular-nums text-right text-foreground">
+            {fmtBps(last?.bps_out ?? 0)}
           </span>
           <Sparkline
             values={outSeries}
             variant="fill"
             yMax={yMax}
-            width={120}
-            height={16}
+            width={80}
+            height={14}
             className="text-sky-600"
           />
         </div>
@@ -161,5 +171,25 @@ export function DeviceNode({ data }: Props) {
         </span>
       </div>
     </div>
+  );
+}
+
+function SideHandle({
+  id,
+  position,
+  type,
+}: {
+  id: string;
+  position: Position;
+  type: "source" | "target";
+}) {
+  return (
+    <Handle
+      id={id}
+      type={type}
+      position={position}
+      className="!h-0 !w-0 !border-0 !bg-transparent"
+      isConnectable={false}
+    />
   );
 }

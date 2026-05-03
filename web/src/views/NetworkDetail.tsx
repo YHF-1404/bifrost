@@ -9,7 +9,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, type DeviceUpdateBody } from "@/lib/api";
 import { fmtErr } from "@/lib/format";
 import { pushToast } from "@/lib/toast";
-import type { Device } from "@/lib/types";
+import type { Device, Network } from "@/lib/types";
 import { Button } from "@/components/ui/Button";
 import { DevicesAsGraph } from "./DevicesAsGraph";
 import { DevicesAsTable } from "./DevicesAsTable";
@@ -18,8 +18,14 @@ export type ViewMode = "table" | "graph";
 
 export interface DeviceViewProps {
   networkId: string;
+  /** Display name for the network — shown on the Hub card in graph
+   *  mode. Empty string if not yet loaded. */
+  networkName: string;
   devices: Device[];
   onUpdate: (cid: string, body: DeviceUpdateBody) => void;
+  /** Rename the current network. Optimistic; `Network.name` updates
+   *  on the next `network.changed` event. */
+  onRenameNetwork: (name: string) => void;
 }
 
 const VIEW_MODE_KEY = "bifrost.viewMode";
@@ -44,6 +50,18 @@ export function NetworkDetail() {
     refetchInterval: 30_000,
     enabled: !!nid,
   });
+
+  // We also need the network's display name for the Hub card. The
+  // networks list is already cached if the user navigated here from
+  // the index page; if they deep-linked, we fetch it the same way the
+  // index page does.
+  const networksQ = useQuery({
+    queryKey: ["networks"] as const,
+    queryFn: () => api.listNetworks(),
+    refetchInterval: 30_000,
+  });
+  const networkName: string =
+    networksQ.data?.find((n: Network) => n.id === nid)?.name ?? "";
 
   // ── Mutations ─────────────────────────────────────────────────────────
 
@@ -79,6 +97,23 @@ export function NetworkDetail() {
     onSettled: () => qc.invalidateQueries({ queryKey }),
   });
 
+  const renameNet = useMutation({
+    mutationFn: (name: string) => api.renameNetwork(nid!, name),
+    onMutate: async (name) => {
+      await qc.cancelQueries({ queryKey: ["networks"] });
+      const prev = qc.getQueryData<Network[]>(["networks"]);
+      qc.setQueryData<Network[]>(["networks"], (old) =>
+        old?.map((n) => (n.id === nid ? { ...n, name } : n)) ?? [],
+      );
+      return { prev };
+    },
+    onError: (err, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["networks"], ctx.prev);
+      pushToast("error", `rename failed: ${fmtErr(err)}`);
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ["networks"] }),
+  });
+
   const [pushing, setPushing] = useState(false);
   const pushRoutes = async () => {
     if (!nid) return;
@@ -110,8 +145,10 @@ export function NetworkDetail() {
   const childProps: DeviceViewProps | null = nid
     ? {
         networkId: nid,
+        networkName,
         devices: q.data ?? [],
         onUpdate: (cid, body) => updateDevice.mutate({ cid, body }),
+        onRenameNetwork: (name) => renameNet.mutate(name),
       }
     : null;
 
