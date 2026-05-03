@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Navigate, Route, BrowserRouter as Router, Routes } from "react-router-dom";
 import { Layout } from "@/components/Layout";
+import { Toaster } from "@/components/Toaster";
 import { DeviceTable } from "@/views/DeviceTable";
 import { NetworkList } from "@/views/NetworkList";
 
@@ -27,6 +28,7 @@ export default function App() {
           </Route>
         </Routes>
       </Router>
+      <Toaster />
     </QueryClientProvider>
   );
 }
