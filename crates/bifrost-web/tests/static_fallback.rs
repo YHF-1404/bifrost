@@ -41,8 +41,9 @@ async fn spawn() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     drop(listener);
     let (st, _rx) = mpsc::channel::<()>(1);
+    let state_dir = tempfile::tempdir().unwrap().keep();
     tokio::spawn(async move {
-        let _ = bifrost_web::serve(addr, handle, st).await;
+        let _ = bifrost_web::serve(addr, handle, state_dir, st).await;
     });
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {

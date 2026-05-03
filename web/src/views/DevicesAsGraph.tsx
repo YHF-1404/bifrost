@@ -6,11 +6,13 @@
 //
 // Two interactions worth calling out:
 //
-//   * **Position persistence.** The user can drag any node anywhere;
-//     positions are kept in localStorage keyed by network id and
-//     replayed on next mount, so a refresh doesn't reset to the ring
-//     layout. Brand-new devices fall back to the next free ring slot
-//     so a freshly joined device doesn't land on top of the hub.
+//   * **Position persistence (server-side).** Drag-determined positions
+//     are PUT to `/api/networks/:nid/layout` debounced after each
+//     drag-end, and fetched on mount. So a fresh browser on a
+//     different machine — or a Ctrl-Shift-Del — still loads the same
+//     arrangement. Pre-server-load and on transient network errors we
+//     fall back to localStorage so dragging stays snappy without a
+//     round-trip per drop.
 //
 //   * **Floating edges.** Each node exposes four invisible handles
 //     (top/right/bottom/left midpoints). The custom `FloatingEdge`
@@ -18,6 +20,7 @@
 //     hub's right and the edge swings to enter on its left side. See
 //     `components/graph/FloatingEdge.tsx`.
 
+import { useQuery } from "@tanstack/react-query";
 import {
   Background,
   BackgroundVariant,
@@ -42,6 +45,7 @@ import {
   type XY,
   deviceRingPositions,
 } from "@/components/graph/graphLayout";
+import { api } from "@/lib/api";
 import type { DeviceViewProps } from "./NetworkDetail";
 
 const nodeTypes = {
@@ -54,12 +58,15 @@ const edgeTypes: EdgeTypes = {
 };
 
 // localStorage key — versioned so a future schema change can ignore
-// stale entries instead of crashing.
+// stale entries instead of crashing. Used as a fallback while the
+// server fetch is in flight (so dragging stays snappy on first load
+// after a refresh) and as a write-through cache so an offline server
+// doesn't lose drags either.
 const POSITIONS_KEY_PREFIX = "bifrost.graph.positions.v1.";
 
 type PositionMap = Record<string, XY>;
 
-function loadPositions(networkId: string): PositionMap {
+function loadLocalPositions(networkId: string): PositionMap {
   try {
     const raw = localStorage.getItem(POSITIONS_KEY_PREFIX + networkId);
     if (!raw) return {};
@@ -71,12 +78,11 @@ function loadPositions(networkId: string): PositionMap {
   }
 }
 
-function savePositions(networkId: string, map: PositionMap) {
+function saveLocalPositions(networkId: string, map: PositionMap) {
   try {
     localStorage.setItem(POSITIONS_KEY_PREFIX + networkId, JSON.stringify(map));
   } catch {
-    // Quota exceeded / private mode — silently ignore. Persistence is
-    // a UX nicety, not a correctness requirement.
+    // Quota exceeded / private mode — fine, server-side is authoritative.
   }
 }
 
@@ -146,11 +152,53 @@ function buildEdges(
   });
 }
 
+// Debounce latency for layout PUTs. Long enough that flicking a node
+// across the canvas doesn't generate a request per pixel, short enough
+// that a fresh browser on a different machine sees the new position
+// without a noticeable lag. We don't try to coalesce across multiple
+// nodes — each drag end fires once, and the request body is the
+// *whole* map, so the latest write always wins.
+const LAYOUT_PUT_DEBOUNCE_MS = 300;
+
 export function DevicesAsGraph(props: DeviceViewProps) {
   const { devices, networkId, networkName, onUpdate, onRenameNetwork } = props;
 
-  // Saved positions. Read once on mount; mutated as the user drags.
-  const positionsRef = useRef<PositionMap>(loadPositions(networkId));
+  // Server-side layout — single source of truth across browsers. The
+  // localStorage map is just a warm cache while the GET is in flight
+  // and a write-through copy in case the PUT fails.
+  const layoutQ = useQuery({
+    queryKey: ["layout", networkId] as const,
+    queryFn: () => api.getLayout(networkId),
+    // Don't refetch on every focus; positions only change when this
+    // tab edits them, and `network.changed` events don't carry layout
+    // info anyway.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
+
+  // Working copy of positions. Seeded from localStorage immediately
+  // (zero round-trip), then replaced with the server's view as soon
+  // as that GET completes. Mutated by drag handlers.
+  const positionsRef = useRef<PositionMap>(loadLocalPositions(networkId));
+
+  // Once the server's layout arrives, merge it in. Server wins for
+  // any id present in both maps; ids only known locally (e.g. a node
+  // dragged while offline) survive until the next PUT goes through.
+  useEffect(() => {
+    if (!layoutQ.data) return;
+    positionsRef.current = {
+      ...positionsRef.current,
+      ...layoutQ.data.positions,
+    };
+    setNodes((current) =>
+      current.map((n) => {
+        const saved = positionsRef.current[n.id];
+        return saved ? { ...n, position: saved } : n;
+      }),
+    );
+    // setNodes is stable per React Flow's contract.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutQ.data]);
 
   const initialNodes = useMemo(
     () =>
@@ -176,10 +224,27 @@ export function DevicesAsGraph(props: DeviceViewProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
+  // Debounce PUTs so flicking a node across the canvas doesn't fire
+  // one request per pixel.
+  const putTimerRef = useRef<number | null>(null);
+  const schedulePutLayout = useCallback(() => {
+    if (putTimerRef.current !== null) {
+      window.clearTimeout(putTimerRef.current);
+    }
+    putTimerRef.current = window.setTimeout(() => {
+      putTimerRef.current = null;
+      // Fire-and-forget. PUT failures aren't user-visible — the next
+      // successful PUT overwrites them. localStorage is the safety net.
+      void api
+        .putLayout(networkId, { positions: positionsRef.current })
+        .catch(() => {});
+    }, LAYOUT_PUT_DEBOUNCE_MS);
+  }, [networkId]);
+
   // Wrap onNodesChange so we can persist positions whenever the user
   // releases a drag. React Flow emits `position` changes both during
-  // and at the end of a drag — we only persist on `dragging: false` to
-  // avoid hammering localStorage.
+  // and at the end of a drag — we only persist on `dragging: false`
+  // so localStorage and the network only see end-state positions.
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       onNodesChange(changes);
@@ -190,9 +255,12 @@ export function DevicesAsGraph(props: DeviceViewProps) {
           touched = true;
         }
       }
-      if (touched) savePositions(networkId, positionsRef.current);
+      if (touched) {
+        saveLocalPositions(networkId, positionsRef.current);
+        schedulePutLayout();
+      }
     },
-    [onNodesChange, networkId],
+    [onNodesChange, networkId, schedulePutLayout],
   );
 
   // Stable signature of "which devices are present, in what order".
@@ -205,7 +273,7 @@ export function DevicesAsGraph(props: DeviceViewProps) {
 
   // Sync data fields on every prop change without disturbing
   // positions the user may have dragged or that we restored from
-  // localStorage on mount.
+  // server / localStorage on mount.
   useEffect(() => {
     setNodes((current) => {
       const next = buildNodes(

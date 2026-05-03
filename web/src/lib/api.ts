@@ -31,7 +31,7 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 async function sendJson<T>(
-  method: "PATCH" | "POST" | "DELETE",
+  method: "PATCH" | "POST" | "PUT" | "DELETE",
   url: string,
   body?: unknown,
 ): Promise<T | null> {
@@ -63,6 +63,13 @@ export interface DeviceUpdateBody {
 export interface PushRoutesResp {
   count: number;
   routes: Array<{ dst: string; via: string }>;
+}
+
+/** Per-network graph layout: a map of node id → { x, y } in flow space.
+ *  The keys match the IDs the frontend assigns (`server:<nid>`,
+ *  `device:<cuid>`). Empty map = nothing saved yet. */
+export interface GraphLayout {
+  positions: Record<string, { x: number; y: number }>;
 }
 
 export const api = {
@@ -106,6 +113,18 @@ export const api = {
       "POST",
       `/api/networks/${encodeURIComponent(networkId)}/routes/push`,
     ) as Promise<PushRoutesResp>;
+  },
+  getLayout(networkId: string): Promise<GraphLayout> {
+    return getJson<GraphLayout>(
+      `/api/networks/${encodeURIComponent(networkId)}/layout`,
+    );
+  },
+  putLayout(networkId: string, layout: GraphLayout): Promise<null> {
+    return sendJson<null>(
+      "PUT",
+      `/api/networks/${encodeURIComponent(networkId)}/layout`,
+      layout,
+    ) as Promise<null>;
   },
 };
 

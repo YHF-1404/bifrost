@@ -63,8 +63,9 @@ async fn spawn_server() -> (SocketAddr, bifrost_core::HubHandle) {
 
     let (st, _stx) = mpsc::channel::<()>(1);
     let h = handle.clone();
+    let state_dir = tempfile::tempdir().unwrap().keep();
     tokio::spawn(async move {
-        let _ = bifrost_web::serve(addr, h, st).await;
+        let _ = bifrost_web::serve(addr, h, state_dir, st).await;
     });
 
     // Wait for the listener.

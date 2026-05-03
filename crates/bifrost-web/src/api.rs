@@ -8,6 +8,8 @@
 //!   GET    /networks/:nid/devices
 //!   PATCH  /networks/:nid/devices/:cid
 //!   POST   /networks/:nid/routes/push
+//!   GET    /networks/:nid/layout
+//!   PUT    /networks/:nid/layout
 //! ```
 //!
 //! Admit / kick are not separate endpoints — they're a field on PATCH:
@@ -23,6 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use bifrost_core::atomic_write::write_atomic;
 use bifrost_core::{DeviceSetResult, DeviceUpdate};
 use bifrost_proto::admin::DeviceEntry;
 use serde::{Deserialize, Serialize};
@@ -40,6 +43,10 @@ pub fn router() -> Router<AppState> {
         .route("/networks/:nid/devices", get(list_devices))
         .route("/networks/:nid/devices/:cid", patch(patch_device))
         .route("/networks/:nid/routes/push", post(push_routes))
+        .route(
+            "/networks/:nid/layout",
+            get(get_layout).put(put_layout),
+        )
 }
 
 // ── GET handlers (unchanged from 1.1) ─────────────────────────────────────
@@ -148,6 +155,9 @@ async fn delete_network(State(state): State<AppState>, Path(nid): Path<Uuid>) ->
     if !state.hub.delete_net(nid).await {
         return not_found("unknown network");
     }
+    // Best-effort cleanup of the layout file so a future network
+    // that happens to reuse this UUID doesn't inherit stale positions.
+    let _ = tokio::fs::remove_file(layout_path(&state, nid)).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -238,6 +248,80 @@ async fn push_routes(State(state): State<AppState>, Path(nid): Path<Uuid>) -> Re
             .collect(),
     })
     .into_response()
+}
+
+// ── Graph layout (per-network UI state) ───────────────────────────────────
+
+/// One node's saved x/y in flow-space. Matches the React Flow
+/// position object the frontend ships.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct NodeXY {
+    x: f64,
+    y: f64,
+}
+
+/// Body of `GET` / `PUT /networks/:nid/layout`. The map's keys are
+/// React-Flow node ids the frontend assigns (`server:<nid>` for the
+/// hub, `device:<client_uuid>` for each device). New layout schemas
+/// in the future can add fields next to `positions`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct GraphLayout {
+    #[serde(default)]
+    positions: std::collections::HashMap<String, NodeXY>,
+}
+
+fn layout_path(state: &AppState, nid: Uuid) -> std::path::PathBuf {
+    state.layout_dir.join(format!("{}.json", nid))
+}
+
+/// `GET /api/networks/:nid/layout` — return the saved positions, or
+/// an empty layout if nothing has been persisted yet. Returns 404 if
+/// the network itself does not exist (so a stale tab pointing at a
+/// deleted network surfaces an error rather than a silent empty
+/// layout).
+async fn get_layout(State(state): State<AppState>, Path(nid): Path<Uuid>) -> Response {
+    if !network_exists(&state, nid).await {
+        return not_found("unknown network");
+    }
+    let path = layout_path(&state, nid);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => match serde_json::from_slice::<GraphLayout>(&bytes) {
+            Ok(layout) => Json(layout).into_response(),
+            Err(_) => Json(GraphLayout::default()).into_response(),
+        },
+        // Missing file is the expected "fresh network" case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Json(GraphLayout::default()).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, ?path, "failed to read layout");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "read failed")
+        }
+    }
+}
+
+/// `PUT /api/networks/:nid/layout` — overwrite the saved positions.
+/// The frontend ships the full map after every drag end (debounced),
+/// so this is a full replace, not a merge. Atomic write keeps the
+/// on-disk file readable even if the server crashes mid-write.
+async fn put_layout(
+    State(state): State<AppState>,
+    Path(nid): Path<Uuid>,
+    Json(body): Json<GraphLayout>,
+) -> Response {
+    if !network_exists(&state, nid).await {
+        return not_found("unknown network");
+    }
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(_) => return bad_request("malformed layout"),
+    };
+    let path = layout_path(&state, nid);
+    if let Err(e) = write_atomic(&path, &bytes).await {
+        tracing::warn!(error = %e, ?path, "failed to write layout");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "write failed");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── Small helpers ─────────────────────────────────────────────────────────

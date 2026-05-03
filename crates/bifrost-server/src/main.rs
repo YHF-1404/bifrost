@@ -201,8 +201,9 @@ async fn run_daemon(
             Ok(addr) => {
                 let hub = hub_handle.clone();
                 let st = shutdown_tx.clone();
+                let state_dir = save_dir.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = bifrost_web::serve(addr, hub, st).await {
+                    if let Err(e) = bifrost_web::serve(addr, hub, state_dir, st).await {
                         tracing::error!(error = %e, "web server stopped");
                     }
                 });

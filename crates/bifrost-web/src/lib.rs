@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use axum::routing::get;
 use axum::Router;
@@ -47,12 +48,19 @@ pub use state::AppState;
 /// `shutdown` is the same `mpsc::Sender<()>` that
 /// `bifrost_server::admin::serve` accepts: it lets HTTP- triggered
 /// shutdowns (none in 1.0, but coming) bubble up to `main`.
+///
+/// `state_dir` is where per-network UI state (graph layouts, etc.)
+/// gets persisted. Pre-created at startup; handlers assume it exists.
 pub async fn serve(
     addr: SocketAddr,
     hub: HubHandle,
+    state_dir: PathBuf,
     _shutdown: mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    let state = AppState { hub };
+    // Ensure the directory exists before any handler tries to use it.
+    let layout_dir = state_dir.join("layouts");
+    tokio::fs::create_dir_all(&layout_dir).await.ok();
+    let state = AppState { hub, layout_dir };
 
     let app = Router::new()
         .nest("/api", api::router())

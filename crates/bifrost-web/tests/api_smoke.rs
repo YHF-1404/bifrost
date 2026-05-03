@@ -39,8 +39,9 @@ async fn spawn(cfg: ServerConfig) -> Harness {
 
     let (st, _rx) = mpsc::channel::<()>(1);
     let h = handle.clone();
+    let state_dir = tempfile::tempdir().unwrap().keep();
     tokio::spawn(async move {
-        let _ = bifrost_web::serve(addr, h, st).await;
+        let _ = bifrost_web::serve(addr, h, state_dir, st).await;
     });
     // Wait for it to come up.
     for _ in 0..50 {
