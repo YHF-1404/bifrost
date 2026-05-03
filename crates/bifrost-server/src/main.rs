@@ -39,6 +39,8 @@ async fn main() -> Result<()> {
     let Cli {
         config,
         socket,
+        web_listen,
+        no_web,
         repl,
         command,
     } = args;
@@ -52,7 +54,7 @@ async fn main() -> Result<()> {
             let cfg = ServerConfig::load(&config)
                 .await
                 .with_context(|| format!("load {config:?}"))?;
-            run_daemon(cfg, config, socket, repl).await
+            run_daemon(cfg, config, socket, web_listen, no_web, repl).await
         }
     }
 }
@@ -124,10 +126,18 @@ async fn run_daemon(
     mut cfg: ServerConfig,
     cfg_path: PathBuf,
     socket_override: Option<PathBuf>,
+    web_listen_override: Option<String>,
+    no_web: bool,
     enable_repl: bool,
 ) -> Result<()> {
     if let Some(s) = &socket_override {
         cfg.admin.socket = s.to_string_lossy().into_owned();
+    }
+    if let Some(addr) = &web_listen_override {
+        cfg.web.listen = addr.clone();
+    }
+    if no_web {
+        cfg.web.enabled = false;
     }
     cfg.save(&cfg_path).await.ok(); // canonicalise / create on first run
 
@@ -136,12 +146,16 @@ async fn run_daemon(
     let save_dir = PathBuf::from(&cfg.server.save_dir);
     let bridge_name = cfg.bridge.name.clone();
     let admin_socket = PathBuf::from(&cfg.admin.socket);
+    let web_cfg = cfg.web.clone();
 
     println!("[*] server id: {server_id}");
     println!("[*] listen:    {listen}");
     println!("[*] bridge:    {bridge_name}");
     println!("[*] save dir:  {}", save_dir.display());
     println!("[*] admin:     {}", admin_socket.display());
+    if web_cfg.enabled {
+        println!("[*] web:       http://{}", web_cfg.listen);
+    }
 
     let platform: Arc<dyn Platform> = build_platform()?;
     let bridge_ip = if cfg.bridge.ip.is_empty() {
@@ -179,6 +193,25 @@ async fn run_daemon(
             }
         }
     });
+
+    // Optional WebUI HTTP server. Failure to bind is logged but does
+    // not abort the daemon — the rest of the server stays useful.
+    if web_cfg.enabled {
+        match web_cfg.listen.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let hub = hub_handle.clone();
+                let st = shutdown_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = bifrost_web::serve(addr, hub, st).await {
+                        tracing::error!(error = %e, "web server stopped");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, listen = %web_cfg.listen, "bad [web] listen; web disabled");
+            }
+        }
+    }
 
     if enable_repl {
         let (req_tx, req_rx) = mpsc::channel::<(ServerAdminReq, oneshot::Sender<String>)>(8);

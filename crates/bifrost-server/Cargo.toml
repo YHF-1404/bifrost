@@ -17,6 +17,7 @@ path = "src/main.rs"
 bifrost-proto.workspace = true
 bifrost-net.workspace   = true
 bifrost-core.workspace  = true
+bifrost-web.workspace   = true
 
 anyhow.workspace             = true
 clap.workspace               = true

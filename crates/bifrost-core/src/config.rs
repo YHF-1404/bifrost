@@ -26,6 +26,8 @@ pub struct ServerConfig {
     pub metrics: MetricsConfig,
     #[serde(default = "default_server_admin")]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub web: WebConfig,
 
     // `skip_serializing_if` keeps an empty list out of the saved
     // TOML — otherwise serde produces a stray `routes = []` that
@@ -55,6 +57,7 @@ impl Default for ServerConfig {
             bridge: BridgeConfig::default(),
             metrics: MetricsConfig::default(),
             admin: default_server_admin(),
+            web: WebConfig::default(),
             networks: Vec::new(),
             approved_clients: Vec::new(),
         }
@@ -99,6 +102,23 @@ impl Default for BridgeConfig {
             name: "br0".to_owned(),
             ip: String::new(),
             disconnect_timeout: 60,
+        }
+    }
+}
+
+/// HTTP / WebSocket WebUI listener. Default: bind localhost only.
+/// Disable by setting `enabled = false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub listen: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "127.0.0.1:8080".to_owned(),
         }
     }
 }

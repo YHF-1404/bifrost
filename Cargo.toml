@@ -6,6 +6,7 @@ members = [
     "crates/bifrost-core",
     "crates/bifrost-client",
     "crates/bifrost-server",
+    "crates/bifrost-web",
 ]
 
 [workspace.package]
@@ -49,6 +50,7 @@ bifrost-net    = { path = "crates/bifrost-net",    version = "0.1.0" }
 bifrost-core   = { path = "crates/bifrost-core",   version = "0.1.0" }
 bifrost-server = { path = "crates/bifrost-server", version = "0.1.0" }
 bifrost-client = { path = "crates/bifrost-client", version = "0.1.0" }
+bifrost-web    = { path = "crates/bifrost-web",    version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

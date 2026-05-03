@@ -21,6 +21,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
+    /// Override `[web] listen` from the config (e.g. `127.0.0.1:8080`).
+    /// Daemon mode only; ignored for subcommands.
+    #[arg(long)]
+    pub web_listen: Option<String>,
+
+    /// Disable the WebUI HTTP server even if `[web] enabled = true` in
+    /// the config. Daemon mode only.
+    #[arg(long)]
+    pub no_web: bool,
+
     /// Also run an interactive REPL on stdin (default: daemon-only).
     /// Ignored when a subcommand is present.
     #[arg(long, global = true)]
