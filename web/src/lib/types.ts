@@ -32,15 +32,21 @@ export interface Device {
   throughput?: Throughput | null;
 }
 
-/** WebSocket event payloads (Phase 1.2+). For 1.1 the channel is
- *  silent except for ping/pong. */
+/** WebSocket event payloads from the Hub. The `device.*` variants
+ *  drive query invalidation — see `lib/eventInvalidator.ts`. */
 export type ServerEvent =
   | { type: "device.online"; network: string; client_uuid: string; sid: number; tap_name: string }
   | { type: "device.offline"; network: string; client_uuid: string }
   | { type: "device.changed"; network: string; device: Device }
   | { type: "device.pending"; network: string; device: Device }
+  | { type: "device.removed"; network: string; client_uuid: string }
   | {
       type: "metrics.tick";
       samples: Array<{ network: string; client_uuid: string } & Throughput>;
     }
-  | { type: "routes.changed"; network: string; routes: Array<{ dst: string; via: string }> };
+  | {
+      type: "routes.changed";
+      network: string;
+      routes: Array<{ dst: string; via: string }>;
+      count: number;
+    };

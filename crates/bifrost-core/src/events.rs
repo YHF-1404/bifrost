@@ -16,6 +16,7 @@
 //! stop, and round-tripping JSON in tests is straightforward without
 //! deriving it.)
 
+use bifrost_proto::admin::DeviceEntry;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -34,9 +35,19 @@ pub struct MetricsSample {
     pub total_out: u64,
 }
 
+/// One row of a derived route table, in the shape the WebUI consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteRow {
+    pub dst: String,
+    pub via: String,
+}
+
 /// Broadcast over `tokio::sync::broadcast` from the Hub. Subscribers
 /// (currently the `/ws` handler in `bifrost-web`) JSON-encode and
 /// forward; lagging subscribers drop frames rather than block the Hub.
+///
+/// All variants carry the `network` UUID so a multi-tab WebUI can
+/// scope its query invalidations.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum HubEvent {
@@ -44,13 +55,61 @@ pub enum HubEvent {
     /// Empty `samples` arrays are not emitted.
     #[serde(rename = "metrics.tick")]
     MetricsTick { samples: Vec<MetricsSample> },
-    // Reserved for Phase 1.3:
-    //   #[serde(rename = "device.online")]
-    //   DeviceOnline { network: Uuid, client_uuid: Uuid, sid: u64, tap_name: String },
-    //   #[serde(rename = "device.offline")]
-    //   DeviceOffline { network: Uuid, client_uuid: Uuid },
-    //   #[serde(rename = "device.changed")]
-    //   DeviceChanged { network: Uuid, device: DeviceEntry },
+
+    /// A SessionTask just started, or a returning client re-bound an
+    /// existing session.
+    #[serde(rename = "device.online")]
+    DeviceOnline {
+        network: Uuid,
+        client_uuid: Uuid,
+        sid: u64,
+        tap_name: String,
+    },
+
+    /// A SessionTask finished — disconnect-timeout, kill, or TAP error.
+    /// Note: the merely-unbound state (conn dropped but session alive)
+    /// does NOT fire this; the device is still "online" by the WebUI's
+    /// definition until its TAP is destroyed.
+    #[serde(rename = "device.offline")]
+    DeviceOffline {
+        network: Uuid,
+        client_uuid: Uuid,
+    },
+
+    /// A new join request landed in `pending` — admin must approve.
+    #[serde(rename = "device.pending")]
+    DevicePending {
+        network: Uuid,
+        device: DeviceEntry,
+    },
+
+    /// One device's persistent fields (name, tap_ip, lan_subnets) or
+    /// runtime state (online, sid) changed. The full record is
+    /// included so subscribers can replace their cached row with no
+    /// extra round-trip.
+    #[serde(rename = "device.changed")]
+    DeviceChanged {
+        network: Uuid,
+        device: DeviceEntry,
+    },
+
+    /// A device's `approved_clients` row was removed — either via
+    /// `device_set { admitted: false }` (kick) or `deny` of a pending
+    /// session.
+    #[serde(rename = "device.removed")]
+    DeviceRemoved {
+        network: Uuid,
+        client_uuid: Uuid,
+    },
+
+    /// The route table for a network was just (re-)derived and pushed.
+    /// `count` is how many bound peers received the push.
+    #[serde(rename = "routes.changed")]
+    RoutesChanged {
+        network: Uuid,
+        routes: Vec<RouteRow>,
+        count: u64,
+    },
 }
 
 #[cfg(test)]
@@ -75,5 +134,35 @@ mod tests {
         assert_eq!(json["type"], "metrics.tick");
         assert_eq!(json["samples"][0]["bps_in"], 100);
         assert_eq!(json["samples"][0]["client_uuid"], cid.to_string());
+    }
+
+    #[test]
+    fn device_online_serializes() {
+        let evt = HubEvent::DeviceOnline {
+            network: Uuid::nil(),
+            client_uuid: Uuid::nil(),
+            sid: 42,
+            tap_name: "tap0a1b2c3d".into(),
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        assert_eq!(json["type"], "device.online");
+        assert_eq!(json["sid"], 42);
+        assert_eq!(json["tap_name"], "tap0a1b2c3d");
+    }
+
+    #[test]
+    fn routes_changed_serializes() {
+        let evt = HubEvent::RoutesChanged {
+            network: Uuid::nil(),
+            routes: vec![RouteRow {
+                dst: "192.168.10.0/24".into(),
+                via: "10.0.0.5".into(),
+            }],
+            count: 3,
+        };
+        let json = serde_json::to_value(&evt).unwrap();
+        assert_eq!(json["type"], "routes.changed");
+        assert_eq!(json["routes"][0]["dst"], "192.168.10.0/24");
+        assert_eq!(json["count"], 3);
     }
 }

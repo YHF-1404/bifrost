@@ -854,33 +854,190 @@ async fn metrics_tick_broadcasts_one_sample_per_session() {
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
 
-    // Wait up to 2.5 s for the first tick. Should arrive ~1 s in.
-    let evt = tokio::time::timeout(Duration::from_millis(2500), events.recv())
-        .await
-        .expect("metrics tick timed out")
-        .expect("broadcast closed");
-    match evt {
-        HubEvent::MetricsTick { samples } => {
-            assert_eq!(samples.len(), 1);
-            assert_eq!(samples[0].network, net);
-            assert_eq!(samples[0].client_uuid, client);
-            // No traffic yet → zero deltas + zero totals.
-            assert_eq!(samples[0].bps_in, 0);
-            assert_eq!(samples[0].bps_out, 0);
-            assert_eq!(samples[0].total_in, 0);
-            assert_eq!(samples[0].total_out, 0);
+    // Drain device.* events that fire on join, wait up to 2.5 s for
+    // the first MetricsTick (sampler ticks at 1 Hz).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    let samples = loop {
+        let e = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("metrics tick timed out")
+            .expect("broadcast closed");
+        if let HubEvent::MetricsTick { samples } = e {
+            break samples;
         }
-    }
+    };
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].network, net);
+    assert_eq!(samples[0].client_uuid, client);
+    // No traffic yet → zero deltas + zero totals.
+    assert_eq!(samples[0].bps_in, 0);
+    assert_eq!(samples[0].bps_out, 0);
+    assert_eq!(samples[0].total_in, 0);
+    assert_eq!(samples[0].total_out, 0);
     h.hub.shutdown().await;
 }
 
 #[tokio::test]
 async fn metrics_tick_skipped_when_no_sessions() {
-    // No sessions → no events. Verify by not seeing one within 2 s.
+    // No sessions → no MetricsTick. (Other event variants don't fire
+    // either — no joins, no admin actions.) Verify by not seeing one
+    // within 2 s.
     let h = spawn(build_cfg(60)).await;
     let mut events = h.hub.subscribe();
 
     let res = tokio::time::timeout(Duration::from_millis(2000), events.recv()).await;
     assert!(res.is_err(), "expected no events, got {:?}", res);
+    h.hub.shutdown().await;
+}
+
+/// Wait for the first event matching `pred`, skipping anything else.
+/// Returns `None` on timeout.
+async fn next_matching<F>(
+    events: &mut tokio::sync::broadcast::Receiver<HubEvent>,
+    timeout: Duration,
+    mut pred: F,
+) -> Option<HubEvent>
+where
+    F: FnMut(&HubEvent) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let e = tokio::time::timeout_at(deadline, events.recv()).await.ok()?.ok()?;
+        if pred(&e) {
+            return Some(e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn approve_emits_device_online() {
+    // Pending → approve → DeviceOnline.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    let h = spawn(cfg).await;
+    let mut events = h.hub.subscribe();
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    h.hub.join(c.id, net).await;
+
+    // First a DevicePending arrives.
+    let pending = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::DevicePending { .. })
+    })
+    .await
+    .expect("expected DevicePending");
+    assert!(matches!(pending, HubEvent::DevicePending { network, .. } if network == net));
+
+    // Find the sid + approve.
+    let sid = h.hub.list().await.unwrap().pending[0].sid;
+    h.hub.approve(sid).await;
+
+    // DeviceOnline should follow.
+    let online = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::DeviceOnline { .. })
+    })
+    .await
+    .expect("expected DeviceOnline");
+    if let HubEvent::DeviceOnline { network, client_uuid, .. } = online {
+        assert_eq!(network, net);
+        assert_eq!(client_uuid, client);
+    }
+
+    // Skip past JoinOk frames the conn received.
+    let _ = recv(&mut c.frame_rx).await;
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn device_set_emits_changed_then_remove() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients.push(approved(client, net, "10.0.0.5/24"));
+    let h = spawn(cfg).await;
+    let mut events = h.hub.subscribe();
+
+    // Edit name.
+    h.hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                name: Some("router".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let changed = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::DeviceChanged { .. })
+    })
+    .await
+    .expect("expected DeviceChanged");
+    if let HubEvent::DeviceChanged { network, device } = changed {
+        assert_eq!(network, net);
+        assert_eq!(device.display_name, "router");
+    }
+
+    // Kick.
+    h.hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                admitted: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+    let removed = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::DeviceRemoved { .. })
+    })
+    .await
+    .expect("expected DeviceRemoved");
+    assert!(matches!(removed, HubEvent::DeviceRemoved { network, client_uuid }
+        if network == net && client_uuid == client));
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn device_push_emits_routes_changed() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord {
+        name: "n".into(),
+        uuid: net,
+    });
+    cfg.approved_clients.push(approved_with_lan(
+        client,
+        net,
+        "10.0.0.5/24",
+        &["192.168.10.0/24"],
+    ));
+    let h = spawn(cfg).await;
+    let mut events = h.hub.subscribe();
+
+    h.hub.device_push(net).await;
+    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::RoutesChanged { .. })
+    })
+    .await
+    .expect("expected RoutesChanged");
+    if let HubEvent::RoutesChanged { network, routes, .. } = evt {
+        assert_eq!(network, net);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].dst, "192.168.10.0/24");
+    }
     h.hub.shutdown().await;
 }

@@ -34,7 +34,10 @@ export function DeviceTable() {
   const q = useQuery({
     queryKey,
     queryFn: () => api.listDevices(nid!),
-    refetchInterval: 5000,
+    // Events (device.online / device.changed / ...) drive freshness;
+    // the timed poll is a slow safety net in case a WS event is
+    // missed (lagged subscriber, dropped connection mid-event).
+    refetchInterval: 30_000,
     enabled: !!nid,
   });
 

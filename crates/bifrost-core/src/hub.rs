@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{ApprovedClient, NetRecord, ServerConfig};
-use crate::events::{HubEvent, MetricsSample};
+use crate::events::{HubEvent, MetricsSample, RouteRow};
 use crate::ids::{ConnId, IdAllocator, SessionId};
 use crate::routes::{derive_routes_for_network, filter_for_peer};
 use crate::session::{DeathReason, SessionCmd, SessionEvt, SessionTask};
@@ -565,6 +565,13 @@ impl Hub {
         info!("hub stop");
     }
 
+    /// Best-effort send. `broadcast::send` errors only when there are
+    /// zero receivers — the common case (no WebUI tab open) — and is
+    /// silently fine. Centralising the call keeps emission sites tidy.
+    fn emit(&self, evt: HubEvent) {
+        let _ = self.events_tx.send(evt);
+    }
+
     /// Snapshot every joined session's byte counters, compute deltas
     /// against the previous tick, and broadcast a `MetricsTick` event.
     /// Skips emission when there are no sessions (no subscribers want
@@ -600,10 +607,7 @@ impl Hub {
         // GC dead sessions out of the prev map.
         self.metrics_prev.retain(|sid, _| alive.contains(sid));
 
-        // Best-effort send. `broadcast::send` errors only when there
-        // are zero receivers, which is the common case (no WebUI tab
-        // open) — silently fine.
-        let _ = self.events_tx.send(HubEvent::MetricsTick { samples });
+        self.emit(HubEvent::MetricsTick { samples });
     }
 
     // ── Top-level dispatch ───────────────────────────────────────────
@@ -730,6 +734,8 @@ impl Hub {
             let cmd_tx = session.cmd_tx.clone();
             let suffix = strip_tap_prefix(&session.tap_name);
             let tap_ip = session.tap_ip.clone();
+            let sid = session.sid.0;
+            let tap_name = session.tap_name.clone();
             let _ = cmd_tx.send(SessionCmd::BindConn(frame_tx.clone())).await;
 
             if let Some(c) = self.conns.get_mut(&conn) {
@@ -745,6 +751,18 @@ impl Hub {
                 .await;
             self.send_routes(&frame_tx, net_uuid, tap_ip.as_deref())
                 .await;
+            // Reconnect re-binds an existing SessionTask. From the
+            // WebUI's "online == has-a-session" perspective the
+            // device may already have been online (during the brief
+            // unbound window the session is still alive), but a fresh
+            // DeviceOnline is the cleanest signal that the device
+            // changed state — subscribers can treat it as idempotent.
+            self.emit(HubEvent::DeviceOnline {
+                network: net_uuid,
+                client_uuid,
+                sid,
+                tap_name,
+            });
             return;
         }
 
@@ -769,6 +787,20 @@ impl Hub {
                 },
             );
             info!(?sid, %client_uuid, %net_uuid, "join awaiting approval");
+            self.emit(HubEvent::DevicePending {
+                network: net_uuid,
+                device: DeviceEntry {
+                    client_uuid,
+                    net_uuid,
+                    display_name: String::new(),
+                    admitted: false,
+                    tap_ip: None,
+                    lan_subnets: Vec::new(),
+                    online: true,
+                    sid: Some(sid.0),
+                    tap_name: None,
+                },
+            });
         }
     }
 
@@ -888,6 +920,16 @@ impl Hub {
             .await;
 
         info!(?sid, ?conn, %client_uuid, tap = %tap_name, "session joined");
+
+        // Tell subscribers about the new live device. This is the
+        // first-time-admit and the auto-approve path; the reconnect
+        // path emits its own DeviceOnline in handle_join.
+        self.emit(HubEvent::DeviceOnline {
+            network: net_uuid,
+            client_uuid,
+            sid: sid.0,
+            tap_name: tap_name.clone(),
+        });
     }
 
     /// Push the derived route table for `net_uuid` to a freshly-bound
@@ -1077,6 +1119,10 @@ impl Hub {
                     .get(&(client_uuid, net_uuid))
                     .map(|s| s.tap_name.clone()),
             }));
+            self.emit(HubEvent::DeviceRemoved {
+                network: net_uuid,
+                client_uuid,
+            });
             return;
         }
 
@@ -1140,7 +1186,7 @@ impl Hub {
         let _ = lan_changed; // currently no immediate side effect
 
         let live = self.sessions.get(&(client_uuid, net_uuid));
-        let _ = ack.send(DeviceSetResult::Ok(DeviceEntry {
+        let entry = DeviceEntry {
             client_uuid,
             net_uuid,
             display_name,
@@ -1154,7 +1200,14 @@ impl Hub {
             online: live.is_some(),
             sid: live.map(|s| s.sid.0),
             tap_name: live.map(|s| s.tap_name.clone()),
-        }));
+        };
+        // Broadcast the post-update view so other tabs / the same tab's
+        // other components see it without waiting for the next poll.
+        self.emit(HubEvent::DeviceChanged {
+            network: net_uuid,
+            device: entry.clone(),
+        });
+        let _ = ack.send(DeviceSetResult::Ok(entry));
     }
 
     async fn handle_device_push(
@@ -1192,6 +1245,19 @@ impl Hub {
                 }
             }
         }
+        // Broadcast so the WebUI can refresh whatever route table it's
+        // displaying without re-querying.
+        self.emit(HubEvent::RoutesChanged {
+            network: net_uuid,
+            routes: routes
+                .iter()
+                .map(|r| RouteRow {
+                    dst: r.dst.clone(),
+                    via: r.via.clone(),
+                })
+                .collect(),
+            count,
+        });
         let _ = ack.send(DevicePushResult { routes, count });
     }
 
@@ -1252,6 +1318,13 @@ impl Hub {
                 })
                 .await;
         }
+        // The pending row simply disappears — no `[[approved_clients]]`
+        // entry was created — but the WebUI was rendering it as a
+        // "pending" device, so emit a removed event to clear that row.
+        self.emit(HubEvent::DeviceRemoved {
+            network: p.net_uuid,
+            client_uuid: p.client_uuid,
+        });
         let _ = ack.send(true);
     }
 
@@ -1304,6 +1377,11 @@ impl Hub {
             }
         }
         let _ = self.bridge.remove_tap(&entry.tap_name).await;
+
+        self.emit(HubEvent::DeviceOffline {
+            network: entry.net_uuid,
+            client_uuid: entry.client_uuid,
+        });
     }
 
     async fn shutdown_all(&mut self) {

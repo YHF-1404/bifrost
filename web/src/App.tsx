@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Navigate, Route, BrowserRouter as Router, Routes } from "react-router-dom";
 import { Layout } from "@/components/Layout";
 import { Toaster } from "@/components/Toaster";
+import { EventInvalidator } from "@/lib/eventInvalidator";
 import { DeviceTable } from "@/views/DeviceTable";
 import { NetworkList } from "@/views/NetworkList";
 
@@ -18,6 +19,7 @@ const queryClient = new QueryClient({
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
+      <EventInvalidator />
       <Router>
         <Routes>
           <Route element={<Layout />}>

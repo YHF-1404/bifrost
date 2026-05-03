@@ -9,7 +9,8 @@ export function NetworkList() {
   const q = useQuery({
     queryKey: ["networks"],
     queryFn: () => api.listNetworks(),
-    refetchInterval: 5000,
+    // Events drive freshness; this is a slow safety-net poll.
+    refetchInterval: 30_000,
   });
 
   return (
