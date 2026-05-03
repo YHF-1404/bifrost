@@ -115,37 +115,56 @@ export function NetworkDetail() {
       }
     : null;
 
-  return (
-    <div className="mx-auto max-w-6xl">
-      <div className="mb-4 flex items-center gap-3 text-sm">
-        <Link to="/networks" className="text-muted-foreground hover:underline">
-          ← Networks
-        </Link>
-        <span className="font-mono text-xs text-muted-foreground">{nid}</span>
+  // The graph view wants to fill the viewport. The table view wants
+  // a bounded width. The toolbar is always centered. We achieve this
+  // with two different containers depending on viewMode.
+  const toolbar = (
+    <div className="mb-4 flex items-center gap-3 text-sm">
+      <Link to="/networks" className="text-muted-foreground hover:underline">
+        ← Networks
+      </Link>
+      <span className="font-mono text-xs text-muted-foreground">{nid}</span>
 
-        <div className="ml-auto flex items-center gap-2">
-          <ViewModeToggle value={viewMode} onChange={setViewMode} />
-          <Button
-            size="sm"
-            onClick={pushRoutes}
-            disabled={pushing || !q.data?.length}
-          >
-            {pushing ? "pushing…" : "Push routes"}
-          </Button>
-        </div>
+      <div className="ml-auto flex items-center gap-2">
+        <ViewModeToggle value={viewMode} onChange={setViewMode} />
+        <Button
+          size="sm"
+          onClick={pushRoutes}
+          disabled={pushing || !q.data?.length}
+        >
+          {pushing ? "pushing…" : "Push routes"}
+        </Button>
       </div>
+    </div>
+  );
 
-      {q.isLoading ? (
-        <div className="text-sm text-muted-foreground">loading…</div>
-      ) : q.isError ? (
-        <div className="text-sm text-destructive">
-          failed to load: {(q.error as Error).message}
-        </div>
-      ) : !childProps ? null : viewMode === "graph" ? (
-        <DevicesAsGraph {...childProps} />
-      ) : (
-        <DevicesAsTable {...childProps} />
-      )}
+  const body = q.isLoading ? (
+    <div className="text-sm text-muted-foreground">loading…</div>
+  ) : q.isError ? (
+    <div className="text-sm text-destructive">
+      failed to load: {(q.error as Error).message}
+    </div>
+  ) : !childProps ? null : viewMode === "graph" ? (
+    <DevicesAsGraph {...childProps} />
+  ) : (
+    <DevicesAsTable {...childProps} />
+  );
+
+  if (viewMode === "graph") {
+    // Full-width column that flex-grows so DevicesAsGraph can fill
+    // the remaining viewport.
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="mx-auto w-full max-w-6xl">{toolbar}</div>
+        <div className="flex min-h-0 flex-1 flex-col">{body}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto w-full max-w-6xl">
+      {toolbar}
+      {body}
     </div>
   );
 }

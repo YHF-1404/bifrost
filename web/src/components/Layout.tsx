@@ -44,7 +44,10 @@ export function Layout() {
           </Badge>
         </div>
       </header>
-      <main className="flex-1 px-4 py-6 sm:px-6">
+      {/* `min-h-0` lets the inner column flex-grow without inheriting
+          a content-driven min height from the children. That's what
+          actually allows DevicesAsGraph to fill the viewport. */}
+      <main className="flex min-h-0 flex-1 flex-col px-4 py-6 sm:px-6">
         <Outlet />
       </main>
     </div>

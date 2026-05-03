@@ -14,10 +14,13 @@ const HUB_X = 0;
 const HUB_Y = 0;
 
 /** Radius grows with N so nodes don't overlap when there are many.
- *  At N = 1: 220, N = 8: 240, N = 16: 320. */
+ *  Each device card is ~224 px wide with some breathing room, so a
+ *  decent rule of thumb is `circumference >= N * 280`. Solving:
+ *  `r >= N * 280 / (2π) ≈ N * 45`. We floor at 280 so a single
+ *  device sits a comfortable distance from the hub. */
 function radiusFor(n: number): number {
-  if (n <= 1) return 220;
-  return Math.max(220, 50 + n * 18);
+  if (n <= 1) return 280;
+  return Math.max(280, Math.round(n * 45));
 }
 
 /** Place `n` evenly-spaced points on a circle around the hub. The
