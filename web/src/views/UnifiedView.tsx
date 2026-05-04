@@ -71,9 +71,11 @@ const VIEW_MODE_KEY = "bifrost.viewMode";
 //
 // TAP IP column is 232 px so the editing-mode picker (4 × w-12 octet
 // inputs + dot separators + "/24") fits comfortably without spilling
-// into the LAN column.
+// into the LAN column. THROUGHPUT column is 192 px so the value
+// (w-20 = 80 px) + 80-px sparkline + triangle/gaps stay on one line
+// at any byte rate up to "99.9 GB/s".
 const ROW_COLS =
-  "grid grid-cols-[20px_40px_minmax(120px,1fr)_232px_minmax(180px,1.5fr)_136px_72px] items-center gap-2";
+  "grid grid-cols-[20px_40px_minmax(120px,1fr)_232px_minmax(160px,1.5fr)_192px_64px] items-center gap-2";
 
 type ViewMode = "table" | "graph";
 
