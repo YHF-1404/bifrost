@@ -191,8 +191,19 @@ function UnifiedGraphInner() {
     const positions = layout.layout.graph.positions;
     const frames = layout.layout.graph.frames;
 
-    for (const n of networks) {
-      const f = frames[n.id] ?? DEFAULT_FRAME;
+    // Fan unsaved frames out horizontally so a fresh deploy with N
+    // networks doesn't stack them all at (0,0). Vertical wrap at 2
+    // per row keeps them above the fold on a typical viewport.
+    const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
+    const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
+    const COLS = 2;
+    networks.forEach((n, i) => {
+      const f = frames[n.id] ?? {
+        x: (i % COLS) * FRAME_GAP_X,
+        y: Math.floor(i / COLS) * FRAME_GAP_Y,
+        width: DEFAULT_FRAME.width,
+        height: DEFAULT_FRAME.height,
+      };
       ns.push({
         id: `frame:${n.id}`,
         type: "frame",
@@ -213,15 +224,25 @@ function UnifiedGraphInner() {
         parentId: `frame:${n.id}`,
         extent: "parent",
       });
-    }
+    });
 
-    let stackY = 20;
+    // Per-frame counter so each network's clients fan vertically
+    // inside their own frame instead of stacking on the hub card.
+    // React Flow v12 hides child nodes (`visibility: hidden`) until
+    // they're measured — supplying explicit `width`/`height` via the
+    // node's `style` skips that delay so pending clients appear on
+    // first paint instead of waiting on a ResizeObserver tick.
+    const CLIENT_W = 220;
+    const CLIENT_H = 60;
+    const inFrameSeq = new Map<string, number>();
+    let freeStackY = 20;
     for (const c of clients) {
       const ckey = `client:${c.client_uuid}`;
       const stored = positions[ckey];
       if (c.net_uuid) {
-        // Inside a frame.
-        const pos = stored ?? { x: 200, y: 60 + (clients.indexOf(c) * 64) % 200 };
+        const seq = inFrameSeq.get(c.net_uuid) ?? 0;
+        inFrameSeq.set(c.net_uuid, seq + 1);
+        const pos = stored ?? { x: 220, y: 100 + seq * (CLIENT_H + 10) };
         ns.push({
           id: ckey,
           type: "client",
@@ -229,6 +250,7 @@ function UnifiedGraphInner() {
           position: pos,
           parentId: `frame:${c.net_uuid}`,
           extent: "parent",
+          style: { width: CLIENT_W, height: CLIENT_H },
         });
         if (c.admitted) {
           es.push({
@@ -239,15 +261,19 @@ function UnifiedGraphInner() {
           });
         }
       } else {
-        // Free-floating; place to the right of the rightmost frame
-        // by default.
-        const pos = stored ?? { x: 700, y: stackY };
-        stackY += 70;
+        // Free-floating; sit to the right of the rightmost frame.
+        const rightEdge =
+          (Math.min(networks.length, COLS) - 1) * FRAME_GAP_X +
+          DEFAULT_FRAME.width +
+          80;
+        const pos = stored ?? { x: rightEdge, y: freeStackY };
+        freeStackY += CLIENT_H + 10;
         ns.push({
           id: ckey,
           type: "client",
           data: { client: c },
           position: pos,
+          style: { width: CLIENT_W, height: CLIENT_H },
         });
       }
     }
@@ -362,29 +388,33 @@ function UnifiedGraphInner() {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    // The wrapper is BLOCK (not flex): React Flow's CSS sets
-    // `width: 100%; height: 100%`, but only when the parent has a
-    // resolvable height. `flex-1 min-h-0` does that in the
-    // outer flex-col without the row-flex hazard that used to
-    // collapse the ReactFlow child to width=0.
+    // Two-layer wrapper: the OUTER one is the flex item that takes
+    // its height from the page's flex-col chain; the INNER one is
+    // absolutely positioned with `inset: 0` so React Flow gets a
+    // hard-pixel parent (its `.react-flow { width:100%; height:100% }`
+    // CSS doesn't reliably resolve against a flex-grow-only ancestor —
+    // browsers compute parent.height but don't always treat it as
+    // "explicit" for percentage-height resolution, leaving the
+    // canvas with height=0).
     <div ref={wrapperRef} className="relative min-h-0 w-full flex-1">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={NODE_TYPES}
-        onNodesChange={onNodesChange}
-        onNodeDragStop={onNodeDragStop}
-        onNodeContextMenu={onNodeContextMenu}
-        onPaneContextMenu={onPaneContextMenu}
-        nodesConnectable={false}
-        // Allow children to be dragged outside their parent? No — extent='parent' clips.
-        fitView={networks.length > 0}
-        proOptions={{ hideAttribution: true }}
-        style={{ width: "100%", height: "100%" }}
-      >
-        <Background />
-        <Controls position="bottom-right" />
-      </ReactFlow>
+      <div className="absolute inset-0">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={NODE_TYPES}
+          onNodesChange={onNodesChange}
+          onNodeDragStop={onNodeDragStop}
+          onNodeContextMenu={onNodeContextMenu}
+          onPaneContextMenu={onPaneContextMenu}
+          nodesConnectable={false}
+          // Allow children to be dragged outside their parent? No — extent='parent' clips.
+          fitView={networks.length > 0}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background />
+          <Controls position="bottom-right" />
+        </ReactFlow>
+      </div>
       {menu && (
         <ContextMenu
           x={menu.x}
