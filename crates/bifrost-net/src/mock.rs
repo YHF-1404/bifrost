@@ -205,6 +205,23 @@ impl MockPlatform {
         self.bridges.lock().await.last().cloned()
     }
 
+    /// All bridges this platform has produced, in creation order.
+    /// Useful for multi-network tests where `last_bridge` isn't
+    /// specific enough.
+    pub async fn bridges(&self) -> Vec<Arc<MockBridge>> {
+        self.bridges.lock().await.clone()
+    }
+
+    /// Look up a bridge by its kernel name.
+    pub async fn bridge_named(&self, name: &str) -> Option<Arc<MockBridge>> {
+        self.bridges
+            .lock()
+            .await
+            .iter()
+            .find(|b| b.name() == name)
+            .cloned()
+    }
+
     pub async fn taps_count(&self) -> usize {
         self.taps.lock().await.len()
     }

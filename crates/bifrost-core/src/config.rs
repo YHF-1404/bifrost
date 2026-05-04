@@ -142,6 +142,43 @@ impl Default for MetricsConfig {
 pub struct NetRecord {
     pub name: String,
     pub uuid: Uuid,
+    /// Kernel-side bridge name for this virtual network. Phase 2 each
+    /// network gets its own L2 broadcast domain — the bridge is per-net,
+    /// not global. Auto-derived from the UUID at network-creation time
+    /// (see [`default_bridge_name_for`]); user can override at creation
+    /// time. Empty in configs from Phase 1 — see the migration in
+    /// [`ServerConfig::load`].
+    #[serde(default)]
+    pub bridge_name: String,
+    /// Optional CIDR for the bridge interface, e.g. `"10.0.0.1/24"`.
+    /// Empty = pure-L2, no host-side address (clients can still reach
+    /// each other; the host can't ping them directly through this
+    /// bridge). Mirrors the old `[bridge].ip` behavior, just per-net.
+    #[serde(default)]
+    pub bridge_ip: String,
+}
+
+/// Auto-derive a bridge name from a network UUID. Stable across
+/// restarts (same UUID → same name) and short enough to fit Linux's
+/// 15-char IFNAMSIZ limit (`bf-` prefix + 8 hex chars = 11).
+pub fn default_bridge_name_for(net_uuid: Uuid) -> String {
+    let s = net_uuid.simple().to_string();
+    format!("bf-{}", &s[..8])
+}
+
+impl NetRecord {
+    /// Build a fresh network record with `bridge_name` auto-derived
+    /// from the UUID and no bridge IP. Most callers want this; the
+    /// struct-literal form is reserved for tests and migration code
+    /// that needs to set every field explicitly.
+    pub fn new(name: impl Into<String>, uuid: Uuid) -> Self {
+        Self {
+            name: name.into(),
+            uuid,
+            bridge_name: default_bridge_name_for(uuid),
+            bridge_ip: String::new(),
+        }
+    }
 }
 
 /// One known `(client, net)` pair. Despite the historical name, a row
@@ -279,11 +316,45 @@ pub struct TapConfig {
 
 impl ServerConfig {
     pub async fn load(path: &Path) -> Result<Self, CoreError> {
-        load_toml::<Self>(path).await
+        let mut cfg: Self = load_toml(path).await?;
+        cfg.migrate_phase2_bridges();
+        Ok(cfg)
     }
 
     pub async fn save(&self, path: &Path) -> Result<(), CoreError> {
         save_toml(self, path).await
+    }
+
+    /// Phase-1 → Phase-2 migration for the per-network bridge split.
+    ///
+    /// Phase 1 had a single global bridge configured under `[bridge]`.
+    /// Phase 2 makes the bridge a per-network resource. To preserve
+    /// existing deployments verbatim, the FIRST network whose
+    /// `bridge_name` is empty inherits the legacy `[bridge].name` and
+    /// `[bridge].ip`; any further networks without their own
+    /// `bridge_name` auto-derive one from their UUID.
+    ///
+    /// This is idempotent: once a config has been written back with
+    /// every network carrying its own `bridge_name`, this function is
+    /// a no-op.
+    fn migrate_phase2_bridges(&mut self) {
+        let mut legacy_consumed = false;
+        for net in &mut self.networks {
+            if !net.bridge_name.is_empty() {
+                continue;
+            }
+            if !legacy_consumed && !self.bridge.name.is_empty() {
+                // First network without per-net config inherits the
+                // legacy global bridge so the existing kernel-side
+                // bridge (and its host IP) keep working without any
+                // operator intervention.
+                net.bridge_name = self.bridge.name.clone();
+                net.bridge_ip = self.bridge.ip.clone();
+                legacy_consumed = true;
+            } else {
+                net.bridge_name = default_bridge_name_for(net.uuid);
+            }
+        }
     }
 }
 
@@ -323,10 +394,7 @@ mod tests {
 
         let mut cfg = ServerConfig::default();
         cfg.bridge.ip = "10.0.0.1/24".to_owned();
-        cfg.networks.push(NetRecord {
-            name: "hml-net".to_owned(),
-            uuid: Uuid::new_v4(),
-        });
+        cfg.networks.push(NetRecord::new("hml-net".to_owned(), Uuid::new_v4()));
         cfg.approved_clients.push(ApprovedClient {
             client_uuid: Uuid::new_v4(),
             net_uuid: cfg.networks[0].uuid,

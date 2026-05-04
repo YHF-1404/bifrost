@@ -144,35 +144,41 @@ async fn run_daemon(
     let server_id = Uuid::new_v4();
     let listen = format!("{}:{}", cfg.server.host, cfg.server.port);
     let save_dir = PathBuf::from(&cfg.server.save_dir);
-    let bridge_name = cfg.bridge.name.clone();
     let admin_socket = PathBuf::from(&cfg.admin.socket);
     let web_cfg = cfg.web.clone();
 
     println!("[*] server id: {server_id}");
     println!("[*] listen:    {listen}");
-    println!("[*] bridge:    {bridge_name}");
+    println!("[*] networks:  {}", cfg.networks.len());
+    for net in &cfg.networks {
+        println!(
+            "    └─ {} ({}) bridge={}{}",
+            net.name,
+            net.uuid,
+            net.bridge_name,
+            if net.bridge_ip.is_empty() {
+                String::new()
+            } else {
+                format!(" ip={}", net.bridge_ip)
+            }
+        );
+    }
     println!("[*] save dir:  {}", save_dir.display());
     println!("[*] admin:     {}", admin_socket.display());
     if web_cfg.enabled {
         println!("[*] web:       http://{}", web_cfg.listen);
     }
 
+    // Phase 2: bridges are per-network. Hub creates them itself during
+    // startup (and on each `mknet` thereafter); main no longer prepares
+    // a single global bridge before instantiating the Hub.
     let platform: Arc<dyn Platform> = build_platform()?;
-    let bridge_ip = if cfg.bridge.ip.is_empty() {
-        None
-    } else {
-        cfg.bridge.ip.parse().ok()
-    };
-    let bridge = platform
-        .create_bridge(&bridge_name, bridge_ip)
-        .await
-        .with_context(|| format!("create bridge {bridge_name:?}"))?;
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
 
-    let (hub, hub_handle) = Hub::new(cfg.clone(), Some(cfg_path.clone()), platform, bridge);
+    let (hub, hub_handle) = Hub::new(cfg.clone(), Some(cfg_path.clone()), platform);
     let hub_join = tokio::spawn(hub.run());
 
     tokio::spawn(accept::run(

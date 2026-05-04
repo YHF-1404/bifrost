@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::Hub;
-use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::mock::MockPlatform;
+use bifrost_net::Platform;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -23,13 +23,9 @@ struct Harness {
 
 async fn spawn(cfg: ServerConfig) -> Harness {
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
-    let (hub, handle) = Hub::new(
-        cfg,
+    let (hub, handle) = Hub::new(cfg,
         None,
-        platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
-    );
+        platform.clone() as Arc<dyn Platform>);
     tokio::spawn(hub.run());
 
     // Bind a random port, then hand the listener address to bifrost-web.
@@ -58,14 +54,8 @@ async fn networks_endpoint_returns_array() {
     let net_a = Uuid::new_v4();
     let net_b = Uuid::new_v4();
     let mut cfg = ServerConfig::default();
-    cfg.networks.push(NetRecord {
-        name: "alpha".into(),
-        uuid: net_a,
-    });
-    cfg.networks.push(NetRecord {
-        name: "beta".into(),
-        uuid: net_b,
-    });
+    cfg.networks.push(NetRecord::new("alpha", net_a));
+    cfg.networks.push(NetRecord::new("beta", net_b));
     cfg.approved_clients.push(ApprovedClient {
         client_uuid: Uuid::new_v4(),
         net_uuid: net_a,
@@ -93,10 +83,7 @@ async fn devices_endpoint_returns_approved() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = ServerConfig::default();
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(ApprovedClient {
         client_uuid: client,
         net_uuid: net,

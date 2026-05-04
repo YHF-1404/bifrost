@@ -20,21 +20,17 @@ use std::time::Duration;
 
 use bifrost_core::config::ServerConfig;
 use bifrost_core::Hub;
-use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::mock::MockPlatform;
+use bifrost_net::Platform;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 async fn spawn() -> SocketAddr {
     let cfg = ServerConfig::default();
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
-    let (hub, handle) = Hub::new(
-        cfg,
+    let (hub, handle) = Hub::new(cfg,
         None,
-        platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
-    );
+        platform.clone() as Arc<dyn Platform>);
     tokio::spawn(hub.run());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

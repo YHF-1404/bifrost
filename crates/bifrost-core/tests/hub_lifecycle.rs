@@ -12,7 +12,7 @@ use std::time::Duration;
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, SessionCmd};
 use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform, Tap};
+use bifrost_net::{Platform, Tap};
 use bifrost_proto::{Frame, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -24,9 +24,23 @@ const SHORT: Duration = Duration::from_millis(200);
 struct Harness {
     hub: HubHandle,
     platform: Arc<MockPlatform>,
-    bridge: Arc<MockBridge>,
     #[allow(dead_code)]
     join: tokio::task::JoinHandle<()>,
+}
+
+impl Harness {
+    /// Fetch the bridge the Hub created on startup. Phase-2 the Hub
+    /// owns its bridges via `MockPlatform::create_bridge`; the test
+    /// harness no longer creates a `MockBridge` of its own. With one
+    /// network per test (the common case), `last_bridge()` is the
+    /// right one; tests with two networks should look it up by name
+    /// via `bridge_named`.
+    async fn bridge(&self) -> Arc<MockBridge> {
+        self.platform
+            .last_bridge()
+            .await
+            .expect("hub did not create a bridge")
+    }
 }
 
 struct FakeConn {
@@ -74,18 +88,18 @@ async fn spawn(cfg: ServerConfig) -> Harness {
 
 async fn spawn_with_path(cfg: ServerConfig, cfg_path: Option<std::path::PathBuf>) -> Harness {
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
     let (hub, handle) = Hub::new(
         cfg,
         cfg_path,
         platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
     );
     let join = tokio::spawn(hub.run());
+    // Give Hub::run a tick to bootstrap its per-network bridges; tests
+    // that immediately probe the platform need them in place.
+    tokio::time::sleep(Duration::from_millis(10)).await;
     Harness {
         hub: handle,
         platform,
-        bridge,
         join,
     }
 }
@@ -133,10 +147,7 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
     let client = Uuid::new_v4();
 
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
@@ -157,7 +168,7 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
     // Mock platform must have created exactly one TAP, added to bridge.
     assert_eq!(h.platform.taps_count().await, 1);
     let tap = h.platform.last_tap().await.unwrap();
-    assert_eq!(h.bridge.snapshot().await.ports, vec![tap.name().to_owned()]);
+    assert_eq!(h.bridge().await.snapshot().await.ports, vec![tap.name().to_owned()]);
 
     // Conn must have received Some(session_cmd_tx) on bind_rx.
     let bound = recv_bind(&mut c.bind_rx).await;
@@ -169,10 +180,7 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
 #[tokio::test]
 async fn unknown_network_is_denied() {
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: Uuid::new_v4(),
-    });
+    cfg.networks.push(NetRecord::new("n", Uuid::new_v4()));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -192,10 +200,7 @@ async fn unknown_network_is_denied() {
 async fn join_without_hello_is_denied() {
     let net = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -217,10 +222,7 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -253,10 +255,7 @@ async fn admit_toggle_on_promotes_pending_to_session() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     let h = spawn(cfg).await;
 
     let mut c = fake_conn(&h, "x").await;
@@ -294,10 +293,7 @@ async fn admit_toggle_off_kicks_session_keeps_row_in_pending() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
@@ -359,10 +355,7 @@ async fn disconnect_unbinds_session_but_keeps_tap() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, ""));
     let h = spawn(cfg).await;
@@ -380,7 +373,7 @@ async fn disconnect_unbinds_session_but_keeps_tap() {
     assert_eq!(snap.sessions.len(), 1);
     assert_eq!(snap.sessions[0].bound_conn, None);
     // TAP still present in bridge.
-    assert_eq!(h.bridge.snapshot().await.ports.len(), 1);
+    assert_eq!(h.bridge().await.snapshot().await.ports.len(), 1);
 
     h.hub.shutdown().await;
 }
@@ -390,10 +383,7 @@ async fn reconnect_reuses_session_no_new_tap() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, "10.0.0.7/24"));
     let h = spawn(cfg).await;
@@ -433,10 +423,7 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, ""));
     let h = spawn(cfg).await;
@@ -465,10 +452,7 @@ async fn disconnect_then_timeout_removes_session_and_tap() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(0); // 0 = expire instantly
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, ""));
     let h = spawn(cfg).await;
@@ -485,7 +469,7 @@ async fn disconnect_then_timeout_removes_session_and_tap() {
 
     let snap = h.hub.list().await.unwrap();
     assert!(snap.sessions.is_empty(), "session should be cleaned up");
-    let bridge = h.bridge.snapshot().await;
+    let bridge = h.bridge().await.snapshot().await;
     assert!(bridge.ports.is_empty(), "tap should be removed from bridge");
 
     h.hub.shutdown().await;
@@ -496,10 +480,7 @@ async fn routes_pushed_after_join_and_filter_self_via() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     let other_client = Uuid::new_v4();
     cfg.approved_clients.push(approved_with_lan(
         client,
@@ -538,10 +519,7 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, ""));
     let h = spawn(cfg).await;
@@ -553,12 +531,15 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
     let _ = recv_bind(&mut c.bind_rx).await;
 
     let tap = h.platform.last_tap().await.unwrap();
+    // Capture the bridge handle BEFORE shutdown moves `h.join` and
+    // makes `h.bridge()` calls trip the partial-move check.
+    let bridge = h.bridge().await;
 
     h.hub.shutdown().await;
     // Allow the hub task to finish its shutdown sequence.
     let _ = tokio::time::timeout(Duration::from_secs(2), h.join).await;
 
-    assert!(h.bridge.snapshot().await.destroyed, "bridge must be destroyed");
+    assert!(bridge.snapshot().await.destroyed, "bridge must be destroyed");
     assert!(tap.snapshot().await.destroyed, "tap must be destroyed");
 }
 
@@ -569,10 +550,7 @@ async fn device_set_ip_pushes_to_live_session() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
@@ -615,10 +593,7 @@ async fn device_set_offline_only_persists_to_disk() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved(client, net, ""));
     cfg.save(&cfg_path).await.unwrap();
     let h = spawn_with_path(cfg, Some(cfg_path.clone())).await;
@@ -651,10 +626,7 @@ async fn device_set_rejects_invalid_or_unknown() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved(client, net, ""));
     let h = spawn(cfg).await;
 
@@ -709,10 +681,7 @@ async fn device_set_detects_tap_ip_conflict() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved(a, net, "10.0.0.2/24"));
     cfg.approved_clients.push(approved(b, net, "10.0.0.3/24"));
     let h = spawn(cfg).await;
@@ -743,10 +712,7 @@ async fn device_set_persists_lan_subnets_to_disk() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, "10.0.0.5/24"));
     cfg.save(&cfg_path).await.unwrap();
@@ -789,10 +755,7 @@ async fn device_push_pushes_to_each_bound_session() {
     let client_b = Uuid::new_v4();
     let other = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     // Two live clients and one offline client whose lan_subnet drives
     // the route table.
     cfg.approved_clients
@@ -901,10 +864,7 @@ async fn metrics_tick_broadcasts_one_sample_per_session() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients
         .push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
@@ -978,10 +938,7 @@ async fn admit_toggle_emits_device_online() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     let h = spawn(cfg).await;
     let mut events = h.hub.subscribe();
 
@@ -1033,10 +990,7 @@ async fn device_set_emits_changed_on_each_edit() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved(client, net, "10.0.0.5/24"));
     let h = spawn(cfg).await;
     let mut events = h.hub.subscribe();
@@ -1093,10 +1047,7 @@ async fn device_push_emits_routes_changed() {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(approved_with_lan(
         client,
         net,
@@ -1118,4 +1069,151 @@ async fn device_push_emits_routes_changed() {
         assert_eq!(routes[0].dst, "192.168.10.0/24");
     }
     h.hub.shutdown().await;
+}
+
+// ── Phase 2: per-network bridges ─────────────────────────────────────────
+
+#[tokio::test]
+async fn each_network_gets_its_own_bridge() {
+    // Two networks → MockPlatform sees two distinct bridges, each
+    // named after the corresponding NetRecord.bridge_name (which
+    // NetRecord::new auto-derives from the UUID).
+    let net_a = Uuid::new_v4();
+    let net_b = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    let rec_a = NetRecord::new("alpha", net_a);
+    let rec_b = NetRecord::new("beta", net_b);
+    let br_a_name = rec_a.bridge_name.clone();
+    let br_b_name = rec_b.bridge_name.clone();
+    cfg.networks.push(rec_a);
+    cfg.networks.push(rec_b);
+    let h = spawn(cfg).await;
+
+    let bridges = h.platform.bridges().await;
+    assert_eq!(bridges.len(), 2, "expected one bridge per network");
+    assert!(h.platform.bridge_named(&br_a_name).await.is_some());
+    assert!(h.platform.bridge_named(&br_b_name).await.is_some());
+    assert_ne!(br_a_name, br_b_name);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn admit_attaches_tap_to_owning_network_bridge_only() {
+    // Approving a device on net A must add its TAP to A's bridge —
+    // and B's bridge must stay empty.
+    let net_a = Uuid::new_v4();
+    let net_b = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    let rec_a = NetRecord::new("alpha", net_a);
+    let rec_b = NetRecord::new("beta", net_b);
+    let br_a_name = rec_a.bridge_name.clone();
+    let br_b_name = rec_b.bridge_name.clone();
+    cfg.networks.push(rec_a);
+    cfg.networks.push(rec_b);
+    cfg.approved_clients
+        .push(approved(client, net_a, "10.0.0.5/24"));
+    let h = spawn(cfg).await;
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    h.hub.join(c.id, net_a).await;
+    let _ = recv(&mut c.frame_rx).await; // JoinOk
+
+    let br_a = h.platform.bridge_named(&br_a_name).await.unwrap();
+    let br_b = h.platform.bridge_named(&br_b_name).await.unwrap();
+    assert_eq!(
+        br_a.snapshot().await.ports.len(),
+        1,
+        "net A's bridge should have the TAP",
+    );
+    assert!(
+        br_b.snapshot().await.ports.is_empty(),
+        "net B's bridge must NOT see net A's TAP",
+    );
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn delete_net_destroys_only_that_networks_bridge() {
+    // Two live networks; deleting A tears down A's kernel bridge but
+    // leaves B's running.
+    let net_a = Uuid::new_v4();
+    let net_b = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    let rec_a = NetRecord::new("alpha", net_a);
+    let rec_b = NetRecord::new("beta", net_b);
+    let br_a_name = rec_a.bridge_name.clone();
+    let br_b_name = rec_b.bridge_name.clone();
+    cfg.networks.push(rec_a);
+    cfg.networks.push(rec_b);
+    let h = spawn(cfg).await;
+
+    let br_a = h.platform.bridge_named(&br_a_name).await.unwrap();
+    let br_b = h.platform.bridge_named(&br_b_name).await.unwrap();
+    assert!(!br_a.snapshot().await.destroyed);
+    assert!(!br_b.snapshot().await.destroyed);
+
+    let ok = h.hub.delete_net(net_a).await;
+    assert!(ok, "delete_net should succeed for an existing net");
+    // Hub processes delete asynchronously; let the bridge teardown finish.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(br_a.snapshot().await.destroyed, "net A's bridge must be torn down");
+    assert!(!br_b.snapshot().await.destroyed, "net B's bridge must survive");
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_bridge_config_migrates_to_first_networks_fields() {
+    // A Phase-1 config: single `[bridge]` block, networks have no
+    // bridge_name. After load + save round-trip, the first network
+    // inherits the legacy name/ip and the second auto-derives a
+    // unique bridge name.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.toml");
+    let net_a = Uuid::new_v4();
+    let net_b = Uuid::new_v4();
+    let toml = format!(
+        r#"
+[server]
+host = "0.0.0.0"
+port = 8888
+save_dir = "/var/lib/bifrost"
+
+[bridge]
+name = "br-bifrost"
+ip = "10.0.0.1/24"
+disconnect_timeout = 60
+
+[admin]
+socket = "/run/bifrost/server.sock"
+
+[[networks]]
+name = "alpha"
+uuid = "{net_a}"
+
+[[networks]]
+name = "beta"
+uuid = "{net_b}"
+"#
+    );
+    tokio::fs::write(&path, toml).await.unwrap();
+    let cfg = ServerConfig::load(&path).await.unwrap();
+
+    assert_eq!(cfg.networks.len(), 2);
+    assert_eq!(
+        cfg.networks[0].bridge_name, "br-bifrost",
+        "first network should inherit the legacy bridge name"
+    );
+    assert_eq!(cfg.networks[0].bridge_ip, "10.0.0.1/24");
+    assert_ne!(
+        cfg.networks[1].bridge_name, "br-bifrost",
+        "second network should not collide on bridge name"
+    );
+    assert_eq!(cfg.networks[1].bridge_ip, "");
+    assert!(cfg.networks[1].bridge_name.starts_with("bf-"));
 }

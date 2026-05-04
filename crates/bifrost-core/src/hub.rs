@@ -434,7 +434,15 @@ pub struct Hub {
     cfg_path: Option<PathBuf>,
 
     platform: Arc<dyn Platform>,
-    bridge: Arc<dyn Bridge>,
+    /// One Linux bridge per virtual network (Phase 2). The map is
+    /// populated lazily during [`Hub::run`] startup from `cfg.networks`
+    /// and on every [`handle_make_net`]; entries are removed and
+    /// destroyed by [`handle_delete_net`]. Lookups in
+    /// [`do_approve`] / [`handle_session_died`] / [`sync_local_routes`]
+    /// route every TAP add/remove and every route push to the bridge
+    /// that owns the relevant network — this is what gives each
+    /// network its own L2 broadcast domain.
+    bridges: HashMap<Uuid, Arc<dyn Bridge>>,
 
     conns: HashMap<ConnId, ConnEntry>,
     sessions: HashMap<(Uuid, Uuid), SessionEntry>,
@@ -466,7 +474,6 @@ impl Hub {
         cfg: ServerConfig,
         cfg_path: Option<PathBuf>,
         platform: Arc<dyn Platform>,
-        bridge: Arc<dyn Bridge>,
     ) -> (Self, HubHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (evt_tx, evt_rx) = mpsc::channel(64);
@@ -476,7 +483,7 @@ impl Hub {
             cfg,
             cfg_path,
             platform,
-            bridge,
+            bridges: HashMap::new(),
             conns: HashMap::new(),
             sessions: HashMap::new(),
             sessions_by_id: HashMap::new(),
@@ -522,32 +529,81 @@ impl Hub {
     /// Failures are logged and swallowed — daemon startup must not
     /// abort just because rtnetlink hiccupped.
     async fn sync_local_routes(&self) {
-        let mut all = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        // Each network's routes go to its OWN bridge — one of the
+        // big wins of Phase 2 is that two networks with overlapping
+        // destinations don't collide on a single global table. We no
+        // longer need cross-network dedup.
         for net in &self.cfg.networks {
-            for r in derive_routes_for_network(&self.cfg, net.uuid) {
-                if !seen.insert(r.dst.clone()) {
-                    // Cross-network dst collision; skip the later one.
-                    continue;
-                }
-                all.push(r);
+            let Some(bridge) = self.bridges.get(&net.uuid) else {
+                continue;
+            };
+            let raw = derive_routes_for_network(&self.cfg, net.uuid);
+            let parsed: Vec<bifrost_net::RouteEntry> = raw
+                .iter()
+                .filter_map(|r| bifrost_net::RouteEntry::parse(&r.dst, &r.via).ok())
+                .collect();
+            if let Err(e) = bridge.apply_routes(&parsed).await {
+                warn!(network = %net.uuid, error = %e, "bridge.apply_routes failed");
             }
         }
-        let parsed: Vec<bifrost_net::RouteEntry> = all
-            .iter()
-            .filter_map(|r| bifrost_net::RouteEntry::parse(&r.dst, &r.via).ok())
-            .collect();
-        if let Err(e) = self.bridge.apply_routes(&parsed).await {
-            warn!(error = %e, "bridge.apply_routes failed");
+    }
+
+    /// Stand up one bridge per persisted network. Persists the config
+    /// afterwards so any auto-derived `bridge_name` lands in the TOML.
+    /// Must run before [`sync_local_routes`] so each network has its
+    /// kernel bridge ready.
+    async fn bootstrap_bridges(&mut self) {
+        for net in self.cfg.networks.clone() {
+            self.create_bridge_for(&net).await;
+        }
+    }
+
+    /// Create (or look up) the kernel bridge for `net` and stash it in
+    /// `self.bridges`. Idempotent — the platform's `create_bridge` is
+    /// expected to reuse an existing kernel bridge of the same name.
+    async fn create_bridge_for(&mut self, net: &NetRecord) {
+        if self.bridges.contains_key(&net.uuid) {
+            return;
+        }
+        let ip = if net.bridge_ip.is_empty() {
+            None
+        } else {
+            net.bridge_ip.parse().ok()
+        };
+        match self
+            .platform
+            .create_bridge(&net.bridge_name, ip)
+            .await
+        {
+            Ok(br) => {
+                info!(
+                    network = %net.uuid,
+                    bridge = %net.bridge_name,
+                    "bridge ready"
+                );
+                self.bridges.insert(net.uuid, br);
+            }
+            Err(e) => {
+                error!(
+                    network = %net.uuid,
+                    bridge = %net.bridge_name,
+                    error = %e,
+                    "create_bridge failed; this network's L2 plane is offline",
+                );
+            }
         }
     }
 
     pub async fn run(mut self) {
         info!(
-            bridge = self.bridge.name(),
+            networks = self.cfg.networks.len(),
             disconnect_timeout_s = self.disconnect_timeout.as_secs(),
             "hub start"
         );
+
+        // Stand up the kernel bridge for every persisted network
+        // before any conn can ask to join.
+        self.bootstrap_bridges().await;
 
         // Replay any persisted routes into the kernel — covers the
         // "daemon restart" path. Without this, traffic from the
@@ -928,7 +984,17 @@ impl Hub {
             }
         };
 
-        if let Err(e) = self.bridge.add_tap(&tap_name).await {
+        let Some(bridge) = self.bridges.get(&net_uuid).cloned() else {
+            error!(network = %net_uuid, "no bridge for network; refusing approval");
+            let _ = tap.destroy().await;
+            let _ = frame_tx
+                .send(Frame::JoinDeny {
+                    reason: "no_bridge".into(),
+                })
+                .await;
+            return;
+        };
+        if let Err(e) = bridge.add_tap(&tap_name).await {
             error!(error = %e, "bridge.add_tap failed");
             let _ = tap.destroy().await;
             let _ = frame_tx
@@ -1057,10 +1123,13 @@ impl Hub {
 
     async fn handle_make_net(&mut self, name: String, ack: oneshot::Sender<Uuid>) {
         let uuid = Uuid::new_v4();
-        self.cfg.networks.push(NetRecord {
-            name: name.clone(),
-            uuid,
-        });
+        let rec = NetRecord::new(name.clone(), uuid);
+        // Create the kernel-side bridge first. If that fails the
+        // record never lands in `cfg.networks` — better to surface the
+        // error to the admin than to leave a half-created network in
+        // a state where joins succeed but frames go nowhere.
+        self.create_bridge_for(&rec).await;
+        self.cfg.networks.push(rec);
         self.persist().await;
         info!(%name, %uuid, "network created");
         self.emit(HubEvent::NetworkCreated {
@@ -1137,9 +1206,17 @@ impl Hub {
         // Drop the network record itself.
         self.cfg.networks.retain(|n| n.uuid != net_uuid);
 
+        // Tear down the kernel bridge that was unique to this network.
+        if let Some(bridge) = self.bridges.remove(&net_uuid) {
+            if let Err(e) = bridge.destroy().await {
+                warn!(%net_uuid, error = %e, "bridge destroy on delete_net failed");
+            }
+        }
+
         self.persist().await;
-        // Bridge route table no longer mentions any of this network's
-        // routes — re-sync to clean up.
+        // Other networks' route tables aren't affected (each lives on
+        // its own bridge now), but a re-sync is still cheap and keeps
+        // the "any state-changing op syncs routes" invariant clean.
         self.sync_local_routes().await;
         info!(%net_uuid, "network deleted");
         self.emit(HubEvent::NetworkDeleted { network: net_uuid });
@@ -1507,7 +1584,9 @@ impl Hub {
                 let _ = c.link.bind_tx.send(None).await;
             }
         }
-        let _ = self.bridge.remove_tap(&entry.tap_name).await;
+        if let Some(bridge) = self.bridges.get(&entry.net_uuid) {
+            let _ = bridge.remove_tap(&entry.tap_name).await;
+        }
 
         self.emit(HubEvent::DeviceOffline {
             network: entry.net_uuid,
@@ -1531,7 +1610,15 @@ impl Hub {
             }
         })
         .await;
-        let _ = self.bridge.destroy().await;
+        // Tear down every per-network bridge. Idempotent on the
+        // platform side — `MockBridge` flips a flag, `LinuxBridge`
+        // issues `link del`. We don't `clear()` `self.bridges` since
+        // shutdown is the last thing this Hub instance does.
+        for (nid, bridge) in self.bridges.iter() {
+            if let Err(e) = bridge.destroy().await {
+                warn!(network = %nid, error = %e, "bridge destroy failed");
+            }
+        }
     }
 }
 

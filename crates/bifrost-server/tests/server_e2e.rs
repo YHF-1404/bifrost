@@ -16,7 +16,7 @@ use std::time::Duration;
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::Hub;
 use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::Platform;
 use bifrost_proto::{Frame, FrameCodec, PROTOCOL_VERSION};
 use bifrost_server::conn;
 use futures::{SinkExt, StreamExt};
@@ -30,7 +30,6 @@ const SHORT: Duration = Duration::from_millis(300);
 struct Harness {
     hub: bifrost_core::HubHandle,
     platform: Arc<MockPlatform>,
-    bridge: Arc<MockBridge>,
     save_dir: PathBuf,
     server_id: Uuid,
     #[allow(dead_code)]
@@ -39,16 +38,28 @@ struct Harness {
     hub_join: tokio::task::JoinHandle<()>,
 }
 
+impl Harness {
+    /// Hub-created bridge for the (only) network this harness uses.
+    /// Phase-2: Hub owns its bridges via `MockPlatform::create_bridge`,
+    /// not a test-supplied `MockBridge`.
+    async fn bridge(&self) -> Arc<MockBridge> {
+        self.platform
+            .last_bridge()
+            .await
+            .expect("hub did not create a bridge")
+    }
+}
+
 async fn spawn_hub(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = ServerConfig::default();
     cfg.bridge.disconnect_timeout = 60;
     cfg.server.save_dir = tmp.path().join("recv").to_string_lossy().into_owned();
     for net in networks {
-        cfg.networks.push(NetRecord {
-            name: format!("net-{}", &net.simple().to_string()[..8]),
-            uuid: net,
-        });
+        cfg.networks.push(NetRecord::new(
+            format!("net-{}", &net.simple().to_string()[..8]),
+            net,
+        ));
     }
     for (client, net, ip) in approved {
         cfg.approved_clients.push(ApprovedClient {
@@ -61,20 +72,20 @@ async fn spawn_hub(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Ha
         });
     }
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
     let save_dir = PathBuf::from(&cfg.server.save_dir);
 
     let (hub, handle) = Hub::new(
         cfg,
         None,
         platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
     );
     let hub_join = tokio::spawn(hub.run());
+    // Let Hub::run bootstrap its per-network bridges before the test
+    // starts driving conns.
+    tokio::time::sleep(Duration::from_millis(20)).await;
     Harness {
         hub: handle,
         platform,
-        bridge,
         save_dir,
         server_id: Uuid::new_v4(),
         _tmp: tmp,
@@ -180,7 +191,7 @@ async fn full_join_flow_creates_tap_and_binds() {
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(h.platform.taps_count().await, 1);
     let tap = h.platform.last_tap().await.unwrap();
-    assert_eq!(h.bridge.snapshot().await.ports.len(), 1);
+    assert_eq!(h.bridge().await.snapshot().await.ports.len(), 1);
 
     // Eth from client → reaches bridge tap.
     c.send(Frame::Eth(b"client-to-server".to_vec()))

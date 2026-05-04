@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::Hub;
-use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::mock::MockPlatform;
+use bifrost_net::Platform;
 use bifrost_proto::PROTOCOL_VERSION;
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -22,10 +22,7 @@ async fn spawn_server() -> (SocketAddr, bifrost_core::HubHandle) {
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = ServerConfig::default();
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     cfg.approved_clients.push(ApprovedClient {
         client_uuid: client,
         net_uuid: net,
@@ -36,13 +33,9 @@ async fn spawn_server() -> (SocketAddr, bifrost_core::HubHandle) {
     });
 
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
-    let (hub, handle) = Hub::new(
-        cfg,
+    let (hub, handle) = Hub::new(cfg,
         None,
-        platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
-    );
+        platform.clone() as Arc<dyn Platform>);
     tokio::spawn(hub.run());
 
     // Bring a fake conn online so a real session exists; the metrics

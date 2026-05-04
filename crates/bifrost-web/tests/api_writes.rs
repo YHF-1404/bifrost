@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::{ConnLink, Hub, HubHandle, SessionCmd};
-use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::mock::MockPlatform;
+use bifrost_net::Platform;
 use bifrost_proto::PROTOCOL_VERSION;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -35,23 +35,16 @@ fn approved(client: Uuid, net: Uuid, ip: &str, lan: &[&str]) -> ApprovedClient {
 async fn spawn_with(approveds: Vec<ApprovedClient>) -> Harness {
     let net = Uuid::new_v4();
     let mut cfg = ServerConfig::default();
-    cfg.networks.push(NetRecord {
-        name: "n".into(),
-        uuid: net,
-    });
+    cfg.networks.push(NetRecord::new("n", net));
     for mut a in approveds {
         a.net_uuid = net;
         cfg.approved_clients.push(a);
     }
 
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
-    let (hub, handle) = Hub::new(
-        cfg,
+    let (hub, handle) = Hub::new(cfg,
         None,
-        platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
-    );
+        platform.clone() as Arc<dyn Platform>);
     tokio::spawn(hub.run());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

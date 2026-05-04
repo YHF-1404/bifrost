@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
 use bifrost_core::Hub;
-use bifrost_net::mock::{MockBridge, MockPlatform};
-use bifrost_net::{Bridge, Platform};
+use bifrost_net::mock::MockPlatform;
+use bifrost_net::Platform;
 use bifrost_proto::admin::{ServerAdminReq, ServerAdminResp};
 use bifrost_server::admin;
 use tempfile::TempDir;
@@ -36,10 +36,10 @@ async fn spawn(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Harnes
     let mut cfg = ServerConfig::default();
     cfg.bridge.disconnect_timeout = 60;
     for net in networks {
-        cfg.networks.push(NetRecord {
-            name: format!("net-{}", &net.simple().to_string()[..8]),
-            uuid: net,
-        });
+        cfg.networks.push(NetRecord::new(
+            format!("net-{}", &net.simple().to_string()[..8]),
+            net,
+        ));
     }
     for (client, net, ip) in approved {
         cfg.approved_clients.push(ApprovedClient {
@@ -52,13 +52,9 @@ async fn spawn(approved: Vec<(Uuid, Uuid, &str)>, networks: Vec<Uuid>) -> Harnes
         });
     }
     let platform = MockPlatform::new();
-    let bridge = MockBridge::new(&cfg.bridge.name);
-    let (hub, handle) = Hub::new(
-        cfg,
+    let (hub, handle) = Hub::new(cfg,
         None,
-        platform.clone() as Arc<dyn Platform>,
-        bridge.clone() as Arc<dyn Bridge>,
-    );
+        platform.clone() as Arc<dyn Platform>);
     let hub_join = tokio::spawn(hub.run());
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel(2);
