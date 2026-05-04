@@ -27,6 +27,12 @@ export function useEventInvalidator() {
         case "device.changed":
         case "device.pending":
         case "device.removed": {
+          // Phase 3 — `network` is `00000000-…` (nil UUID) for events
+          // about unassigned clients in the pending pool. Either way,
+          // invalidate the unified /api/clients query AND the legacy
+          // per-network device list (only the second one cares about
+          // the network UUID).
+          qc.invalidateQueries({ queryKey: ["clients"] });
           qc.invalidateQueries({ queryKey: ["devices", evt.network] });
           // Network header counts (online_count / device_count) are
           // derived from the same data — refresh them too.
