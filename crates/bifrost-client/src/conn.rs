@@ -108,7 +108,19 @@ impl ConnTask {
                     },
                     outgoing = self.out_rx.recv() => match outgoing {
                         Some(frame) => {
-                            if let Err(e) = framed.send(frame).await {
+                            // Feed first + drain backlog + single flush.
+                            // Replaces SinkExt::send (feed+flush per
+                            // frame), turning N write syscalls into 1
+                            // when bulk traffic queues frames up.
+                            let res: Result<(), bifrost_proto::ProtoError> = async {
+                                framed.feed(frame).await?;
+                                while let Ok(more) = self.out_rx.try_recv() {
+                                    framed.feed(more).await?;
+                                }
+                                framed.flush().await
+                            }
+                            .await;
+                            if let Err(e) = res {
                                 warn!(error = %e, "socket write failed");
                                 break;
                             }
@@ -133,15 +145,22 @@ impl ConnTask {
     /// on and avoid threading a generic type all the way through.
     async fn connect(cfg: &ClientConfig) -> anyhow::Result<TcpStream> {
         let target = (cfg.client.host.as_str(), cfg.client.port);
-        if cfg.proxy.enabled {
+        let stream = if cfg.proxy.enabled {
             let s = Socks5Stream::connect(
                 (cfg.proxy.host.as_str(), cfg.proxy.port),
                 target,
             )
             .await?;
-            Ok(s.into_inner())
+            s.into_inner()
         } else {
-            Ok(TcpStream::connect(target).await?)
+            TcpStream::connect(target).await?
+        };
+        // Disable Nagle so per-frame writes don't get held waiting for
+        // the previous segment's ACK. See accept.rs for the matching
+        // server-side rationale.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(error = %e, "set_nodelay failed (continuing)");
         }
+        Ok(stream)
     }
 }

@@ -36,7 +36,10 @@ pub async fn run<S>(stream: S, addr: String, hub: HubHandle, server_id: Uuid, sa
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(128);
+    // 1024 ≈ 1.5 MB of buffered frames at MTU 1500. Big enough that a
+    // momentarily-stalled writer (e.g. socket congestion window
+    // shrinking) doesn't immediately backpressure the TAP-read loop.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(1024);
     let (bind_tx, mut bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
     let conn_id = match hub
         .register_conn(addr.clone(), ConnLink { frame_tx, bind_tx })
@@ -54,10 +57,23 @@ where
         tokio::select! {
             biased;
 
-            // Outbound from hub / session → wire.
+            // Outbound from hub / session → wire. We feed the first
+            // frame, then drain anything else already queued, then a
+            // single flush — this turns N per-frame syscalls under
+            // bulk traffic into one. SinkExt::send is feed+flush, so
+            // the previous code paid one flush (and at least one
+            // write syscall) per frame.
             outbound = frame_rx.recv() => match outbound {
                 Some(frame) => {
-                    if let Err(e) = framed.send(frame).await {
+                    let res: Result<(), bifrost_proto::ProtoError> = async {
+                        framed.feed(frame).await?;
+                        while let Ok(more) = frame_rx.try_recv() {
+                            framed.feed(more).await?;
+                        }
+                        framed.flush().await
+                    }
+                    .await;
+                    if let Err(e) = res {
                         warn!(?conn_id, error = %e, "socket write failed");
                         break 'main;
                     }

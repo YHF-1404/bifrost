@@ -1286,7 +1286,11 @@ impl Hub {
             return;
         }
 
-        let (sess_cmd_tx, sess_cmd_rx) = mpsc::channel(64);
+        // Carries data-plane EthIn frames from the conn task into this
+        // session. 1024 lets bulk traffic queue without immediately
+        // blocking the conn task's `tx.send(EthIn).await`, which would
+        // otherwise stall every inbound packet behind socket I/O.
+        let (sess_cmd_tx, sess_cmd_rx) = mpsc::channel(1024);
         let bytes_in = Arc::new(AtomicU64::new(0));
         let bytes_out = Arc::new(AtomicU64::new(0));
         let task = SessionTask::new(

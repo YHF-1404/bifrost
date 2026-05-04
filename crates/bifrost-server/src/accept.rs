@@ -18,6 +18,15 @@ pub async fn run(listener: TcpListener, hub: HubHandle, server_id: Uuid, save_di
                 continue;
             }
         };
+        // Disable Nagle. The data plane is one TAP frame per length-
+        // prefixed TCP write; with Nagle on, every write waits for the
+        // previous segment's ACK or a 200 ms timer, which throttles bulk
+        // transfers (e.g. SCP) to ~10 % of line rate over a non-trivial
+        // RTT. Bifrost frames are already large enough that batching
+        // doesn't help.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(%addr, error = %e, "set_nodelay failed (continuing)");
+        }
         info!(%addr, "accepted");
         let hub = hub.clone();
         let save_dir = save_dir.clone();
