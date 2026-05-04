@@ -20,9 +20,19 @@ interface Side {
 function midpoints(
   node: ReturnType<typeof useInternalNode> | undefined,
 ): Side[] {
-  if (!node || !node.measured) return [];
-  const w = node.measured.width ?? 0;
-  const h = node.measured.height ?? 0;
+  if (!node) return [];
+  // React Flow v12 only fills `measured` after a ResizeObserver
+  // tick. Parented nodes with an explicit `style: { width, height }`
+  // sometimes render before measure completes — fall back to those
+  // values so the edge midpoints don't collapse to a single point
+  // and the line ends up pinned to the wrong corner of the card.
+  const styleW =
+    typeof node.style?.width === "number" ? node.style.width : undefined;
+  const styleH =
+    typeof node.style?.height === "number" ? node.style.height : undefined;
+  const w = node.measured?.width ?? node.width ?? styleW ?? 0;
+  const h = node.measured?.height ?? node.height ?? styleH ?? 0;
+  if (w === 0 || h === 0) return [];
   const x = node.internals.positionAbsolute.x;
   const y = node.internals.positionAbsolute.y;
   return [

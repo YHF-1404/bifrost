@@ -76,11 +76,12 @@ const DEFAULT_FRAME = { x: 0, y: 0, width: 720, height: 520 };
 const DEFAULT_HUB_OFFSET = { x: 24, y: 36 };
 const CLIENT_W = 280;
 // Sized to fit the rendered ClientNode (header strip + name/IP/LAN +
-// throughput); previously 150 was an under-estimate that caused the
-// bottom of the card to spill below the auto-grown frame.
+// throughput) AND match the inner card's `h-full w-full` size, so
+// the edge midpoints land on the visible card border instead of a
+// padded wrapper edge.
 const CLIENT_H = 200;
 const HUB_W = 240;
-const HUB_H = 160;
+const HUB_H = 132;
 const FRAME_PADDING = 40;
 const FRAME_GAP = 24; // gap kept between non-overlapping frames
 const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
@@ -166,7 +167,10 @@ function FrameNode({ data, selected }: NodeProps<Node<FrameData>>) {
 function HubNode({ data }: NodeProps<Node<HubData>>) {
   const { net } = data;
   return (
-    <div className="rounded-lg border-2 border-primary bg-card text-sm shadow-md">
+    // h-full + flex-col: the card stretches to fill the React Flow
+    // wrapper exactly, so FloatingEdge's wrapper-bbox midpoints
+    // coincide with the visible card border (no gap below).
+    <div className="flex h-full w-full flex-col rounded-lg border-2 border-primary bg-card text-sm shadow-md">
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
       {/* The whole header strip is the drag handle: a wide easy-to-
@@ -180,7 +184,7 @@ function HubNode({ data }: NodeProps<Node<HubData>>) {
           {data.deviceCount} dev
         </Badge>
       </div>
-      <div className="space-y-1.5 px-3 py-2">
+      <div className="flex flex-1 flex-col justify-between gap-1 px-3 py-2">
         <div className="flex items-center gap-2 text-xs">
           <span className="text-muted-foreground">name</span>
           <InlineEdit
@@ -248,7 +252,7 @@ function ClientNode({ data }: NodeProps<Node<ClientData>>) {
   return (
     <div
       className={cn(
-        "flex flex-col rounded-lg border bg-card text-xs shadow-sm",
+        "flex h-full w-full flex-col rounded-lg border bg-card text-xs shadow-sm",
         isPending ? "border-dashed border-amber-400" : "border-border",
       )}
     >
@@ -281,7 +285,7 @@ function ClientNode({ data }: NodeProps<Node<ClientData>>) {
           {shortUuid(c.client_uuid)}…
         </span>
       </div>
-      <div className="flex flex-col gap-1.5 px-2.5 py-2">
+      <div className="flex flex-1 flex-col gap-1.5 px-2.5 py-2">
 
       {/* Name + IP row */}
       <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-0.5">
@@ -732,6 +736,13 @@ function UnifiedGraphInner() {
           style: { width: CLIENT_W, height: CLIENT_H },
         });
         if (c.admitted) {
+          // Edge target is the Hub card so the floating line lands
+          // at the hub's closest border midpoint — the source of
+          // truth visually for "this client connects to that
+          // network". The hub card is sized to fill its React-Flow
+          // wrapper exactly (CLIENT_H/HUB_H below + h-full inside),
+          // so the endpoint coincides with the visible card border
+          // rather than an empty padding zone.
           es.push({
             id: `e:${c.client_uuid}->${c.net_uuid}`,
             type: "floating",
@@ -783,6 +794,11 @@ function UnifiedGraphInner() {
     (_e: unknown, node: Node) => {
       if (node.type === "frame") {
         const nid = node.id.replace(/^frame:/, "");
+        // node.position is the *visual* (post-shift) position. The
+        // saved value is the RAW anchor — add the current shift back
+        // so the next derive doesn't subtract it a second time and
+        // the frame stays where the user released it.
+        const shift = shiftsRef.current.get(nid) ?? { shiftX: 0, shiftY: 0 };
         layout.update((prev) => ({
           ...prev,
           graph: {
@@ -790,8 +806,8 @@ function UnifiedGraphInner() {
             frames: {
               ...prev.graph.frames,
               [nid]: {
-                x: node.position.x,
-                y: node.position.y,
+                x: node.position.x + shift.shiftX,
+                y: node.position.y + shift.shiftY,
                 width: Number(node.style?.width ?? DEFAULT_FRAME.width),
                 height: Number(node.style?.height ?? DEFAULT_FRAME.height),
               },
