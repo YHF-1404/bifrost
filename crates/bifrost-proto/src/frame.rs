@@ -58,6 +58,20 @@ pub enum Frame {
     File { name: String, data: Vec<u8> },
 
     // ── Online configuration push ─────────────────────────────────────
+    /// **S → C, Phase 3.** Reassign the client to a different virtual
+    /// network (or to no network at all).
+    ///
+    /// Sent by the server when an admin drags the client onto another
+    /// network in the WebUI, or removes it from its current network.
+    /// On receipt the client tears down any current TAP/session, sets
+    /// its on-disk `joined_network` to the new value, and (if `Some`)
+    /// sends a fresh `Join` for the new network.
+    ///
+    /// `net_uuid = None` means "you are currently unassigned; sit
+    /// idle until told otherwise." The client persists this state too,
+    /// so a restart doesn't auto-rejoin a stale network.
+    AssignNet { net_uuid: Option<Uuid> },
+
     /// **S → C.** Replace the TAP IP. `None` clears any existing address.
     SetIp { ip: Option<String> },
 

@@ -41,7 +41,12 @@ pub use frame::Frame;
 pub use types::{caps, RouteEntry};
 
 /// Current protocol version. Bumped on any wire-incompatible change.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// * v1 — initial.
+/// * v2 — added [`Frame::AssignNet`] for server-driven network
+///   assignment (Phase 3 unified WebUI). Old clients get a
+///   `JoinDeny { reason: "version_mismatch:..." }` on Hello.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum encoded payload size in bytes (postcard output, header excluded).
 ///

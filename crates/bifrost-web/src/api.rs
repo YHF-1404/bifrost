@@ -79,7 +79,7 @@ async fn list_networks(State(state): State<AppState>) -> Response {
         .iter()
         .map(|n| {
             let in_net: Vec<&DeviceEntry> =
-                devices.iter().filter(|d| d.net_uuid == n.uuid).collect();
+                devices.iter().filter(|d| d.net_uuid == Some(n.uuid)).collect();
             Network {
                 id: n.uuid,
                 name: n.name.clone(),

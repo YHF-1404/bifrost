@@ -31,9 +31,10 @@ pub enum ServerAdminReq {
     MakeNet { name: String },
     RenameNet { net_uuid: Uuid, name: String },
     DeleteNet { net_uuid: Uuid },
-    /// Mutate one or more fields of an approved client. `None` on a
-    /// field means "leave unchanged"; setting `tap_ip = Some("")` or
-    /// `lan_subnets = Some(vec![])` clears the field.
+    /// Mutate one or more fields of a client. `None` on a field means
+    /// "leave unchanged"; setting `tap_ip = Some("")` or
+    /// `lan_subnets = Some(vec![])` clears the field. A pending
+    /// (unassigned) client only accepts `name` and `lan_subnets`.
     DeviceSet {
         client_uuid: Uuid,
         name: Option<String>,
@@ -41,12 +42,21 @@ pub enum ServerAdminReq {
         tap_ip: Option<String>,
         lan_subnets: Option<Vec<String>>,
     },
+    /// **Phase 3.** Assign a client to a network (or detach it).
+    /// `net_uuid = None` moves the client to the pending pool.
+    /// `Some(nid)` makes the client a (pending, admitted=false) member
+    /// of that network — admin then sets `tap_ip` and flips `admitted`.
+    AssignClient {
+        client_uuid: Uuid,
+        net_uuid: Option<Uuid>,
+    },
     /// Re-derive routes for a network and push to all currently joined
     /// clients in it.
     DevicePush {
         net_uuid: Uuid,
     },
-    /// List devices. `None` = all networks; `Some(uuid)` = filter.
+    /// List devices. `None` = all networks **plus** pending clients;
+    /// `Some(uuid)` = filter to a single network.
     DeviceList {
         net_uuid: Option<Uuid>,
     },
@@ -130,19 +140,26 @@ pub struct RouteRow {
     pub via: String,
 }
 
-/// Combined view of an approved client — both persistent
-/// (`approved_clients` row) and runtime (current session) state. Used
-/// by `DeviceList` and `DeviceSet` responses, and by the WebUI.
+/// Combined view of a client — both persistent (`approved_clients`
+/// row, or `pending_clients` row in Phase 3) and runtime (current
+/// session) state. Used by `DeviceList` / `DeviceSet` responses and
+/// the WebUI.
+///
+/// `net_uuid = None` distinguishes a Phase-3 pending (unassigned)
+/// client from one that lives in a specific network. Pending entries
+/// have `admitted = false`, `tap_ip = None`, and never carry session
+/// state (`online` reflects only whether the conn is alive).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceEntry {
     pub client_uuid: Uuid,
-    pub net_uuid: Uuid,
+    pub net_uuid: Option<Uuid>,
     pub display_name: String,
     pub admitted: bool,
     pub tap_ip: Option<String>,
     pub lan_subnets: Vec<String>,
     /// True iff the hub currently has a live `SessionTask` joined for
-    /// `(client_uuid, net_uuid)`.
+    /// `(client_uuid, net_uuid)`, OR (for pending entries) the client
+    /// has an open conn awaiting assignment.
     pub online: bool,
     /// Current session id while online, else `None`.
     pub sid: Option<u64>,
@@ -272,7 +289,7 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         let resp = ServerAdminResp::Devices(vec![DeviceEntry {
             client_uuid: Uuid::new_v4(),
-            net_uuid: Uuid::new_v4(),
+            net_uuid: Some(Uuid::new_v4()),
             display_name: "router".into(),
             admitted: true,
             tap_ip: Some("10.0.0.5/24".into()),
@@ -284,6 +301,18 @@ mod tests {
         write_admin(&mut a, &resp).await.unwrap();
         let got: ServerAdminResp = read_admin(&mut b).await.unwrap();
         assert_eq!(got, resp);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_assign_client() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let req = ServerAdminReq::AssignClient {
+            client_uuid: Uuid::new_v4(),
+            net_uuid: Some(Uuid::new_v4()),
+        };
+        write_admin(&mut a, &req).await.unwrap();
+        let got: ServerAdminReq = read_admin(&mut b).await.unwrap();
+        assert_eq!(got, req);
     }
 
     #[tokio::test]

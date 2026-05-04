@@ -192,6 +192,7 @@ where
         f @ (Frame::HelloAck { .. }
         | Frame::JoinOk { .. }
         | Frame::JoinDeny { .. }
+        | Frame::AssignNet { .. }
         | Frame::SetIp { .. }
         | Frame::SetRoutes(_)) => {
             warn!(?conn_id, ?f, "unexpected server→client frame from client");

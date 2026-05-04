@@ -42,6 +42,18 @@ pub struct ServerConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub approved_clients: Vec<ApprovedClient>,
+
+    /// Phase 3 — clients that have connected (or been pre-registered)
+    /// but are not currently assigned to any network. Survives restarts
+    /// so an admin can pre-fill `display_name` and `lan_subnets` while
+    /// the client is offline. A given `client_uuid` is in at most one
+    /// of `pending_clients` and `approved_clients` at a time.
+    #[serde(
+        default,
+        rename = "pending_clients",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub pending_clients: Vec<PendingClient>,
 }
 
 fn default_server_admin() -> AdminConfig {
@@ -60,6 +72,7 @@ impl Default for ServerConfig {
             web: WebConfig::default(),
             networks: Vec::new(),
             approved_clients: Vec::new(),
+            pending_clients: Vec::new(),
         }
     }
 }
@@ -213,6 +226,23 @@ fn default_admitted() -> bool {
     true
 }
 
+/// Phase 3 — a client known to the server but not currently in any
+/// network. Gets promoted to an [`ApprovedClient`] row when the admin
+/// drags it onto a network in the WebUI; demoted back to here when an
+/// admin removes it from a network or deletes the network it was in.
+///
+/// `display_name` and `lan_subnets` are pre-configurable while the
+/// client is offline, and survive a "drag into / drag out of" round
+/// trip (the server copies them across when moving rows).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingClient {
+    pub client_uuid: Uuid,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lan_subnets: Vec<String>,
+}
+
 /// Route as it appears on disk (client config) and on the wire — strings
 /// only, validated at the platform layer (see `bifrost_net::RouteEntry::parse`).
 ///
@@ -318,6 +348,7 @@ impl ServerConfig {
     pub async fn load(path: &Path) -> Result<Self, CoreError> {
         let mut cfg: Self = load_toml(path).await?;
         cfg.migrate_phase2_bridges();
+        cfg.migrate_phase3_one_net_per_client();
         Ok(cfg)
     }
 
@@ -337,6 +368,50 @@ impl ServerConfig {
     /// This is idempotent: once a config has been written back with
     /// every network carrying its own `bridge_name`, this function is
     /// a no-op.
+    /// Phase-2 → Phase-3 migration: one client lives in at most one
+    /// network at a time.
+    ///
+    /// Phase 1/2 schemas allowed an `approved_clients` row per
+    /// `(client, net)` pair, so the same client could end up in
+    /// multiple networks simultaneously. Phase 3's drag-to-assign UX
+    /// fundamentally treats each client as belonging to one network
+    /// or none. To make existing configs load cleanly we collapse
+    /// duplicates here:
+    ///
+    /// * If a `client_uuid` has any `admitted=true` row, keep the
+    ///   first such row and drop the rest.
+    /// * If all rows for a client are `admitted=false`, keep the
+    ///   first and drop the rest.
+    ///
+    /// Idempotent on Phase-3-clean configs.
+    fn migrate_phase3_one_net_per_client(&mut self) {
+        use std::collections::HashSet;
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        // Two passes: prefer admitted rows.
+        let mut keep: Vec<ApprovedClient> = Vec::new();
+        for ac in self.approved_clients.iter().filter(|a| a.admitted) {
+            if seen.insert(ac.client_uuid) {
+                keep.push(ac.clone());
+            }
+        }
+        for ac in self.approved_clients.iter().filter(|a| !a.admitted) {
+            if seen.insert(ac.client_uuid) {
+                keep.push(ac.clone());
+            }
+        }
+        self.approved_clients = keep;
+
+        // Drop any pending_clients row whose client_uuid also appears
+        // in approved_clients — the network row wins.
+        let approved_ids: HashSet<Uuid> = self
+            .approved_clients
+            .iter()
+            .map(|a| a.client_uuid)
+            .collect();
+        self.pending_clients
+            .retain(|p| !approved_ids.contains(&p.client_uuid));
+    }
+
     fn migrate_phase2_bridges(&mut self) {
         let mut legacy_consumed = false;
         for net in &mut self.networks {

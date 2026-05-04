@@ -174,6 +174,7 @@ impl App {
                     let _ = tx.send(SessionCmd::EthIn(bytes)).await;
                 }
             }
+            Frame::AssignNet { net_uuid } => self.on_assign_net(net_uuid).await?,
             Frame::SetIp { ip } => self.on_set_ip(ip).await,
             Frame::SetRoutes(routes) => self.on_set_routes(routes).await,
             Frame::Text(msg) => println!("[server] > {msg}"),
@@ -275,6 +276,47 @@ impl App {
         self.joined_net = None;
         self.cfg.client.joined_network.clear();
         let _ = self.cfg.save(&self.cfg_path).await;
+    }
+
+    /// Server-driven re-assignment (Phase 3).
+    ///
+    /// `Some(nid)` = "join this network" (replacing any current
+    /// assignment). `None` = "leave any current network and idle."
+    /// Either way the local TAP comes down and is re-created from the
+    /// next `JoinOk`.
+    async fn on_assign_net(&mut self, net_uuid: Option<Uuid>) -> anyhow::Result<()> {
+        // Tear down whatever session we currently have.
+        if let Some(tx) = self.session_tx.take() {
+            let _ = tx.send(SessionCmd::Kill).await;
+        }
+        self.joined_net = None;
+        self.joined_tap_name = None;
+        self.joined_tap_ip = None;
+        self.cfg.tap.ip.clear();
+
+        match net_uuid {
+            Some(net) => {
+                self.joining_net = Some(net);
+                self.cfg.client.joined_network = net.to_string();
+                let _ = self.cfg.save(&self.cfg_path).await;
+                if self.hello_acked {
+                    self.out_tx.send(Frame::Join { net_uuid: net }).await?;
+                    println!("[*] reassigned to network {}", net_short(&net));
+                } else {
+                    println!(
+                        "[*] reassigned to network {}; will join after the next HelloAck",
+                        net_short(&net)
+                    );
+                }
+            }
+            None => {
+                self.joining_net = None;
+                self.cfg.client.joined_network.clear();
+                let _ = self.cfg.save(&self.cfg_path).await;
+                println!("[*] unassigned — awaiting admin reassignment");
+            }
+        }
+        Ok(())
     }
 
     async fn on_set_ip(&mut self, ip: Option<String>) {

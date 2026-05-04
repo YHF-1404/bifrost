@@ -29,8 +29,8 @@ pub mod transport;
 pub use error::CoreError;
 pub use events::{HubEvent, MetricsSample, RouteRow};
 pub use hub::{
-    ConnLink, DevicePushResult, DeviceSetResult, DeviceUpdate, Hub, HubCmd, HubHandle, HubSnapshot,
-    PendingInfo, SessionInfo,
+    AssignClientResult, ConnLink, DevicePushResult, DeviceSetResult, DeviceUpdate, Hub, HubCmd,
+    HubHandle, HubSnapshot, PendingInfo, SessionInfo,
 };
 pub use ids::{ConnId, SessionId};
 pub use session::{

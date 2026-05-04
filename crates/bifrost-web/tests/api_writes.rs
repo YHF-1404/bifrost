@@ -194,12 +194,12 @@ async fn patch_device_unknown_is_404() {
 
 #[tokio::test]
 async fn fresh_join_creates_pending_row_and_admit_promotes_it() {
+    // Phase 3 — Hello → unassigned, assign → row in net (admitted=false),
+    // Join → silent pending, admit → live session.
     let h = spawn_with(vec![]).await;
 
-    // Stand up a fake conn that joins. Hub creates a row with
-    // admitted=false on first contact.
     let cid = Uuid::new_v4();
-    let (frame_tx, _frame_rx) = mpsc::channel(16);
+    let (frame_tx, mut frame_rx) = mpsc::channel(16);
     let (bind_tx, _bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
     let conn = h
         .hub
@@ -207,11 +207,16 @@ async fn fresh_join_creates_pending_row_and_admit_promotes_it() {
         .await
         .unwrap();
     h.hub.hello(conn, cid, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Admin assigns to the network — the conn receives `AssignNet`.
+    let _ = h.hub.assign_client(cid, Some(h.net)).await;
+    // Drain that frame so we don't confuse later assertions.
+    let _ = tokio::time::timeout(Duration::from_millis(100), frame_rx.recv()).await;
     h.hub.join(conn, h.net).await;
-    // brief settle
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Listing shows the device in pending state.
+    // Listing shows the device in pending-admit state.
     let arr: Value = reqwest::get(url(&h, &format!("/api/networks/{}/devices", h.net)))
         .await
         .unwrap()

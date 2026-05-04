@@ -215,10 +215,11 @@ async fn join_without_hello_is_denied() {
 }
 
 #[tokio::test]
-async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
-    // No row exists for this client yet. handle_join creates one with
-    // admitted=false and parks the conn in pending — no JoinOk or
-    // JoinDeny is sent.
+async fn fresh_hello_creates_pending_unassigned_row() {
+    // Phase 3 — server is authoritative on assignment. A first Hello
+    // from an unknown client creates a pending_clients row (left pane
+    // in the WebUI) and any Join attempt is denied with "unassigned"
+    // until an admin assigns it.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -227,9 +228,54 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
-    h.hub.join(c.id, net).await;
+    // Give the hub a beat to write the pending_clients row.
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // No frame should arrive — server holds the conn in pending state.
+    h.hub.join(c.id, net).await;
+    match recv(&mut c.frame_rx).await {
+        Frame::JoinDeny { reason } => assert_eq!(reason, "unassigned"),
+        other => panic!("expected JoinDeny(unassigned), got {other:?}"),
+    }
+
+    // Device list (no filter) shows the unassigned row with net_uuid=None.
+    let devices = h.hub.device_list(None).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].client_uuid, client);
+    assert_eq!(devices[0].net_uuid, None);
+    assert!(!devices[0].admitted);
+    assert!(devices[0].online);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn assign_then_join_creates_pending_admit_row_and_holds_conn() {
+    // After Hello, an admin's `assign_client` creates an approved_clients
+    // row with admitted=false. The client (re-)joins and the server
+    // holds the conn silently in `pending` — waiting for admit toggle.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let h = spawn(cfg).await;
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Admin assigns. This sends `Frame::AssignNet { Some(net) }` to the
+    // conn; in the test harness we observe it on `frame_rx`.
+    let result = h.hub.assign_client(client, Some(net)).await;
+    assert!(matches!(result, bifrost_core::AssignClientResult::Ok(_)));
+
+    match recv(&mut c.frame_rx).await {
+        Frame::AssignNet { net_uuid } => assert_eq!(net_uuid, Some(net)),
+        other => panic!("expected AssignNet, got {other:?}"),
+    }
+
+    // Now the client (simulating its on_assign_net handler) issues Join.
+    h.hub.join(c.id, net).await;
+    // Server holds silently — no JoinOk yet.
     assert!(try_recv_silent(&mut c.frame_rx, Duration::from_millis(80))
         .await
         .is_none());
@@ -238,8 +284,6 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
     assert_eq!(snap.pending.len(), 1);
     assert_eq!(snap.pending[0].client_uuid, client);
 
-    // The device list shows the row in pending state (admitted=false,
-    // online=true).
     let devices = h.hub.device_list(Some(net)).await;
     assert_eq!(devices.len(), 1);
     assert!(!devices[0].admitted);
@@ -250,8 +294,7 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
 
 #[tokio::test]
 async fn admit_toggle_on_promotes_pending_to_session() {
-    // Same as above, then admin flips admitted=true and a real session
-    // spawns; the conn finally gets JoinOk.
+    // Phase 3 flow: Hello → assign → Join (silent) → admit → JoinOk.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -260,6 +303,10 @@ async fn admit_toggle_on_promotes_pending_to_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = h.hub.assign_client(client, Some(net)).await;
+    // Drain the AssignNet frame.
+    let _ = recv(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     // Flip admitted on.
@@ -934,7 +981,8 @@ where
 
 #[tokio::test]
 async fn admit_toggle_emits_device_online() {
-    // Pending join → admit toggle ON → DeviceOnline.
+    // Phase 3 — Hello → DevicePending(net=nil) (unassigned),
+    // assign  → DeviceChanged (now in net), admit → DeviceOnline.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -944,15 +992,22 @@ async fn admit_toggle_emits_device_online() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
-    h.hub.join(c.id, net).await;
 
-    // First a DevicePending arrives.
+    // First a DevicePending(network=nil) arrives — unassigned client.
     let pending = next_matching(&mut events, Duration::from_millis(500), |e| {
         matches!(e, HubEvent::DevicePending { .. })
     })
     .await
     .expect("expected DevicePending");
-    assert!(matches!(pending, HubEvent::DevicePending { network, .. } if network == net));
+    assert!(
+        matches!(pending, HubEvent::DevicePending { network, .. } if network == Uuid::nil())
+    );
+
+    // Assign the client to `net`.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = h.hub.assign_client(client, Some(net)).await;
+    let _ = recv(&mut c.frame_rx).await; // AssignNet
+    h.hub.join(c.id, net).await;
 
     // Flip admitted on via device_set.
     h.hub
