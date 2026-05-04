@@ -75,11 +75,6 @@ type ClientData = {
 const DEFAULT_FRAME = { x: 0, y: 0, width: 720, height: 520 };
 const DEFAULT_HUB_OFFSET = { x: 24, y: 36 };
 const CLIENT_W = 280;
-// Sized to fit the rendered ClientNode (header strip + name/IP/LAN +
-// throughput) AND match the inner card's `h-full w-full` size, so
-// the edge midpoints land on the visible card border instead of a
-// padded wrapper edge.
-const CLIENT_H = 200;
 const HUB_W = 240;
 const HUB_H = 132;
 const FRAME_PADDING = 40;
@@ -87,6 +82,18 @@ const FRAME_GAP = 24; // gap kept between non-overlapping frames
 const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
 const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
 const COLS = 2;
+
+// Estimated rendered height of a ClientNode card, given its content.
+// LAN badges wrap roughly two-per-row at CLIENT_W=280 / 9px font, so
+// each additional row of subnets adds ~22 px. Pending clients lack
+// the IP row and the throughput chart, so they get a smaller base.
+function clientHeight(c: Device): number {
+  const isPending = c.net_uuid === null;
+  const lanCount = c.lan_subnets?.length ?? 0;
+  const lanRows = lanCount === 0 ? 1 : Math.ceil(lanCount / 2);
+  const base = isPending ? 132 : 200;
+  return base + Math.max(0, lanRows - 1) * 22;
+}
 
 interface FrameBox {
   id: string;
@@ -567,15 +574,13 @@ function UnifiedGraphInner() {
       const items: Item[] = [];
       const hubPos = positions[`hub:${nid}`] ?? DEFAULT_HUB_OFFSET;
       items.push({ x: hubPos.x, y: hubPos.y, w: HUB_W, h: HUB_H });
-      let seq = 0;
+      let stackY = 36;
       for (const c of byNet.get(nid) ?? []) {
         const stored = positions[`client:${c.client_uuid}`];
-        const p = stored ?? {
-          x: HUB_W + 60,
-          y: 36 + seq * (CLIENT_H + 16),
-        };
-        seq += 1;
-        items.push({ x: p.x, y: p.y, w: CLIENT_W, h: CLIENT_H });
+        const h = clientHeight(c);
+        const p = stored ?? { x: HUB_W + 60, y: stackY };
+        stackY += h + 16;
+        items.push({ x: p.x, y: p.y, w: CLIENT_W, h });
       }
       let minX = Infinity;
       let minY = Infinity;
@@ -675,7 +680,7 @@ function UnifiedGraphInner() {
       });
     });
 
-    const inFrameSeq = new Map<string, number>();
+    const inFrameStackY = new Map<string, number>();
     let freeStackY = 20;
     for (const c of clients) {
       const ckey = `client:${c.client_uuid}`;
@@ -714,12 +719,10 @@ function UnifiedGraphInner() {
       };
 
       if (c.net_uuid) {
-        const seq = inFrameSeq.get(c.net_uuid) ?? 0;
-        inFrameSeq.set(c.net_uuid, seq + 1);
-        const pos = stored ?? {
-          x: HUB_W + 60,
-          y: 36 + seq * (CLIENT_H + 16),
-        };
+        const ch = clientHeight(c);
+        const stackY = inFrameStackY.get(c.net_uuid) ?? 36;
+        inFrameStackY.set(c.net_uuid, stackY + ch + 16);
+        const pos = stored ?? { x: HUB_W + 60, y: stackY };
         // Compensate for the frame's left/up shift so the client
         // appears at the same visual location even when the frame
         // grew leftward to encompass it.
@@ -733,7 +736,7 @@ function UnifiedGraphInner() {
           // No `extent: "parent"` — clients must be draggable across
           // frame boundaries to trigger assign_client on drop.
           dragHandle: ".drag-handle",
-          style: { width: CLIENT_W, height: CLIENT_H },
+          style: { width: CLIENT_W, height: ch },
         });
         if (c.admitted) {
           // Edge target is the Hub card so the floating line lands
@@ -754,17 +757,18 @@ function UnifiedGraphInner() {
       } else {
         // Free node — place it past the rightmost frame (in absolute
         // flow space), wrapping vertically.
+        const ch = clientHeight(c);
         const rightEdge =
           Math.max(...initialFrames.map((f) => f.x + f.width), 0) + 80;
         const pos = stored ?? { x: rightEdge, y: freeStackY };
-        freeStackY += CLIENT_H + 16;
+        freeStackY += ch + 16;
         ns.push({
           id: ckey,
           type: "client",
           data: sharedData,
           position: pos,
           dragHandle: ".drag-handle",
-          style: { width: CLIENT_W, height: CLIENT_H },
+          style: { width: CLIENT_W, height: ch },
         });
       }
     }

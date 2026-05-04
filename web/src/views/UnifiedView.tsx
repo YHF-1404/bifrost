@@ -27,6 +27,7 @@ import {
   DndContext,
   DragOverlay,
   PointerSensor,
+  pointerWithin,
   useDraggable,
   useDroppable,
   useSensor,
@@ -61,6 +62,14 @@ import { UnifiedGraphView } from "./UnifiedGraphView";
 
 const DEFAULT_LEFT_RATIO = 0.33; // 1/3
 const VIEW_MODE_KEY = "bifrost.viewMode";
+
+// Shared grid template for the per-network device list. Same template
+// is used by both the column-header strip and every row, so columns
+// line up across rows even when content widths vary (e.g. one row has
+// 5 LAN subnets and another has none). Min widths keep the cells
+// stable; the name and LAN columns are flexible.
+const ROW_COLS =
+  "grid grid-cols-[20px_40px_minmax(120px,1fr)_152px_minmax(220px,1.5fr)_140px_76px] items-center gap-3";
 
 type ViewMode = "table" | "graph";
 
@@ -326,6 +335,13 @@ export function UnifiedView() {
   return (
     <DndContext
       sensors={sensors}
+      // Use pointer-position (not rect-intersection) so the drop is
+      // decided purely by where the cursor is. The DragOverlay preview
+      // is ~200 px wide; with rectIntersection a drop near the top of
+      // the narrow PENDING pane mostly overlapped the wider Networks
+      // pane and got mis-routed there. pointerWithin makes "release
+      // here" do exactly what the user expects.
+      collisionDetection={pointerWithin}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
       onDragCancel={() => setActiveDrag(null)}
@@ -855,19 +871,37 @@ function NetworkCard({
             Drag a client here to assign.
           </div>
         ) : (
-          <ul className="divide-y divide-border">
-            {devices.map((d) => (
-              <AdmittedClientRow
-                key={d.client_uuid}
-                client={d}
-                bridgePrefix={bridgePrefix}
-                bridgeIp={network.bridge_ip}
-                netUuid={network.id}
-                collisions={collisions.filter((c) => c !== (d.tap_ip ?? ""))}
-                onUpdate={(body) => onUpdateDevice(d.client_uuid, body)}
-              />
-            ))}
-          </ul>
+          <div className="space-y-1.5">
+            {/* Column header — same grid template as each row so the
+                visible labels align with the columns below. */}
+            <div
+              className={cn(
+                ROW_COLS,
+                "px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground",
+              )}
+            >
+              <span aria-hidden />
+              <span aria-hidden />
+              <span>name</span>
+              <span>tap IP</span>
+              <span>LAN subnets</span>
+              <span>throughput</span>
+              <span>uuid</span>
+            </div>
+            <ul className="space-y-1.5">
+              {devices.map((d) => (
+                <AdmittedClientRow
+                  key={d.client_uuid}
+                  client={d}
+                  bridgePrefix={bridgePrefix}
+                  bridgeIp={network.bridge_ip}
+                  netUuid={network.id}
+                  collisions={collisions.filter((c) => c !== (d.tap_ip ?? ""))}
+                  onUpdate={(body) => onUpdateDevice(d.client_uuid, body)}
+                />
+              ))}
+            </ul>
+          </div>
         )}
       </CardContent>
     </Card>
@@ -899,7 +933,12 @@ function AdmittedClientRow({
     <li
       ref={setNodeRef}
       className={cn(
-        "grid grid-cols-[auto_auto_1fr_auto_auto_auto_auto] items-center gap-2 py-2 text-sm",
+        // Each admitted client is its own bordered card with a muted
+        // background + soft shadow so adjacent rows have a clear,
+        // glanceable boundary against the network card behind. Same
+        // grid template as the header strip above so columns line up.
+        ROW_COLS,
+        "rounded-md border border-border bg-muted/50 px-3 py-2 text-sm shadow-sm transition-colors hover:bg-muted/70",
         isDragging && "opacity-40",
       )}
     >
@@ -937,7 +976,7 @@ function AdmittedClientRow({
         inputClassName="w-48 font-mono"
         display={(v) =>
           v === "" ? (
-            <span className="text-muted-foreground italic">LAN</span>
+            <span className="text-muted-foreground italic">click to set</span>
           ) : (
             <div className="flex flex-wrap gap-1">
               {v.split(/\s*,\s*/).map((s) => (
@@ -966,7 +1005,7 @@ function AdmittedClientRow({
         online={client.online && client.admitted}
       />
       <span
-        className="font-mono text-xs text-muted-foreground"
+        className="truncate font-mono text-xs text-muted-foreground"
         title={client.client_uuid}
       >
         {shortUuid(client.client_uuid)}…
