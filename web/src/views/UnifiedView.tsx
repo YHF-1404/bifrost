@@ -68,8 +68,12 @@ const VIEW_MODE_KEY = "bifrost.viewMode";
 // line up across rows even when content widths vary (e.g. one row has
 // 5 LAN subnets and another has none). Min widths keep the cells
 // stable; the name and LAN columns are flexible.
+//
+// TAP IP column is 232 px so the editing-mode picker (4 × w-12 octet
+// inputs + dot separators + "/24") fits comfortably without spilling
+// into the LAN column.
 const ROW_COLS =
-  "grid grid-cols-[20px_40px_minmax(120px,1fr)_152px_minmax(220px,1.5fr)_140px_76px] items-center gap-3";
+  "grid grid-cols-[20px_40px_minmax(120px,1fr)_232px_minmax(180px,1.5fr)_136px_72px] items-center gap-2";
 
 type ViewMode = "table" | "graph";
 

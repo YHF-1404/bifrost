@@ -239,7 +239,10 @@ export function IpSegmentInput({
                   }
                   commit();
                 }}
-                className="w-9 bg-transparent text-center outline-none"
+                // w-12 (48 px) easily fits a 3-digit octet ("255") in
+                // font-mono text-sm with comfortable padding so the
+                // cursor + caret never sit right against the digit.
+                className="w-12 bg-transparent px-1 text-center outline-none"
               />
             )}
           </span>
