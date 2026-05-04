@@ -49,6 +49,7 @@ import { Switch } from "@/components/ui/Switch";
 import { ThroughputCell } from "@/components/ThroughputCell";
 import { useUiLayout } from "@/lib/useUiLayout";
 import { cn } from "@/lib/cn";
+import { UnifiedGraphView } from "./UnifiedGraphView";
 
 const DEFAULT_LEFT_RATIO = 33; // 1/3, %
 const COLLAPSE_KEY = "bifrost.left-collapsed";
@@ -246,7 +247,7 @@ export function UnifiedView() {
           isSaving={layout.isSaving}
         />
         {viewMode === "graph" ? (
-          <GraphPlaceholder />
+          <UnifiedGraphView />
         ) : (
           <PanelGroup
             direction="horizontal"
@@ -368,14 +369,6 @@ function ViewModeToggle({
           {m === "table" ? "Table" : "Graph"}
         </button>
       ))}
-    </div>
-  );
-}
-
-function GraphPlaceholder() {
-  return (
-    <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-      Graph view — coming up in Phase 3.0f.
     </div>
   );
 }
