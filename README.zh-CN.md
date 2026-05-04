@@ -368,12 +368,18 @@ npm run dev        # http://127.0.0.1:5173；/api 与 /ws 自动 proxy 到 8080
 
 **Phase 3** 起整个 WebUI 收敛成一个页面（`/`），不再有 Networks → Devices 的层级：
 
-- **Table 视图** —— 左右可拖拽分割条，左栏列 pending（未入网）client，右栏一张卡片一个虚拟网络。**用鼠标把 client 卡片在两栏 / 不同网络卡片之间拖动**就是 assign，服务端会推 `Frame::AssignNet` 让 client 销毁 TAP 切到新网。每次跨网拖完 admit 自动归零，TAP IP 自动清空——按规范用户得重新设置。Pending 卡片只显示 `name` 和 `lan_subnets`（不显示 IP 和吞吐）；admitted 行有完整字段 + 60 采样 sparkline。左下角 FAB 折叠/展开左栏；分隔比例和折叠状态由 `/api/ui-layout` 持久化。
-- **Graph 视图** —— React Flow 一张画布展示所有网络，每个网络是一个**实线框**容纳自己的 Hub 和已 admitted client；pending client 是画布上自由浮动节点。**拖动 client 进框** = 入网；**拖出所有框** = 拆出回到 pending。**右键 Hub 卡片** → "Delete network"（client 落到 pending pool 不删除）。**右键画布空白** → "Create new network"（新框落在鼠标位置）。框 x/y/w/h、Hub/client 位置都服务端持久化。
-- **IP 段位拣选器** —— 网桥 IP 用四 octet 输入框 + `/16 ↔ /24` 切换；client TAP IP 把网桥前缀对应的 octets 锁住（如网桥 `10.0.0.1/24` ⇒ client 拣选器显示 `10.0.0.[__]/24`）；行内冲突检测拦截同网重复 IP。
-- **每张卡片各自的 Push routes 按钮** —— 该网络的 LAN 子网改完后弹 toast 提醒用户点击。
-- **画布右上角 saving/saved/error 状态 chip** —— 反映 `/api/ui-layout` 异步保存状态。
-- 顶栏连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动。
+- **Table 视图** —— `react-resizable-panels` 提供的左右分栏 + 可拖拽分隔条；左栏列 pending（未入网）client，右栏一张卡片一个虚拟网络。`@dnd-kit/core` 实现拖拽：**把 client 卡片在两栏 / 不同网络卡片之间拖动**就是 assign，服务端推 `Frame::AssignNet` 让 client 销毁 TAP 切到新网；TanStack Query 的 `onMutate` 立即写 cache，drop 当帧卡片就到位（无 fly-back 反向动画——`<DragOverlay dropAnimation={null}>`）。每次跨网拖完 admit 自动归零、TAP IP 自动清空——按规范用户得重新设置。Pending 卡片只显示 `name` 和 `lan_subnets`（不显示 IP 和吞吐）；admitted 行有完整字段 + 60 采样 sparkline。左下角 FAB 通过 `ImperativePanelHandle.collapse()` / `.expand()` 折叠/展开左栏，pane 不卸载所以拖宽尺寸跨折叠保留；分隔比例和折叠状态由 `/api/ui-layout` 持久化。
+- **Graph 视图** —— React Flow 一张画布展示所有网络，每个网络是一个**实线框**容纳自己的 Hub 和已 admitted client；pending client 是画布上自由浮动节点。Hub 和 Client 卡片都富编辑（admit Switch / 名字 / 段位 IP / LAN 子网 chips / 吞吐），仅顶部宽 header 是 drag handle，编辑控件不会触发拖拽。
+  - **拖 client 进框** = 入网；**拖出所有框** = 拆回 pending pool。卡片留在用户松手的位置上（drop 位置在目标 frame 的坐标系内换算后再触发 assign mutation）。
+  - **右键 Hub 卡片** → "Delete network"（client 落到 pending pool 不删除）。
+  - **右键画布空白** → "Create new network"（`screenToFlowPosition` 把新框落在鼠标位置）。
+  - 框 **四面自动伸张**容纳 Hub + 所有 admitted client；多个框 **不重叠**：迭代式 AABB 碰撞解算器沿较小重叠轴推开未 pin 的（无用户保存位置的）那一个。
+  - 连线用自定义 **`FloatingEdge`**：每帧用 `useInternalNode` 拿两端节点的位置和尺寸，挑距离最近的一对边中点画 bezier，线段端点精确落在卡片可见边框上（卡片内部用 `h-full w-full flex-col` 让内容贴合 React Flow wrapper，不留 padding 空隙）。
+  - 框 x/y/w/h、Hub/client 位置都通过 `/api/ui-layout` 服务端持久化。
+- **IP 段位拣选器** —— 网桥 IP 用四 octet 输入框 + 一个**点击切换** `/16 ↔ /24` 的按钮（取代原生 `<select>`，那个一打开就丢焦点退出编辑）+ 一个 "ok" 显式提交按钮。client TAP IP 把网桥前缀对应的 octets 锁住（如网桥 `10.0.0.1/24` ⇒ client 拣选器显示 `10.0.0.[__]/24`）；行内冲突检测同时拦截同网内重复 IP **以及** 与网桥 IP 相同。
+- **每张卡片各自的 Push routes 按钮** —— LAN 子网改完后弹 info toast，按钮变琥珀色 + 微脉冲 + 末尾加 `•` 提示需要点击下发；push 成功清掉。
+- **toolbar 上的 saving/saved 状态 chip** —— 反映 `/api/ui-layout` 异步保存状态。
+- **WS 状态徽章**：`live` / `connecting` / `offline`，由 WebSocket 状态驱动。
 - 每个 admitted 设备的实时吞吐由 1 Hz `metrics.tick` 事件驱动。
 
 ---

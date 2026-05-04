@@ -592,38 +592,68 @@ other than `127.0.0.1:8080`. HMR works as expected.
 **Phase 3** drops the old Networks → Devices hierarchy in favor of a
 single unified page (`/`):
 
-* **Table mode** — left/right split with a draggable divider. The
-  left pane lists pending (unassigned) clients; the right pane is one
-  card per virtual network. **Drag a client between panes/cards** to
-  assign — the server sends `Frame::AssignNet` to the live conn and
-  the client tears down its TAP and re-joins the new target. Every
-  cross-network move clears `admitted` and `tap_ip` per spec, so the
-  user always re-confirms. Pending cards expose only `name` and
-  `lan_subnets` (no IP, no throughput); admitted rows get the full
-  set plus a per-row throughput cell with a 60-sample sparkline. The
-  bottom-left FAB toggles the left pane's collapse state; the
-  divider's position and the collapse flag persist via
-  `/api/ui-layout`.
+* **Table mode** — left/right split with a draggable divider built
+  on `react-resizable-panels`. The left pane lists pending
+  (unassigned) clients; the right pane is one card per virtual
+  network. DnD via `@dnd-kit/core`: **drag a client between
+  panes/cards** to (re-)assign — the server sends `Frame::AssignNet`
+  to the live conn and the client tears down its TAP and re-joins
+  the new target. Optimistic cache update lands the card in its new
+  home in the same frame the user releases (no fly-back animation —
+  `<DragOverlay dropAnimation={null}>`). Every cross-network move
+  clears `admitted` and `tap_ip` per spec, so the user always
+  re-confirms. Pending cards expose only `name` and `lan_subnets`
+  (no IP, no throughput); admitted rows get the full set plus a
+  per-row throughput cell with a 60-sample sparkline. The
+  bottom-left FAB toggles the left pane's `collapsible` state via
+  the panel's `ImperativePanelHandle`, so the dragged size survives
+  collapse/expand round-trips; both width ratio and collapse flag
+  persist via `/api/ui-layout`.
 * **Graph mode** — React Flow canvas with one solid-bordered group
   frame per network containing its Hub card and admitted clients.
-  Pending clients float free outside any frame. **Drag a client into
-  a frame** ⇒ assign; **drag out of every frame** ⇒ detach. **Right-
-  click a Hub card** ⇒ "Delete network" (clients fall back to
-  pending). **Right-click the canvas blank** ⇒ "Create new network"
-  (the new frame lands at the cursor). Frame x/y/w/h, hub/client
-  positions all persist server-side.
+  Pending clients float free outside any frame. Both Hub and Client
+  cards are richly editable (admit Switch, name, segmented TAP IP,
+  LAN subnet chips, throughput) — only the wide top header strip is
+  the drag handle, so editing inputs doesn't grab the node.
+  Interactions:
+  - **Drag a client into a frame** ⇒ assign; **drag out of every
+    frame** ⇒ detach to pending. The card stays exactly where the
+    user dropped it (drop position is computed in the destination
+    frame's coordinate system before the assign mutation fires).
+  - **Right-click a Hub card** ⇒ "Delete network" (clients fall
+    back to the pending pool).
+  - **Right-click the canvas blank** ⇒ "Create new network"
+    (the new frame lands at the cursor via `screenToFlowPosition`).
+  - Frames **auto-grow on all four sides** to encompass their
+    children — Hub plus admitted clients — and **don't overlap**:
+    if growing one frame would intersect another, an iterative
+    bbox-collision resolver pushes the unpinned (default-positioned)
+    one apart along the smaller-overlap axis.
+  - Edges use a **`FloatingEdge`** custom renderer that, on every
+    drag tick, picks the closest pair of side midpoints between the
+    client card and the hub card. The card's inner div uses
+    `h-full w-full flex-col` so the wrapper bbox coincides with the
+    visible card border — endpoints land on the border, not in the
+    padding.
+  - Frame x/y/w/h, hub/client positions all persist server-side
+    via `/api/ui-layout`.
 * **IP-segment pickers** — bridge IPs use a four-octet input with a
-  `/16 ↔ /24` toggle. Client TAP IPs lock the octets pinned by the
+  click-to-toggle `/16 ↔ /24` button (replaces a native `<select>`,
+  which used to lose focus on dropdown open) plus an explicit `ok`
+  commit button. Client TAP IPs lock the octets pinned by the
   bridge's prefix (e.g. bridge `10.0.0.1/24` ⇒ client picker shows
-  `10.0.0.[__]/24`); inline collision detection rejects duplicates
-  in the same network before submit.
+  `10.0.0.[__]/24`); inline collision detection rejects both
+  duplicates with other clients **and** equality with the bridge IP
+  itself before submit.
 * **`Push routes` per card** — the per-network card's button
   recomputes routes and sends `SetRoutes` to its peers. After any
-  `lan_subnets` edit a toast reminds the user to click it.
-* **Layout save chip** — top-right of the toolbar; flips between
+  `lan_subnets` edit, an info toast pops AND the button switches to
+  amber + soft pulse + trailing `•` so the user knows to push;
+  cleared on success.
+* **Layout save chip** — in the toolbar; flips between
   *saved* / *unsaved* / *saving* as the debounced PUT round-trips.
-* Header status badge — live / connecting / offline, driven by the
-  WebSocket connection.
+* **WS status badge** — `live` / `connecting` / `offline`, driven
+  by the WebSocket connection state.
 * Live throughput on every admitted device — fed by 1 Hz
   `metrics.tick` events.
 
