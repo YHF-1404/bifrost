@@ -21,6 +21,7 @@
 import {
   Background,
   Controls,
+  type EdgeTypes,
   Handle,
   Position,
   ReactFlow,
@@ -33,6 +34,7 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
+import { FloatingEdge } from "@/components/graph/FloatingEdge";
 import "@xyflow/react/dist/style.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -59,6 +61,7 @@ type HubData = {
   onDelete: () => void;
   onPushRoutes: () => void;
   deviceCount: number;
+  routesPending: boolean;
 };
 type ClientData = {
   client: Device;
@@ -74,10 +77,59 @@ const DEFAULT_HUB_OFFSET = { x: 24, y: 36 };
 const CLIENT_W = 280;
 const CLIENT_H = 150;
 const HUB_W = 240;
-const HUB_H = 110;
+const HUB_H = 130;
+const FRAME_PADDING = 32;
+const FRAME_GAP = 24; // gap kept between non-overlapping frames
 const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
 const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
 const COLS = 2;
+
+interface FrameBox {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Whether the user has saved a custom position (= less likely to
+   *  be moved during overlap resolution). */
+  pinned: boolean;
+}
+
+/** Push frames apart in-place along the axis of smaller overlap.
+ *  Pinned frames are pushed last (i.e. unpinned ones get moved first
+ *  to resolve a collision). */
+function resolveFrameOverlaps(input: FrameBox[]): FrameBox[] {
+  const out = input.map((f) => ({ ...f }));
+  for (let iter = 0; iter < 80; iter++) {
+    let moved = false;
+    for (let i = 0; i < out.length; i++) {
+      for (let j = i + 1; j < out.length; j++) {
+        const a = out[i]!;
+        const b = out[j]!;
+        const overlapX =
+          Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+        const overlapY =
+          Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+        // Decide which one to move: prefer the unpinned one. If both
+        // have the same pinned state, move the later one.
+        const moveB = !b.pinned || (a.pinned && b.pinned);
+        const movee = moveB ? b : a;
+        const fixed = moveB ? a : b;
+        if (overlapX < overlapY) {
+          if (movee.x < fixed.x) movee.x = fixed.x - movee.width - FRAME_GAP;
+          else movee.x = fixed.x + fixed.width + FRAME_GAP;
+        } else {
+          if (movee.y < fixed.y) movee.y = fixed.y - movee.height - FRAME_GAP;
+          else movee.y = fixed.y + fixed.height + FRAME_GAP;
+        }
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+  return out;
+}
 
 // Pull /16 ↔ /24 prefix length from a CIDR or empty.
 function prefixOf(cidr: string | null | undefined): Prefix | null {
@@ -150,16 +202,26 @@ function HubNode({ data }: NodeProps<Node<HubData>>) {
             size="sm"
             variant="outline"
             onClick={() => data.onPushRoutes()}
-            className="ml-auto h-6 px-2 text-[10px]"
-            title="Re-derive routes from LAN subnets and push"
+            className={cn(
+              "ml-auto h-6 px-2 text-[10px]",
+              data.routesPending &&
+                "animate-pulse bg-amber-500 text-white ring-2 ring-amber-400 hover:bg-amber-600",
+            )}
+            title={
+              data.routesPending
+                ? "LAN subnets changed — click to push to all peers"
+                : "Re-derive routes from LAN subnets and push"
+            }
           >
-            push
+            {data.routesPending ? "push •" : "push"}
           </Button>
         </div>
       </div>
     </div>
   );
 }
+
+const EDGE_TYPES: EdgeTypes = { floating: FloatingEdge };
 
 function ClientNode({ data }: NodeProps<Node<ClientData>>) {
   const c = data.client;
@@ -331,6 +393,22 @@ function UnifiedGraphInner() {
 
   const layout = useUiLayout();
 
+  // Networks whose `lan_subnets` have been edited since the last push.
+  // The Hub card's push button pulses amber while a net is here.
+  const [pendingPush, setPendingPush] = useState<Set<string>>(new Set());
+  const markPending = useCallback((nid: string) => {
+    setPendingPush((prev) => {
+      if (prev.has(nid)) return prev;
+      const next = new Set(prev);
+      next.add(nid);
+      return next;
+    });
+    pushToast(
+      "info",
+      "LAN subnets updated — click 'push' on the Hub card to apply.",
+    );
+  }, []);
+
   // ── Mutations ─────────────────────────────────────────────────────────
   // Optimistic update on assign: write the client's new net_uuid into
   // the cache the instant the user releases the drag, so the card
@@ -351,13 +429,9 @@ function UnifiedGraphInner() {
             : d,
         ),
       );
-      // Reset saved position so the moved client gets a fresh default
-      // inside its new frame (or its free-node slot when detaching).
-      layout.update((p) => {
-        const positions = { ...p.graph.positions };
-        delete positions[`client:${cid}`];
-        return { ...p, graph: { ...p.graph, positions } };
-      });
+      // NB: position is set by `onNodeDragStop` BEFORE this mutation
+      // fires, in the coordinate system of the destination frame, so
+      // the dragged card stays where the user dropped it.
       return { prev };
     },
     onError: (e, _v, ctx) => {
@@ -409,7 +483,10 @@ function UnifiedGraphInner() {
       cid: string;
       body: DeviceUpdateBody;
     }) => api.updateDevice(nid, cid, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["clients"] }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: ["clients"] });
+      if (vars.body.lan_subnets !== undefined) markPending(vars.nid);
+    },
     onError: (e) => pushToast("error", `update failed: ${fmtErr(e)}`),
   });
   const patchPendingMut = useMutation({
@@ -425,8 +502,18 @@ function UnifiedGraphInner() {
   });
   const pushRoutesMut = useMutation({
     mutationFn: (nid: string) => api.pushRoutes(nid),
-    onSuccess: (r) =>
-      pushToast("success", `pushed ${r.routes.length} route(s) to ${r.count} client(s)`),
+    onSuccess: (r, nid) => {
+      pushToast(
+        "success",
+        `pushed ${r.routes.length} route(s) to ${r.count} client(s)`,
+      );
+      setPendingPush((prev) => {
+        if (!prev.has(nid)) return prev;
+        const next = new Set(prev);
+        next.delete(nid);
+        return next;
+      });
+    },
     onError: (e) => pushToast("error", `push failed: ${fmtErr(e)}`),
   });
 
@@ -447,19 +534,65 @@ function UnifiedGraphInner() {
       }
     }
 
-    networks.forEach((n, i) => {
-      const f = frames[n.id] ?? {
-        x: (i % COLS) * FRAME_GAP_X,
-        y: Math.floor(i / COLS) * FRAME_GAP_Y,
-        width: DEFAULT_FRAME.width,
-        height: DEFAULT_FRAME.height,
+    // Pass 1 — compute each frame's *content bounds* so we can grow
+    // the box if the user has packed in more clients than the default
+    // size accommodates. Uses the same default-positioning logic as
+    // the node loop below; if any node has a saved position we honour
+    // it.
+    const contentSize = (nid: string): { width: number; height: number } => {
+      const hubPos = positions[`hub:${nid}`] ?? DEFAULT_HUB_OFFSET;
+      let maxR = hubPos.x + HUB_W;
+      let maxB = hubPos.y + HUB_H;
+      let seq = 0;
+      for (const c of byNet.get(nid) ?? []) {
+        const stored = positions[`client:${c.client_uuid}`];
+        const p = stored ?? {
+          x: HUB_W + 60,
+          y: 36 + seq * (CLIENT_H + 16),
+        };
+        seq += 1;
+        maxR = Math.max(maxR, p.x + CLIENT_W);
+        maxB = Math.max(maxB, p.y + CLIENT_H);
+      }
+      return {
+        width: maxR + FRAME_PADDING,
+        height: maxB + FRAME_PADDING,
       };
+    };
+
+    // Pass 2 — initial frame boxes (pre-collision-resolution).
+    let initialFrames: FrameBox[] = networks.map((n, i) => {
+      const saved = frames[n.id];
+      const { width: minW, height: minH } = contentSize(n.id);
+      const baseX = (i % COLS) * FRAME_GAP_X;
+      const baseY = Math.floor(i / COLS) * FRAME_GAP_Y;
+      const x = saved?.x ?? baseX;
+      const y = saved?.y ?? baseY;
+      const w = Math.max(saved?.width ?? DEFAULT_FRAME.width, minW);
+      const h = Math.max(saved?.height ?? DEFAULT_FRAME.height, minH);
+      return {
+        id: n.id,
+        x,
+        y,
+        width: w,
+        height: h,
+        pinned: !!saved,
+      };
+    });
+    // Pass 3 — push apart any overlapping frames (a recently-grown
+    // frame can otherwise cover its neighbours). User-dragged frames
+    // are pinned and stay put when possible.
+    initialFrames = resolveFrameOverlaps(initialFrames);
+    const frameById = new Map(initialFrames.map((f) => [f.id, f]));
+
+    networks.forEach((n) => {
+      const fb = frameById.get(n.id)!;
       ns.push({
         id: `frame:${n.id}`,
         type: "frame",
         data: { net: n },
-        position: { x: f.x, y: f.y },
-        style: { width: f.width, height: f.height, zIndex: -1 },
+        position: { x: fb.x, y: fb.y },
+        style: { width: fb.width, height: fb.height, zIndex: -1 },
         // Frame uses its title strip as the drag handle so clients
         // can be clicked / dragged independently.
         dragHandle: ".drag-handle",
@@ -473,6 +606,7 @@ function UnifiedGraphInner() {
         data: {
           net: n,
           deviceCount: inThis.length,
+          routesPending: pendingPush.has(n.id),
           onRename: (name: string) => renameNetMut.mutate({ nid: n.id, name }),
           onSetBridgeIp: (ip: string) =>
             setBridgeIpMut.mutate({ nid: n.id, ip }),
@@ -497,10 +631,16 @@ function UnifiedGraphInner() {
       const net =
         c.net_uuid !== null ? networks.find((n) => n.id === c.net_uuid) : null;
       const bridgePrefix = prefixOf(net?.bridge_ip);
+      // Bridge IP is reserved (it's the gateway address). Including it
+      // in `collisions` makes the IpSegmentInput reject attempts to
+      // set a client TAP IP equal to the bridge IP (issue #8).
       const collisions: string[] = c.net_uuid
-        ? (byNet.get(c.net_uuid) ?? [])
-            .filter((d) => d.client_uuid !== c.client_uuid && d.tap_ip)
-            .map((d) => d.tap_ip as string)
+        ? [
+            ...(byNet.get(c.net_uuid) ?? [])
+              .filter((d) => d.client_uuid !== c.client_uuid && d.tap_ip)
+              .map((d) => d.tap_ip as string),
+            ...(net?.bridge_ip ? [net.bridge_ip] : []),
+          ]
         : [];
 
       const sharedData: ClientData = {
@@ -542,16 +682,17 @@ function UnifiedGraphInner() {
         if (c.admitted) {
           es.push({
             id: `e:${c.client_uuid}->${c.net_uuid}`,
+            type: "floating",
             source: ckey,
             target: `hub:${c.net_uuid}`,
             style: { strokeDasharray: c.online ? "" : "4 3" },
           });
         }
       } else {
+        // Free node — place it past the rightmost frame (in absolute
+        // flow space), wrapping vertically.
         const rightEdge =
-          (Math.min(networks.length, COLS) - 1) * FRAME_GAP_X +
-          DEFAULT_FRAME.width +
-          80;
+          Math.max(...initialFrames.map((f) => f.x + f.width), 0) + 80;
         const pos = stored ?? { x: rightEdge, y: freeStackY };
         freeStackY += CLIENT_H + 16;
         ns.push({
@@ -569,7 +710,7 @@ function UnifiedGraphInner() {
     // intentionally exclude them from deps so the memo only recomputes
     // when actual data changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [networks, clients, layout.layout]);
+  }, [networks, clients, layout.layout, pendingPush]);
 
   // React Flow's controlled state. Without these, position changes
   // during a drag don't propagate to the DOM — the user only sees
@@ -636,26 +777,37 @@ function UnifiedGraphInner() {
         : null;
       const currentNid = client.net_uuid;
 
-      if (currentNid === targetNid) {
-        // Same frame (or both null) — just save the new position.
-        layout.update((prev) => ({
-          ...prev,
-          graph: {
-            ...prev.graph,
-            positions: {
-              ...prev.graph.positions,
-              [node.id]: { x: node.position.x, y: node.position.y },
-            },
+      // node.position is relative to its CURRENT parent (the OLD frame
+      // for an admitted client, absolute for a free one).
+      const oldFrame = currentNid
+        ? rfNodes.find((n) => n.id === `frame:${currentNid}`)
+        : null;
+      const absX = (oldFrame?.position.x ?? 0) + node.position.x;
+      const absY = (oldFrame?.position.y ?? 0) + node.position.y;
+      const newPos = targetFrame
+        ? {
+            x: absX - targetFrame.position.x,
+            y: absY - targetFrame.position.y,
+          }
+        : { x: absX, y: absY };
+
+      // Save the drop position FIRST so the post-assign re-render
+      // keeps the card under the cursor (issue #4).
+      layout.update((prev) => ({
+        ...prev,
+        graph: {
+          ...prev.graph,
+          positions: {
+            ...prev.graph.positions,
+            [node.id]: newPos,
           },
-        }));
-        return;
-      }
-      // Cross-frame move (or detach to free) — fire assign_client; the
-      // mutation's onMutate clears the saved position so the new frame
-      // can lay it out fresh.
+        },
+      }));
+
+      if (currentNid === targetNid) return; // same frame (or both null)
       assignMut.mutate({ cid: cuid, nid: targetNid });
     },
-    [clients, flow, layout, assignMut],
+    [clients, flow, layout, assignMut, rfNodes],
   );
 
   // ── Right-click menus ─────────────────────────────────────────────────
@@ -707,6 +859,7 @@ function UnifiedGraphInner() {
           nodes={rfNodes}
           edges={rfEdges}
           nodeTypes={NODE_TYPES}
+          edgeTypes={EDGE_TYPES}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onNodeDragStop={onNodeDragStop}

@@ -138,11 +138,19 @@ export function IpSegmentInput({
       setError("each octet must be 0–255");
       return;
     }
-    const cidr = format(nums, prefix);
+    // Bridge IP collision (the gateway address is reserved).
+    if (pinFromBridge) {
+      const br = parseCidr(pinFromBridge);
+      if (br && br.octets.join(".") === nums.join(".")) {
+        setError("address conflicts with the bridge IP");
+        return;
+      }
+    }
     if (collisions?.some((c) => parseCidr(c)?.octets.join(".") === nums.join("."))) {
       setError("address already used by another client");
       return;
     }
+    const cidr = format(nums, prefix);
     setError(null);
     setEditing(false);
     onCommit(cidr);
@@ -239,21 +247,34 @@ export function IpSegmentInput({
       })}
       <span className="px-0.5 text-muted-foreground">/</span>
       {allowPrefixToggle ? (
-        <select
-          value={prefix}
-          onChange={(e) => setPrefix(Number(e.target.value))}
-          onBlur={(e) => {
-            const nextEl = e.relatedTarget as HTMLElement | null;
-            if (nextEl && inputRefs.current.some((r) => r === nextEl)) return;
-            commit();
-          }}
-          className="bg-transparent outline-none"
+        // Toggle button instead of <select>: a native dropdown loses
+        // focus the moment the menu opens, which would commit the
+        // edit before the user could pick the new value. With a
+        // button, a single click flips between /16 and /24.
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault() /* keep edit focused */}
+          onClick={() => setPrefix((p) => (p === 24 ? 16 : 24))}
+          title={`prefix /${prefix} — click to switch (only /16 or /24)`}
+          className="cursor-pointer bg-transparent px-0.5 hover:underline"
         >
-          <option value={24}>24</option>
-          <option value={16}>16</option>
-        </select>
+          {prefix}
+        </button>
       ) : (
         <span className="text-muted-foreground">{prefix}</span>
+      )}
+      {/* Confirm button so the user can commit on click without
+          fighting the focus-leaves-the-row blur logic. */}
+      {allowPrefixToggle && (
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={commit}
+          title="apply"
+          className="ml-1 rounded bg-primary px-1.5 text-[10px] text-primary-foreground hover:bg-primary/90"
+        >
+          ok
+        </button>
       )}
     </span>
   );

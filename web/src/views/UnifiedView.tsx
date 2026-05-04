@@ -35,7 +35,7 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ImperativePanelHandle,
   Panel,
@@ -183,6 +183,22 @@ export function UnifiedView() {
     },
   });
 
+  // Networks whose lan_subnets have been edited since the last push.
+  // The card's push button pulses amber while a net is here.
+  const [pendingPush, setPendingPush] = useState<Set<string>>(new Set());
+  const markPending = useCallback((nid: string) => {
+    setPendingPush((prev) => {
+      if (prev.has(nid)) return prev;
+      const next = new Set(prev);
+      next.add(nid);
+      return next;
+    });
+    pushToast(
+      "info",
+      "LAN subnets updated — click 'push routes' on the network card.",
+    );
+  }, []);
+
   const updateAdmittedDeviceMut = useMutation({
     mutationFn: ({
       nid,
@@ -193,7 +209,10 @@ export function UnifiedView() {
       cid: string;
       body: DeviceUpdateBody;
     }) => api.updateDevice(nid, cid, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["clients"] }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: ["clients"] });
+      if (vars.body.lan_subnets !== undefined) markPending(vars.nid);
+    },
     onError: (e) => pushToast("error", `update failed: ${fmtErr(e)}`),
   });
 
@@ -244,8 +263,18 @@ export function UnifiedView() {
 
   const pushRoutesMut = useMutation({
     mutationFn: (nid: string) => api.pushRoutes(nid),
-    onSuccess: (r) =>
-      pushToast("success", `pushed ${r.routes.length} route(s) to ${r.count} client(s)`),
+    onSuccess: (r, nid) => {
+      pushToast(
+        "success",
+        `pushed ${r.routes.length} route(s) to ${r.count} client(s)`,
+      );
+      setPendingPush((prev) => {
+        if (!prev.has(nid)) return prev;
+        const next = new Set(prev);
+        next.delete(nid);
+        return next;
+      });
+    },
     onError: (e) => pushToast("error", `push failed: ${fmtErr(e)}`),
   });
 
@@ -357,6 +386,7 @@ export function UnifiedView() {
               <NetworksPane
                 networks={networks}
                 byNet={byNet}
+                pendingPush={pendingPush}
                 onUpdateDevice={(nid, cid, body) =>
                   updateAdmittedDeviceMut.mutate({ nid, cid, body })
                 }
@@ -386,7 +416,12 @@ export function UnifiedView() {
           }}
         />
       </div>
-      <DragOverlay>
+      {/* dropAnimation={null} kills the @dnd-kit default fly-back-to-
+          source 250ms animation. With the optimistic-update on assign,
+          the card lands in its new home in the same frame the user
+          releases — the fly-back was visually telling the user "drop
+          rejected" even though it succeeded. */}
+      <DragOverlay dropAnimation={null}>
         {activeDrag ? <DragPreview client={activeDrag} /> : null}
       </DragOverlay>
     </DndContext>
@@ -660,6 +695,7 @@ function PendingClientCard({
 function NetworksPane({
   networks,
   byNet,
+  pendingPush,
   onUpdateDevice,
   onRenameNet,
   onSetBridgeIp,
@@ -669,6 +705,7 @@ function NetworksPane({
 }: {
   networks: Network[];
   byNet: Map<string, Device[]>;
+  pendingPush: Set<string>;
   onUpdateDevice: (nid: string, cid: string, body: DeviceUpdateBody) => void;
   onRenameNet: (nid: string, name: string) => void;
   onSetBridgeIp: (nid: string, ip: string) => void;
@@ -684,6 +721,7 @@ function NetworksPane({
           key={n.id}
           network={n}
           devices={byNet.get(n.id) ?? []}
+          routesPending={pendingPush.has(n.id)}
           onUpdateDevice={(cid, body) => onUpdateDevice(n.id, cid, body)}
           onRename={(name) => onRenameNet(n.id, name)}
           onSetBridgeIp={(ip) => onSetBridgeIp(n.id, ip)}
@@ -719,6 +757,7 @@ function NetworksPane({
 function NetworkCard({
   network,
   devices,
+  routesPending,
   onUpdateDevice,
   onRename,
   onSetBridgeIp,
@@ -727,6 +766,7 @@ function NetworkCard({
 }: {
   network: Network;
   devices: Device[];
+  routesPending: boolean;
   onUpdateDevice: (cid: string, body: DeviceUpdateBody) => void;
   onRename: (name: string) => void;
   onSetBridgeIp: (ip: string) => void;
@@ -739,8 +779,11 @@ function NetworkCard({
   });
   const bridgePrefix = prefixOf(network.bridge_ip);
   const collisions = useMemo(
-    () => devices.map((d) => d.tap_ip ?? "").filter(Boolean),
-    [devices],
+    () => [
+      ...devices.map((d) => d.tap_ip ?? "").filter(Boolean),
+      ...(network.bridge_ip ? [network.bridge_ip] : []),
+    ],
+    [devices, network.bridge_ip],
   );
   return (
     <Card
@@ -766,9 +809,18 @@ function NetworkCard({
             variant="outline"
             onClick={onPushRoutes}
             disabled={devices.length === 0}
-            title="Re-derive routes from LAN subnets and push to all peers"
+            className={
+              routesPending
+                ? "animate-pulse bg-amber-500 text-white ring-2 ring-amber-400 hover:bg-amber-600"
+                : undefined
+            }
+            title={
+              routesPending
+                ? "LAN subnets changed — click to push to all peers"
+                : "Re-derive routes from LAN subnets and push to all peers"
+            }
           >
-            push routes
+            {routesPending ? "push routes •" : "push routes"}
           </Button>
           <button
             type="button"
