@@ -94,16 +94,16 @@ delegated to a tool that already solves them well.
 ## Architecture
 
 ```
-┌─ Client (e.g. router, aarch64) ─────┐         ┌─ Server (Linux, x86_64) ───────────┐
-│  bifrost-client (daemon)            │         │  bifrost-server (daemon)            │
-│  ├─ TAP   tapXXXX  (10.0.0.2/24)    │         │  ├─ Bridge  br-bifrost (10.0.0.1)   │
-│  ├─ ConnTask  (TCP / SOCKS5)        │         │  ├─ TAP × N  (one per client)       │
-│  ├─ App  (state machine)            │         │  ├─ Hub  (single actor)             │
-│  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                    │
-│                                     │         │  ├─ SessionTask × N                 │
-│                                     │         │  ├─ admin  /run/bifrost/server.sock │
-│                                     │         │  └─ WebUI HTTP / WS  (127.0.0.1:8080)
-└────────────────┬────────────────────┘         └──────────────────┬──────────────────┘
+┌─ Client (e.g. router, aarch64) ─────┐         ┌─ Server (Linux, x86_64) ────────────┐
+│  bifrost-client (daemon)            │         │  bifrost-server (daemon)             │
+│  ├─ TAP   tapXXXX  (10.0.0.2/24)    │         │  ├─ Bridge × N  (one per net_uuid)   │
+│  ├─ ConnTask  (TCP / SOCKS5)        │         │  ├─ TAP × M    (one per session)     │
+│  ├─ App  (state machine)            │         │  ├─ Hub        (single actor)        │
+│  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                     │
+│                                     │         │  ├─ SessionTask × N                  │
+│                                     │         │  ├─ admin   /run/bifrost/server.sock │
+│                                     │         │  └─ WebUI HTTP / WS  (0.0.0.0:8080)  │
+└────────────────┬────────────────────┘         └──────────────────┬───────────────────┘
                  │                                                  │
                  │       postcard-framed wire protocol over TCP     │
                  │  (optionally tunneled through SOCKS5 → Xray /    │
@@ -122,6 +122,12 @@ delegated to a tool that already solves them well.
   After that, every Ethernet frame flows
   `socket → ConnTask → SessionTask → TAP` directly — the Hub is only
   involved in control events.
+* **Per-network L2 isolation (Phase 2).** Each virtual network gets
+  its own Linux bridge (auto-derived `bf-<8-hex>` from the network
+  UUID, or whatever `NetRecord.bridge_name` holds). A device's TAP
+  is attached only to the bridge of its network — networks share no
+  broadcast domain, no ARP, no routing table. `mknet` creates the
+  kernel bridge; `delete_net` tears it down.
 * **Session is the long-lived state.** A `SessionTask` survives
   reconnects so the local TAP, its IP, and its routes are preserved
   across transient network hiccups. Server-side it has a
@@ -129,11 +135,12 @@ delegated to a tool that already solves them well.
   itself.
 * **Routes are derived, not configured.** Each admitted client
   declares the LAN subnets behind it (`lan_subnets`); the server
-  stitches them into a routing table at push time. No more global
+  stitches them into a per-network routing table at push time —
+  installed on that network's bridge only, not globally. No more
   `[[routes]]` to keep in sync.
 * **Two control surfaces, one source of truth.** The Unix-socket
-  admin RPC (`bifrost-server admin <cmd>`) and the localhost HTTP
-  API (`/api/...`) both go through the same `HubHandle` methods —
+  admin RPC (`bifrost-server admin <cmd>`) and the HTTP API
+  (`/api/...`) both go through the same `HubHandle` methods —
   the WebUI is just another consumer of the data plane.
 
 ---
@@ -327,36 +334,63 @@ host = "0.0.0.0"
 port = 8888
 save_dir = "/var/lib/bifrost/received"
 
-[bridge]
+[bridge]                      # legacy global block — only `disconnect_timeout`
+                              # is still authoritative; `name` / `ip` are
+                              # ignored unless you're upgrading from a Phase-1
+                              # config (see "Migration" below).
 name = "br-bifrost"
-ip = "10.0.0.1/24"           # leave empty to skip giving the bridge an address
+ip = "10.0.0.1/24"
 disconnect_timeout = 60       # seconds; how long a TAP outlives its socket
 
 [admin]
 socket = "/run/bifrost/server.sock"
 
-[web]                         # localhost-only by default; reach it via SSH -L
+[web]                         # `deploy/server.toml.example` ships
+                              # `0.0.0.0:8080` so a VPS behind a network-level
+                              # firewall can serve the WebUI directly. The
+                              # in-code default is `127.0.0.1:8080` — flip
+                              # whichever fits your setup.
 enabled = true
-listen = "127.0.0.1:8080"
+listen = "0.0.0.0:8080"
 
-[metrics]                     # reserved, not yet wired
+[metrics]                     # reserved; no consumer wired yet
 enabled = false
 listen = "127.0.0.1:9090"
 
 # These two sections are populated automatically by the daemon:
 # [[networks]]          ← `mknet`
-# [[approved_clients]]  ← `approve` / `device set`
+# [[approved_clients]]  ← `device set`
+#
+# Each [[networks]] row owns its kernel bridge (Phase 2):
+#   name         = "hml-net"
+#   uuid         = "..."
+#   bridge_name  = "br-bifrost"        # auto-derived `bf-<8-hex>` for fresh
+#                                      # networks; legacy bridge name preserved
+#                                      # for the first network on upgrade
+#   bridge_ip    = "10.0.0.1/24"       # empty = pure-L2, no host-side address
 #
 # Each [[approved_clients]] row carries:
-#   client_uuid    = "..."           # set by the daemon
-#   net_uuid       = "..."           # set by the daemon
-#   tap_ip         = "10.0.0.2/24"   # `device set --ip`
-#   display_name   = "router"        # `device set --name`
-#   lan_subnets    = ["192.168.200.0/24"]   # `device set --lan`
+#   client_uuid  = "..."               # set by the daemon
+#   net_uuid     = "..."               # set by the daemon
+#   tap_ip       = "10.0.0.2/24"       # `device set --ip`
+#   display_name = "router"            # `device set --name`
+#   lan_subnets  = ["192.168.200.0/24"]  # `device set --lan`
+#   admitted     = true                # `device set --admit`
 #
-# The server-wide route table is **derived** from `lan_subnets` —
-# there is no `[[routes]]` section any more.
+# Each network's route table is **derived** from its members'
+# `lan_subnets` and installed on that network's bridge only —
+# no `[[routes]]` section anywhere.
 ```
+
+#### Migration from Phase 1 (single global bridge)
+
+`ServerConfig::load` runs a one-shot migration: for every
+`[[networks]]` row whose `bridge_name` is empty, the **first** one
+inherits `[bridge].name` / `[bridge].ip` from the legacy block
+(your existing kernel bridge keeps owning its network without
+operator action), and any further networks auto-derive
+`bf-<8-hex>` from their UUID. Once the rewritten config has been
+saved back, the migration is a no-op on subsequent loads.
 
 ### `client.toml`
 
@@ -665,7 +699,7 @@ Crate dependency graph:
   server and an Ubuntu 24.04 aarch64 client (tunnelling through
   Xray's SOCKS5)
 
-### Completed (Phase 1.0–1.6 — WebUI v1)
+### Completed (Phase 1.0–1.6 — WebUI v1, Phase 2.0 — multi-tenant L2)
 
 * **Per-device `lan_subnets`** replaces the global `[[routes]]`
   table; the route table is derived per-network at push time. CLI
@@ -702,15 +736,23 @@ Crate dependency graph:
   links fall back to `index.html`; hashed assets get
   `Cache-Control: immutable`. `<save_dir>/layouts/<nid>.json` holds
   per-network UI state.
-* **164 tests passing**, clippy-clean with `-D warnings`.
+* **Per-network Linux bridges (Phase 2.0).** Each virtual network
+  owns its own kernel bridge — `mknet` creates one, `delete_net`
+  tears it down, an admitted device's TAP attaches to its
+  network's bridge only. Networks share no broadcast domain, ARP,
+  MAC table, or route table. `NetRecord` carries `bridge_name`
+  (auto-derived `bf-<8-hex>` from UUID) and optional `bridge_ip`
+  (host-side gateway address). One-shot migration on upgrade
+  hands the legacy `[bridge]` config to the first network.
+* **168 tests passing**, clippy-clean with `-D warnings`.
 
 ### Roadmap
 
 | Phase | Item | Notes |
 |---|---|---|
-| 2.x | Per-network bridges: split the single `br-bifrost` so each network gets its own L2 broadcast domain | Today every network shares one bridge — fine for the small-N target, blocks true multi-tenancy. Actor model is already keyed by `net_uuid`, this is mostly a `bifrost-net` change. |
+| 2.x | `--ip <cidr>` flag on `mknet` CLI + `POST /api/networks` body, plus a per-network bridge editor in the WebUI | Phase 2.0 ships kernel-level isolation but new networks default to `bridge_ip = ""` — the operator can hand-edit `server.toml` to give a network a host-side address until the surface ships. |
 | —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
-| —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (1.2 lays the groundwork; `[metrics]` config exists but is currently a no-op) |
+| —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (`[metrics]` config exists but is currently a no-op) |
 | —   | **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |
 | —   | **macOS / Windows clients** | `bifrost-net::macos::utun` (IP-only), `bifrost-net::windows::wintun` (full L2) |
 

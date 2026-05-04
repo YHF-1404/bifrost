@@ -29,16 +29,16 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 ## Architecture
 
 ```
-┌─ Client (e.g. router, aarch64) ─────┐         ┌─ Server (Linux, x86_64) ───────────┐
-│  bifrost-client (daemon)            │         │  bifrost-server (daemon)            │
-│  ├─ TAP   tapXXXX  (10.0.0.2/24)    │         │  ├─ Bridge  br-bifrost (10.0.0.1)   │
-│  ├─ ConnTask  (TCP / SOCKS5)        │         │  ├─ TAP × N  (one per client)       │
-│  ├─ App  (state machine)            │         │  ├─ Hub  (single actor)             │
-│  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                    │
-│                                     │         │  ├─ SessionTask × N                 │
-│                                     │         │  ├─ admin  /run/bifrost/server.sock │
-│                                     │         │  └─ WebUI HTTP / WS  (127.0.0.1:8080)
-└────────────────┬────────────────────┘         └──────────────────┬──────────────────┘
+┌─ Client (e.g. router, aarch64) ─────┐         ┌─ Server (Linux, x86_64) ────────────┐
+│  bifrost-client (daemon)            │         │  bifrost-server (daemon)             │
+│  ├─ TAP   tapXXXX  (10.0.0.2/24)    │         │  ├─ Bridge × N  (一个网桥一个虚拟网) │
+│  ├─ ConnTask  (TCP / SOCKS5)        │         │  ├─ TAP × M    (一台已 admitted)    │
+│  ├─ App  (state machine)            │         │  ├─ Hub        (single actor)        │
+│  └─ admin  /run/bifrost/client.sock │         │  ├─ ConnTask × N                     │
+│                                     │         │  ├─ SessionTask × N                  │
+│                                     │         │  ├─ admin   /run/bifrost/server.sock │
+│                                     │         │  └─ WebUI HTTP / WS  (0.0.0.0:8080)  │
+└────────────────┬────────────────────┘         └──────────────────┬───────────────────┘
                  │                                                  │
                  │     postcard-framed wire protocol over TCP       │
                  │     (optionally tunnelled through SOCKS5)        │
@@ -49,9 +49,10 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 - **Hub 单 actor**：所有控制态（networks / approved_clients / sessions / pending / conns）由一个 `tokio::select!` 任务独占，外部只能通过 `mpsc<HubCmd>` 发命令；不再需要锁。
 - **数据面 0 hop**：批准 join 时，Hub 把 `session_cmd_tx` 通过 `bind_tx` 推给 ConnTask，此后 ETH 帧 `socket → ConnTask → SessionTask → TAP` 直连，**不经 Hub**。
+- **每个虚拟网一座网桥（Phase 2）**：每个 `[[networks]]` 行拥有自己的 Linux bridge（默认从 UUID 派生 `bf-<8-hex>`，可在 `NetRecord.bridge_name` 自定义）。`mknet` 建网桥，`delete_net` 拆网桥。已 admit 设备的 TAP 只挂到自己网络的桥上——网络之间不共享广播域、ARP、MAC 表、路由表。
 - **Session 状态机**：`Joined → Disconnected → Dead`，server 端有 disconnect timeout，client 端用 `None` 表示"永不超时由用户控制"。
-- **路由派生而非配置**：每台 admitted client 声明 `lan_subnets`，`device push` 时由 server 聚合得出路由表，去掉了 `[[routes]]` 这个独立维度。
-- **两个控制面同源**：admin Unix socket（`bifrost-server admin <cmd>`）和本地 HTTP API（`/api/...`）背后都是 `HubHandle` 的方法；WebUI 只是另一个 consumer。
+- **路由派生而非配置**：每台 admitted client 声明 `lan_subnets`，`device push` 时按网络聚合 → 安装到 **该网络的桥** 上（不是全局），去掉了 `[[routes]]` 这个独立维度。
+- **两个控制面同源**：admin Unix socket（`bifrost-server admin <cmd>`）和 HTTP API（`/api/...`）背后都是 `HubHandle` 的方法；WebUI 只是另一个 consumer。
 
 ---
 
@@ -162,35 +163,55 @@ host = "0.0.0.0"
 port = 8888
 save_dir = "/var/lib/bifrost/received"
 
-[bridge]
+[bridge]                      # 遗留全局段：仅 `disconnect_timeout` 仍生效；
+                              # `name` / `ip` 不再权威——但从 Phase 1 升级时
+                              # 会被读取一次（见下方"迁移"小节）。
 name = "br-bifrost"
-ip = "10.0.0.1/24"           # 空字符串 = 不给 bridge 加地址
+ip = "10.0.0.1/24"
 disconnect_timeout = 60       # 秒：socket 断开后 TAP 保留多久
 
 [admin]
 socket = "/run/bifrost/server.sock"
 
-[web]                         # 默认只绑 lo，要远程访问请走 SSH -L 隧道
+[web]                         # `deploy/server.toml.example` 默认 `0.0.0.0:8080`，
+                              # 方便防火墙后的 VPS 直接访问；代码内默认
+                              # `127.0.0.1:8080`。按部署需要改即可。
 enabled = true
-listen = "127.0.0.1:8080"
+listen = "0.0.0.0:8080"
 
-[metrics]                     # 暂未启用，预留
+[metrics]                     # 预留，目前没有 consumer
 enabled = false
 listen = "127.0.0.1:9090"
 
 # 以下两段由 daemon 自动填充，无需手编
 # [[networks]]          → mknet
-# [[approved_clients]]  → approve / device set
+# [[approved_clients]]  → device set
+#
+# 每个 [[networks]] 行拥有自己的内核网桥（Phase 2）：
+#   name         = "hml-net"
+#   uuid         = "..."
+#   bridge_name  = "br-bifrost"        # 新建网络默认从 UUID 派生 `bf-<8-hex>`，
+#                                      # 升级时第一个网络会继承遗留 [bridge].name
+#   bridge_ip    = "10.0.0.1/24"       # 空 = 纯 L2，不给桥加 host 侧地址
 #
 # 每个 [[approved_clients]] 行的字段：
-#   client_uuid    = "..."           # daemon 写入
-#   net_uuid       = "..."           # daemon 写入
-#   tap_ip         = "10.0.0.2/24"   # device set --ip
-#   display_name   = "router"        # device set --name
-#   lan_subnets    = ["192.168.200.0/24"]  # device set --lan
+#   client_uuid  = "..."               # daemon 写入
+#   net_uuid     = "..."               # daemon 写入
+#   tap_ip       = "10.0.0.2/24"       # device set --ip
+#   display_name = "router"            # device set --name
+#   lan_subnets  = ["192.168.200.0/24"]  # device set --lan
+#   admitted     = true                # device set --admit
 #
-# 服务端的路由表是从 lan_subnets 派生出来的，不再有独立的 [[routes]] 段。
+# 每个网络的路由表是 **从其成员的 `lan_subnets` 派生** 的，
+# 只装到该网络的桥上，不再有独立的 [[routes]] 段。
 ```
+
+#### 从 Phase 1（单一全局桥）迁移
+
+`ServerConfig::load` 会跑一次自动迁移：对每个 `bridge_name` 为空的
+`[[networks]]` 行，**第一个** 会继承遗留的 `[bridge].name` /
+`[bridge].ip`（你原本的内核桥继续归这个网络所有，无需手工干预），
+后续的网络从 UUID 派生 `bf-<8-hex>`。改写后的配置落盘后下次加载是 no-op。
 
 ### `client.toml`
 
@@ -451,7 +472,7 @@ Admin RPC 是另一份独立协议：
 - ✅ 跨编译：x86_64-linux-gnu + aarch64-linux-gnu via `cross`
 - ✅ systemd unit + 部署脚本，已在生产 Arch + Ubuntu aarch64 跑通端到端
 
-### 已完成（Phase 1.0–1.6 — WebUI v1）
+### 已完成（Phase 1.0–1.6 — WebUI v1，Phase 2.0 — 多租户 L2）
 
 - ✅ **per-device `lan_subnets`** 取代全局 `[[routes]]`；路由表按需派生。CLI 改为 `device list/set/push`。
 - ✅ **单一 admit 开关**取代 approve / deny / kick：CLI 用 `device set --admit true|false`，HTTP 用 `PATCH … {admitted:…}`；被踢的设备保留为 pending 行，重连重发 `Join` 落回 pending —— 不需要协议层改动。
@@ -461,13 +482,14 @@ Admin RPC 是另一份独立协议：
 - ✅ **Graph 视图（React Flow）**：Hub 卡片网络名 InlineEdit；**连线浮动吸附**到两节点最近的一对边中点；**节点位置服务端持久化** + 画布右上角 saving/saved/error 状态 chip；fitView 首次居中；带 minimap。
 - ✅ **per-session 字节计数 + 1 Hz 采样**：每台设备同时显示数字 bps + 60 采样 sparkline。WS 事件驱动 TanStack Query invalidate，UI 不轮询，30 s 兜底刷一次。
 - ✅ **单二进制部署**：`rust-embed` 把 `web/dist/` 编进 `bifrost-server`；同端口服务 SPA + API + WS；深链接回退 `index.html`；哈希资产 immutable cache；`<save_dir>/layouts/<nid>.json` 存 per-network UI 状态。
-- ✅ **164 个测试**通过，clippy `-D warnings` 干净。
+- ✅ **每个虚拟网一座 Linux bridge（Phase 2.0）**：`mknet` 建网桥，`delete_net` 拆网桥；admit 设备的 TAP 只挂到自己网络的桥上。`NetRecord` 新增 `bridge_name`（默认 `bf-<8-hex>`）和 `bridge_ip`（host 侧网关地址，可空）。从 Phase 1 升级时，第一个网络自动继承遗留 `[bridge]` 段。网络之间不共享广播域、ARP、MAC 表、路由表。
+- ✅ **168 个测试**通过，clippy `-D warnings` 干净。
 
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
 |---|---|---|
-| 2.x | 每个虚拟网独立 bridge：把现在的单一 `br-bifrost` 拆分，每网一个 L2 广播域 | 当前所有网络共享一座桥（小规模够用，但阻断真正的多租户隔离）。actor 模型已经按 `net_uuid` keying，主要是 `bifrost-net` 层的工作 |
+| 2.x | `mknet` CLI 加 `--ip <cidr>` flag、`POST /api/networks` body 加 `bridge_ip`、WebUI 加每网桥编辑面板 | Phase 2.0 已经做了内核级隔离，但新建网络默认 `bridge_ip = ""`。当前可手动改 `server.toml` 给某网络配 host 侧 IP，等 UI 落地后会更顺手。 |
 | —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基；`[metrics]` 配置段已存在但目前是空挂） |
 | —   | **per-session pcap dump** | `SessionCmd::PcapStart/Stop` 已经定义，只缺实现 |
