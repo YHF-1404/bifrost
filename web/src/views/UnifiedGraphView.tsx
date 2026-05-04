@@ -72,13 +72,16 @@ type ClientData = {
   onUpdatePending: (body: { name?: string; lan_subnets?: string[] }) => void;
 };
 
-const DEFAULT_FRAME = { x: 0, y: 0, width: 720, height: 480 };
+const DEFAULT_FRAME = { x: 0, y: 0, width: 720, height: 520 };
 const DEFAULT_HUB_OFFSET = { x: 24, y: 36 };
 const CLIENT_W = 280;
-const CLIENT_H = 150;
+// Sized to fit the rendered ClientNode (header strip + name/IP/LAN +
+// throughput); previously 150 was an under-estimate that caused the
+// bottom of the card to spill below the auto-grown frame.
+const CLIENT_H = 200;
 const HUB_W = 240;
-const HUB_H = 130;
-const FRAME_PADDING = 32;
+const HUB_H = 160;
+const FRAME_PADDING = 40;
 const FRAME_GAP = 24; // gap kept between non-overlapping frames
 const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
 const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
@@ -396,6 +399,15 @@ function UnifiedGraphInner() {
   // Networks whose `lan_subnets` have been edited since the last push.
   // The Hub card's push button pulses amber while a net is here.
   const [pendingPush, setPendingPush] = useState<Set<string>>(new Set());
+  // Per-network shift applied at derive time (so left/up content
+  // pushes the frame anchor). We save raw positions in the layout,
+  // then add the shift when handing off to React Flow; on dragStop
+  // we have to SUBTRACT the shift before persisting so the next
+  // derive doesn't double-shift. Exposed via ref so onNodeDragStop
+  // (which is a stable callback) can read the latest values.
+  const shiftsRef = useRef<Map<string, { shiftX: number; shiftY: number }>>(
+    new Map(),
+  );
   const markPending = useCallback((nid: string) => {
     setPendingPush((prev) => {
       if (prev.has(nid)) return prev;
@@ -534,15 +546,23 @@ function UnifiedGraphInner() {
       }
     }
 
-    // Pass 1 — compute each frame's *content bounds* so we can grow
-    // the box if the user has packed in more clients than the default
-    // size accommodates. Uses the same default-positioning logic as
-    // the node loop below; if any node has a saved position we honour
-    // it.
-    const contentSize = (nid: string): { width: number; height: number } => {
+    // Pass 1 — compute each frame's content bounding box across ALL
+    // four sides (not just right/bottom). Children with negative
+    // relative positions force the frame to grow left/up; we record
+    // the necessary shift so we can re-anchor the frame and offset
+    // every child by the same delta to keep visual positions stable.
+    const frameLayout = (
+      nid: string,
+    ): {
+      width: number;
+      height: number;
+      shiftX: number;
+      shiftY: number;
+    } => {
+      type Item = { x: number; y: number; w: number; h: number };
+      const items: Item[] = [];
       const hubPos = positions[`hub:${nid}`] ?? DEFAULT_HUB_OFFSET;
-      let maxR = hubPos.x + HUB_W;
-      let maxB = hubPos.y + HUB_H;
+      items.push({ x: hubPos.x, y: hubPos.y, w: HUB_W, h: HUB_H });
       let seq = 0;
       for (const c of byNet.get(nid) ?? []) {
         const stored = positions[`client:${c.client_uuid}`];
@@ -551,31 +571,56 @@ function UnifiedGraphInner() {
           y: 36 + seq * (CLIENT_H + 16),
         };
         seq += 1;
-        maxR = Math.max(maxR, p.x + CLIENT_W);
-        maxB = Math.max(maxB, p.y + CLIENT_H);
+        items.push({ x: p.x, y: p.y, w: CLIENT_W, h: CLIENT_H });
       }
-      return {
-        width: maxR + FRAME_PADDING,
-        height: maxB + FRAME_PADDING,
-      };
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const it of items) {
+        minX = Math.min(minX, it.x);
+        minY = Math.min(minY, it.y);
+        maxX = Math.max(maxX, it.x + it.w);
+        maxY = Math.max(maxY, it.y + it.h);
+      }
+      // shiftX/Y > 0 ⇒ the frame's saved left/top edge lands FRAME_PADDING
+      // px to the right/below the leftmost/topmost child after we shift
+      // the frame anchor. Negative children become non-negative inside
+      // the new frame coord system.
+      const shiftX = Math.max(0, FRAME_PADDING - minX);
+      const shiftY = Math.max(0, FRAME_PADDING - minY);
+      const width = Math.max(
+        DEFAULT_FRAME.width,
+        maxX + shiftX + FRAME_PADDING,
+      );
+      const height = Math.max(
+        DEFAULT_FRAME.height,
+        maxY + shiftY + FRAME_PADDING,
+      );
+      return { width, height, shiftX, shiftY };
     };
 
-    // Pass 2 — initial frame boxes (pre-collision-resolution).
+    // Pass 2 — initial frame boxes (pre-collision-resolution). Apply
+    // the shifts so frame.x/y move left/up to encompass any
+    // negatively-positioned children.
+    const shifts = shiftsRef.current;
+    shifts.clear();
     let initialFrames: FrameBox[] = networks.map((n, i) => {
       const saved = frames[n.id];
-      const { width: minW, height: minH } = contentSize(n.id);
+      const { width: w, height: h, shiftX, shiftY } = frameLayout(n.id);
+      shifts.set(n.id, { shiftX, shiftY });
       const baseX = (i % COLS) * FRAME_GAP_X;
       const baseY = Math.floor(i / COLS) * FRAME_GAP_Y;
-      const x = saved?.x ?? baseX;
-      const y = saved?.y ?? baseY;
-      const w = Math.max(saved?.width ?? DEFAULT_FRAME.width, minW);
-      const h = Math.max(saved?.height ?? DEFAULT_FRAME.height, minH);
+      const x = (saved?.x ?? baseX) - shiftX;
+      const y = (saved?.y ?? baseY) - shiftY;
+      const finalW = Math.max(saved?.width ?? DEFAULT_FRAME.width, w);
+      const finalH = Math.max(saved?.height ?? DEFAULT_FRAME.height, h);
       return {
         id: n.id,
         x,
         y,
-        width: w,
-        height: h,
+        width: finalW,
+        height: finalH,
         pinned: !!saved,
       };
     });
@@ -587,6 +632,7 @@ function UnifiedGraphInner() {
 
     networks.forEach((n) => {
       const fb = frameById.get(n.id)!;
+      const shift = shifts.get(n.id) ?? { shiftX: 0, shiftY: 0 };
       ns.push({
         id: `frame:${n.id}`,
         type: "frame",
@@ -613,7 +659,9 @@ function UnifiedGraphInner() {
           onDelete: () => deleteNetMut.mutate(n.id),
           onPushRoutes: () => pushRoutesMut.mutate(n.id),
         },
-        position: hubPos,
+        // Apply the same shift to the hub so growing the frame left
+        // or up doesn't visually move the hub card.
+        position: { x: hubPos.x + shift.shiftX, y: hubPos.y + shift.shiftY },
         parentId: `frame:${n.id}`,
         // Hub stays inside its frame; clients do NOT (so they can be
         // dragged across to other frames — see #2 in the bug list).
@@ -668,11 +716,15 @@ function UnifiedGraphInner() {
           x: HUB_W + 60,
           y: 36 + seq * (CLIENT_H + 16),
         };
+        // Compensate for the frame's left/up shift so the client
+        // appears at the same visual location even when the frame
+        // grew leftward to encompass it.
+        const shift = shifts.get(c.net_uuid) ?? { shiftX: 0, shiftY: 0 };
         ns.push({
           id: ckey,
           type: "client",
           data: sharedData,
-          position: pos,
+          position: { x: pos.x + shift.shiftX, y: pos.y + shift.shiftY },
           parentId: `frame:${c.net_uuid}`,
           // No `extent: "parent"` — clients must be draggable across
           // frame boundaries to trigger assign_client on drop.
@@ -749,20 +801,28 @@ function UnifiedGraphInner() {
         return;
       }
 
-      if (node.type !== "client") {
-        // Hub move — just remember its (relative-to-frame) position.
+      if (node.type === "hub") {
+        // Hub move — subtract shift before saving so the next render
+        // doesn't double-shift it.
+        const nid = node.id.replace(/^hub:/, "");
+        const shift = shiftsRef.current.get(nid) ?? { shiftX: 0, shiftY: 0 };
         layout.update((prev) => ({
           ...prev,
           graph: {
             ...prev.graph,
             positions: {
               ...prev.graph.positions,
-              [node.id]: { x: node.position.x, y: node.position.y },
+              [node.id]: {
+                x: node.position.x - shift.shiftX,
+                y: node.position.y - shift.shiftY,
+              },
             },
           },
         }));
         return;
       }
+
+      if (node.type !== "client") return;
 
       // Client move — figure out which frame (if any) we ended up in.
       const cuid = node.id.replace(/^client:/, "");
@@ -777,17 +837,25 @@ function UnifiedGraphInner() {
         : null;
       const currentNid = client.net_uuid;
 
-      // node.position is relative to its CURRENT parent (the OLD frame
-      // for an admitted client, absolute for a free one).
+      // node.position is the visual relative position to the OLD
+      // frame (which is already at its post-shift x/y in rfNodes).
+      // Compute absolute visual position then re-anchor to the target
+      // frame, finally subtract the target frame's shift so the saved
+      // value is the RAW (pre-shift) coordinate that's stable across
+      // re-derives.
       const oldFrame = currentNid
         ? rfNodes.find((n) => n.id === `frame:${currentNid}`)
         : null;
       const absX = (oldFrame?.position.x ?? 0) + node.position.x;
       const absY = (oldFrame?.position.y ?? 0) + node.position.y;
+      const targetShift =
+        targetNid !== null
+          ? shiftsRef.current.get(targetNid) ?? { shiftX: 0, shiftY: 0 }
+          : { shiftX: 0, shiftY: 0 };
       const newPos = targetFrame
         ? {
-            x: absX - targetFrame.position.x,
-            y: absY - targetFrame.position.y,
+            x: absX - targetFrame.position.x - targetShift.shiftX,
+            y: absY - targetFrame.position.y - targetShift.shiftY,
           }
         : { x: absX, y: absY };
 
