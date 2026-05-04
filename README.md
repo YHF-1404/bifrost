@@ -23,10 +23,12 @@ duplicative. The wire protocol is plaintext on the inside but is
 trivially carried by any of those tunnels — the SOCKS5 client is built
 in.
 
-In addition to the classic CLI, recent versions ship a **localhost-only
-WebUI** (`http://127.0.0.1:8080` by default) for inspecting networks
-and devices. The frontend is a small React app under `web/`; the
-backend is the same daemon binary. See [WebUI](#webui).
+In addition to the classic CLI, recent versions ship a **WebUI** (HTTP
++ WebSocket, default `127.0.0.1:8080`) for inspecting networks,
+admitting/kicking devices, editing per-device fields, pushing routes,
+and visualising the topology as a draggable node graph. The frontend
+is a small React app under `web/`; the backend is the same daemon
+binary. See [WebUI](#webui).
 
 ---
 
@@ -59,7 +61,7 @@ delegated to a tool that already solves them well.
 | Encryption               | **None — bring your own tunnel**         | WireGuard                                 | Salsa20 + Poly1305                        | ChaCha20Poly1305           |
 | NAT traversal            | Outbound TCP only; **SOCKS5 native**     | STUN + relays via Tailscale's DERP        | STUN + ZT controllers                     | Manual port forwarding     |
 | Coordinator / control    | Self-hosted single binary, no cloud      | Tailscale cloud (or self-hosted Headscale)| ZeroTier cloud (or self-hosted)           | None                       |
-| Member approval          | Manual `approve <sid>` then auto         | OAuth, ACL files                          | Web console + API                         | Static key exchange        |
+| Member approval          | Per-device admit toggle (CLI + WebUI)    | OAuth, ACL files                          | Web console + API                         | Static key exchange        |
 | Mobile clients           | No                                        | Yes (iOS / Android)                       | Yes                                       | Yes                        |
 | Best fit                 | You already run Xray / V2Ray / SS        | Plug-and-play LAN over the internet       | Mesh L2 with member sprawl                | Minimal-trust point-to-point |
 
@@ -158,15 +160,18 @@ ssh root@<server-ip> 'bifrost-server admin mknet hml-net'
 # 4. Have the client request to join
 ssh root@<client-ip> "bifrost-client admin join <NET_UUID>"
 
-# 5. Approve on the server side
-ssh root@<server-ip> 'bifrost-server admin list'             # find the sid
-ssh root@<server-ip> 'bifrost-server admin approve <SID>'
-
-# 6. Assign the client's TAP IP, name, and LAN subnets behind it
+# 5. Admit and configure the client in one go.
+#    A `device set` with `--admit true` promotes a pending row; without
+#    it the client stays in pending state. Each flag is independent —
+#    pass only the ones you want to change.
 CLIENT_UUID=$(ssh root@<client-ip> \
   'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
 ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
-  --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
+  --admit true --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
+
+# 6. (later, optional) Kick a device back to pending without removing
+#    its row, e.g. for maintenance:
+#    ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID --admit false"
 
 # 7. Push the derived route table to all members
 ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
@@ -190,7 +195,7 @@ appropriate moments.
 
 ```bash
 cargo build  --workspace
-cargo test   --workspace                                 # ~156 tests
+cargo test   --workspace                                 # ~164 tests
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Frontend (optional — only if you're going to touch the WebUI)
@@ -389,21 +394,24 @@ which performs a single request-reply RPC and exits.
 | Command | Action |
 |---|---|
 | `mknet <name>` | Create a virtual network; returns its UUID. |
-| `approve <sid>` | Admit a pending client; allocates a TAP and adds it to the bridge. |
-| `deny <sid>` | Reject a pending client. |
-| `device list [<net-uuid>]` | List devices (admitted + currently pending). Filter by network if given. |
-| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | Mutate one device. Each flag is independent: omitted = no change; `--ip ""` clears; `--lan ""` clears the list. Live `SET_IP` is pushed if the device is online. |
+| `rename <net-uuid> <new-name>` | Rename an existing network. |
+| `rmnet <net-uuid>` | Delete a network and cascade-remove its devices (kills live sessions, drops conns, clears persisted rows, re-syncs routes). |
+| `device list [<net-uuid>]` | List devices (admitted + pending). Filter by network if given. |
+| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | Mutate one device. Each flag is independent: omitted = no change; `--ip ""` clears; `--lan ""` clears the list. `--admit true` promotes a pending row to admitted (allocates the TAP, sends `JoinOk`); `--admit false` kicks a session back to pending (kills the live socket, leaves the row in place). Live `SET_IP` is pushed if the device is online. |
 | `device push <net-uuid>` | Re-derive routes for the network (from every member's `lan_subnets`), install them on the server bridge, and send `SetRoutes` to each joined client. |
 | `list` | Snapshot of networks, sessions, and pending requests. |
 | `send <msg>` | Broadcast a `Frame::Text` to every connected client. |
 | `sendfile <path>` | Read a local file and broadcast it as `Frame::File`. |
 | `shutdown` | Ask the daemon to exit cleanly. |
 
-> Earlier versions had `setip` and `route add/del/push`. Both are gone:
-> the per-device `lan_subnets` field replaces the global routes table,
-> and `device set` subsumes `setip`. There is no migration path —
-> Bifrost is alpha; remove old `[[routes]]` from `server.toml` by hand
-> and re-create routes via `device set --lan`.
+> Earlier versions had `approve <sid>` / `deny <sid>` / `setip` /
+> `route add/del/push`. All four are gone. **Admit/kick is now a
+> field** on `device set` (`--admit true|false`); a kicked device
+> stays as a pending row and a re-join lands back in pending state.
+> The per-device `lan_subnets` field plus `device push` replaces the
+> global routes table; `device set --ip` replaces `setip`. There is
+> no migration path — Bifrost is alpha; remove old `[[routes]]` from
+> `server.toml` by hand, then re-create them with `device set --lan`.
 
 ### `bifrost-client admin`
 
@@ -432,29 +440,44 @@ source of truth for command behavior.
 
 ## WebUI
 
-The server daemon ships a small HTTP + WebSocket API that the React
-frontend in `web/` consumes. By default it binds **`127.0.0.1:8080`**
-— that is the auth model. To use it from another host, port-forward
-over SSH:
+The server daemon ships an HTTP + WebSocket API that the React
+frontend in `web/` consumes — same port serves the SPA, the REST API,
+and the `/ws` event stream.
+
+### Bind address
+
+In code the default is **`127.0.0.1:8080`** — safe everywhere, reach
+it via SSH `-L`:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 root@<server-ip>
 # then open http://127.0.0.1:8080 in your browser
 ```
 
-Disable / move it via the `[web]` block in `server.toml`, or with the
-CLI flags `--web-listen <addr>` / `--no-web`.
+The shipped `deploy/server.toml.example`, on the other hand, sets
+`listen = "0.0.0.0:8080"` so direct browser access works on a VPS
+behind a provider-level firewall (no auth, do **not** bind publicly
+without a network-level gate). Override per-deploy via the `[web]`
+block, or with the CLI flags `--web-listen <addr>` / `--no-web`.
 
-### Endpoints (read-only in v0.1)
+### Endpoints
 
-| Method | Path | Returns |
+| Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/networks` | List of networks with per-net `device_count` / `online_count`. |
-| `GET` | `/api/networks/:nid/devices` | Combined view of admitted + pending devices, including online state and TAP name. |
-| `GET` | `/ws` | WebSocket. v0.1 sends 25 s keepalive Pings; future phases push `metrics.tick`, `device.online`, `device.changed`, etc. |
+| `GET` | `/api/networks` | Network list with `device_count` / `online_count`. |
+| `POST` | `/api/networks` | Create a virtual network. Body `{ "name": "..." }`. |
+| `PATCH` | `/api/networks/:nid` | Rename. Body `{ "name": "..." }`. |
+| `DELETE` | `/api/networks/:nid` | Cascade-delete network and all its device rows (also drops the saved layout file). |
+| `GET` | `/api/networks/:nid/devices` | Combined view of admitted + pending devices. |
+| `PATCH` | `/api/networks/:nid/devices/:cid` | In-place edit: `name`, `tap_ip`, `lan_subnets`, **`admitted`** (true admits, false kicks back to pending). All fields optional. |
+| `POST` | `/api/networks/:nid/routes/push` | Re-derive routes from every member's `lan_subnets`, push `SetRoutes` to all joined peers. |
+| `GET` | `/api/networks/:nid/layout` | Saved graph node positions: `{ positions: { "<id>": { x, y } } }`. Returns empty object on a fresh network (200 OK), 404 for unknown network. |
+| `PUT` | `/api/networks/:nid/layout` | Atomic full-replace of saved positions; `<save_dir>/layouts/<nid>.json`. |
+| `GET` | `/ws` | WebSocket; pushes `metrics.tick` (1 Hz throughput sample), `device.{online,offline,changed,pending,removed}`, `routes.changed`, `network.{created,changed,deleted}`. Server keeps it warm with 25 s pings. |
 
-PATCH/POST endpoints (in-place edit, admit toggle, route push) land in
-the next phase.
+Errors all share the envelope `{ "error": "<message>" }`. 4xx for
+caller-fixable mistakes (unknown network, malformed CIDR, IP
+collision); 5xx is reserved for hub failure.
 
 ### Production: single binary
 
@@ -497,14 +520,38 @@ other than `127.0.0.1:8080`. HMR works as expected.
 
 Pages currently shipping:
 
-* `/networks` — table of virtual networks; events from `/ws` keep it fresh.
+* `/networks` — table of virtual networks; **create** with the inline
+  "+ New network" button, **rename** by clicking the name (inline
+  edit), **delete** with the per-row Delete button (confirm dialog).
+  Counts and edits stream in via `network.*` and `device.*` WS events,
+  with a 30 s safety-net poll.
 * `/networks/:nid` — devices in a network, with two interchangeable
-  views (table / node-graph) toggled per-tab. Inline-edit name, TAP
-  IP, and LAN subnets; admit / deny pending; `Push routes` recomputes
-  and pushes the derived table to all members.
+  views toggled per-tab and persisted to `localStorage`:
+  * **Table view** — admit toggle (a single switch per row replaces
+    the old approve/deny/kick buttons), inline edit on name / TAP IP
+    / LAN subnets, throughput cell with numeric bps + sparkline.
+  * **Graph view** — React Flow canvas filling the viewport. Hub
+    card centers; device cards orbit on a deterministic ring on
+    first load. **Node positions persist server-side** (PUT to
+    `/api/networks/:nid/layout` debounced 300 ms after each drag),
+    so a fresh browser on a different machine sees the same
+    arrangement. **Floating edges** snap to the closest pair of
+    side-midpoints between any two nodes — drag a device around
+    the hub and the line follows. **Saving / Saved chip** in the
+    canvas's top-right corner gives explicit feedback on each
+    drag-release. Hub card's network name is editable inline (same
+    PATCH endpoint the index page uses, both views stay in sync via
+    `network.changed` WS events).
+* `Push routes` button in the toolbar recomputes the derived table
+  and pushes `SetRoutes` to every joined peer. After any
+  `lan_subnets` edit, the button switches to amber + soft pulse +
+  trailing dot to remind the user the change isn't live until pushed
+  — plus an info toast at the moment of the edit. Cleared on a
+  successful push.
 * Header status badge — live / connecting / offline, driven by the
   WebSocket connection.
-* Live throughput sparklines on each device, fed by 1 Hz
+* Live throughput on every device — both the numeric `B/s` / `KB/s`
+  / `MB/s` value and a 60-sample sparkline, fed by 1 Hz
   `metrics.tick` events.
 
 ---
@@ -561,9 +608,15 @@ bifrost/
 │  └─ bifrost-client/              # daemon binary + driver lib
 │
 ├─ web/                            # React + Vite + TS + Tailwind frontend
-│  ├─ src/views/                   #   NetworkList, DeviceTable
-│  ├─ src/lib/                     #   api / ws / types / cn
-│  └─ src/components/ui/           #   Button, Card, Badge, Table primitives
+│  ├─ src/views/                   #   NetworkList, NetworkDetail,
+│  │                                 #   DevicesAsTable, DevicesAsGraph
+│  ├─ src/components/
+│  │  ├─ Layout, InlineEdit, Sparkline, ThroughputCell, Toaster
+│  │  ├─ graph/                    #   ServerNode, DeviceNode,
+│  │  │                              #   FloatingEdge, graphLayout
+│  │  └─ ui/                       #   Button, Card, Badge, Switch, Table
+│  └─ src/lib/                     #   api / ws / types / metrics /
+│                                    #   eventInvalidator / toast / format / cn
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -612,40 +665,52 @@ Crate dependency graph:
   server and an Ubuntu 24.04 aarch64 client (tunnelling through
   Xray's SOCKS5)
 
-### Completed (Phase 1.0–1.5 — WebUI v1)
+### Completed (Phase 1.0–1.6 — WebUI v1)
 
 * **Per-device `lan_subnets`** replaces the global `[[routes]]`
-  table; route table is derived per-network at push time. CLI
-  surface migrated to `device list/set/push`.
-* **`bifrost-web` crate** — axum HTTP/WS server on
-  `127.0.0.1:8080` by default. Read-only listing endpoints, write
-  endpoints (`PATCH device`, `POST approve|deny|routes/push`), and
-  a `/ws` event stream pushing `metrics.tick`, `device.online`,
-  `device.offline`, `device.changed`, `device.pending`,
-  `device.removed`, `routes.changed`.
+  table; the route table is derived per-network at push time. CLI
+  migrated to `device list/set/push`.
+* **Single admit toggle** replaces approve / deny / kick.
+  `device set --admit true|false` (CLI) or `PATCH … {admitted: …}`
+  (HTTP) is the one knob; a kicked device stays as a pending row,
+  a fresh `Join` lands back in pending state — no protocol changes.
+* **Network CRUD on the WebUI** — create, rename, delete networks
+  from the index page and the graph view's hub card. Backed by
+  `POST/PATCH/DELETE /api/networks[/:nid]` and three new event
+  types (`network.created/changed/deleted`).
+* **`bifrost-web` crate** — axum HTTP/WS on `127.0.0.1:8080` by
+  default. Full CRUD over networks and devices, `/api/.../layout`
+  for graph node positions, `/api/.../routes/push` for route push.
+  Errors share `{"error": "..."}`.
 * **`web/` SPA** — React + Vite + TypeScript + Tailwind. Two
-  interchangeable views: a table and a React-Flow node graph,
-  toggled per-tab and persisted to localStorage. Inline edit on
-  name / TAP IP / lan_subnets, optimistic updates with rollback,
-  admit / deny / kick / push-routes actions, live throughput
-  sparklines.
+  interchangeable views toggled per-tab; inline edits with
+  optimistic updates + rollback + toast on validation failure;
+  per-device admit switch; "Push routes" button that pulses amber
+  while LAN-subnet changes are unpushed.
+* **Graph view (React Flow)** with editable hub-name card, **floating
+  edges** that snap to the closest side midpoints between any two
+  nodes, **server-side persisted node positions** with
+  saving/saved/error indicator chip, fitView on first load, and a
+  minimap.
 * **Per-session throughput counters** (`AtomicU64` in `SessionTask`)
-  feed a 1 Hz sampler that broadcasts `metrics.tick` events. WS
-  events also drive query invalidation so the WebUI refreshes
-  without polling — the timed safety-net poll is at 30 s.
-* **Single-binary deploy**: `rust-embed` bakes `web/dist/` into
-  `bifrost-server`. Same port serves the API, the WS, and the SPA;
-  deep links fall back to `index.html`; hashed assets get
-  `Cache-Control: immutable`.
-* **156 tests passing**, clippy-clean with `-D warnings`.
+  drive a 1 Hz sampler that broadcasts `metrics.tick` events.
+  Devices show both the human-readable bps and a 60-sample
+  sparkline. WS events drive TanStack-Query invalidation so the UI
+  doesn't poll; the safety-net refetch is at 30 s.
+* **Single-binary deploy** — `rust-embed` bakes `web/dist/` into
+  `bifrost-server`. Same port serves the SPA, API, and WS; deep
+  links fall back to `index.html`; hashed assets get
+  `Cache-Control: immutable`. `<save_dir>/layouts/<nid>.json` holds
+  per-network UI state.
+* **164 tests passing**, clippy-clean with `-D warnings`.
 
 ### Roadmap
 
 | Phase | Item | Notes |
 |---|---|---|
-| 2.x | Multi-network: `HubManager`, per-net `HubHandle`, network CRUD | Currently the URL paths are forward-compatible; the actor split is the actual work |
+| 2.x | Per-network bridges: split the single `br-bifrost` so each network gets its own L2 broadcast domain | Today every network shares one bridge — fine for the small-N target, blocks true multi-tenancy. Actor model is already keyed by `net_uuid`, this is mostly a `bifrost-net` change. |
 | —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
-| —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (1.2 lays the groundwork) |
+| —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (1.2 lays the groundwork; `[metrics]` config exists but is currently a no-op) |
 | —   | **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |
 | —   | **macOS / Windows clients** | `bifrost-net::macos::utun` (IP-only), `bifrost-net::windows::wintun` (full L2) |
 

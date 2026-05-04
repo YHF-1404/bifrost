@@ -18,8 +18,8 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 - **SOCKS5 出口** — 客户端可走代理穿透到服务器，便于在受限网络部署
 - **协议带版本号** — `Hello/HelloAck` 强制版本协商，未来加密升级（Noise / TLS）已经预留 `caps` bit
 - **断线复用** — Session 跨重连保 TAP，可配置 disconnect timeout 之后才回收
-- **三套控制面同源** — daemon 默认起 admin Unix socket + 本机 HTTP/WS（默认 `127.0.0.1:8080`），可选前台 REPL；三者背后是同一个 `HubHandle`
-- **WebUI（v0.1 只读）** — `web/` 下的 React + Vite + Tailwind 应用；浏览网络 / 设备 / 在线状态。后续阶段加流量图表、就地编辑、节点拓扑视图
+- **三套控制面同源** — daemon 默认起 admin Unix socket + 本机 HTTP/WS（代码默认 `127.0.0.1:8080`，部署示例配置改成 `0.0.0.0:8080`），可选前台 REPL；三者背后是同一个 `HubHandle`
+- **WebUI（v1）** — `web/` 下的 React + Vite + Tailwind 应用：网络 CRUD、设备 admit/踢人开关、行内编辑名字 / TAP IP / LAN 子网、自动派生路由 + Push 按钮、表格 / 节点图两种视图、节点拖拽位置**服务端持久化**、连线自动吸附最近边中点、实时数字化吞吐 + sparkline
 - **路由表自动派生** — 每台设备声明背后的 `lan_subnets`，server 端 `device push` 时聚合下发，不再手维护 `[[routes]]`
 - **零外部 `ip` 命令依赖** — Linux 后端走 rtnetlink + ioctl 直连内核
 - **跨编译开箱即用** — `cross.toml` + Docker 一行编译 x86_64 / aarch64
@@ -61,7 +61,7 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 156 个单测 / 集成测试
+cargo test  --workspace      # 164 个单测 / 集成测试
 cargo clippy --workspace --all-targets -- -D warnings
 
 # 前端（只在动 WebUI 时需要）
@@ -126,18 +126,18 @@ CLIENT_HOST=root@<router-ip>  ./scripts/deploy-client.sh
 ssh root@<server-ip> 'bifrost-server admin mknet hml-net'
 # → network created  uuid=<NET_UUID>
 
-# 客户端发起 join（会进入 pending 状态）
+# 客户端发起 join（落到 pending 行）
 ssh root@<router-ip> 'bifrost-client admin join <NET_UUID>'
 
-# 服务端审批
-ssh root@<server-ip> 'bifrost-server admin list'           # 看 sid
-ssh root@<server-ip> 'bifrost-server admin approve <SID>'
-
-# 配置该设备：TAP IP、显示名、它背后的 LAN 网段
+# 一次性 admit + 配置：name / IP / LAN 子网。每个 flag 独立，缺省 = 不动。
+# 没传 --admit true 之前设备一直停在 pending 状态，行还在但不会下发 JoinOk。
 CLIENT_UUID=$(ssh root@<router-ip> \
   'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
 ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
-  --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
+  --admit true --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
+
+# 后续要把已经 admit 的设备踢回 pending（保留行不删）：
+#   ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID --admit false"
 
 # 重新派生路由表并下发给所有成员
 ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
@@ -227,17 +227,17 @@ socket = "/run/bifrost/client.sock"
 | 命令 | 行为 |
 |---|---|
 | `mknet <name>` | 创建虚拟网络，返回 UUID |
-| `approve <sid>` | 批准 pending join；建 TAP + 入桥 + 发 JoinOk |
-| `deny <sid>` | 拒绝 pending join；发 JoinDeny |
+| `rename <net-uuid> <new-name>` | 重命名网络 |
+| `rmnet <net-uuid>` | 删除网络并级联删除其下所有 device 行（在线 session 杀掉、conn 解绑、approved_clients 清掉、bridge 路由重派生） |
 | `device list [<net-uuid>]` | 列设备（已 admit 的 + 当前 pending 的），可按 net 过滤 |
-| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | 改一台设备的字段。每个 flag 独立：缺省 = 不动；`--ip ""` 清空；`--lan ""` 清空 LAN 列表。在线设备会立即收到 `SET_IP` |
+| `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | 改一台设备的字段。每个 flag 独立：缺省 = 不动；`--ip ""` 清空；`--lan ""` 清空 LAN 列表。`--admit true` 把 pending 升级为 admit（建 TAP + 发 JoinOk），`--admit false` 把在线 session 踢回 pending（杀 socket，行保留）。在线设备会立即收到 `SET_IP` |
 | `device push <net-uuid>` | 重新从所有成员的 `lan_subnets` 派生路由表，本机 bridge 上 apply 一遍，并下发 `SetRoutes` 给该网络内所有 joined 客户端 |
 | `list` | networks / sessions / pending 全量 snapshot |
 | `send <msg>` | 向所有连入客户端广播文本 |
 | `sendfile <path>` | 把本地文件广播给所有客户端 |
 | `shutdown` | 让 daemon 优雅退出 |
 
-> 旧版本里的 `setip` 与 `route add/del/push` 已经全部移除。`device set --ip` 取代 `setip`；`route` 被 per-device `lan_subnets` + `device push` 取代。alpha 阶段，没有迁移路径——直接手工删除老 `server.toml` 里的 `[[routes]]` 段，然后 `device set --lan` 重建。
+> 旧版本里的 `approve <sid>` / `deny <sid>` / `setip` / `route add/del/push` 已经全部移除。**Admit/踢人统一收敛到 `device set --admit true|false`**：被踢的客户端留在 pending 行（不删），重连重发 `Join` 落回 pending。`device set --ip` 取代 `setip`；`route` 被 per-device `lan_subnets` + `device push` 取代。alpha 阶段，没有迁移路径——直接手工删除老 `server.toml` 里的 `[[routes]]` 段，然后 `device set --lan` 重建。
 
 ### `bifrost-client admin`
 
@@ -266,29 +266,35 @@ REPL 命令与 admin 子命令对齐。
 
 ## WebUI
 
-server daemon 自带一个本机 HTTP + WebSocket 服务，前端在 `web/`，
-用 React + Vite + Tailwind 写。默认只绑 **`127.0.0.1:8080`**——这是
-鉴权模型本身。要从别的机器访问，请走 SSH 端口转发：
+server daemon 自带 HTTP + WebSocket 服务，同一端口同时跑 SPA + REST + `/ws`。前端在 `web/`，React + Vite + Tailwind。
+
+### 监听地址
+
+代码默认 **`127.0.0.1:8080`**，安全前提是只能本机访问，从外面来要走 SSH `-L`：
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 root@<server-ip>
 # 浏览器打开 http://127.0.0.1:8080
 ```
 
-`server.toml` 的 `[web]` 段可以改 listen 或彻底关掉；命令行也支持
-`--web-listen <addr>` / `--no-web` 临时覆盖。
+部署用的 `deploy/server.toml.example` 直接给的是 `listen = "0.0.0.0:8080"`——前提是 VPS 那一层有外部防火墙挡 8080，浏览器才能直接 `http://<server-ip>:8080` 用，**不要在没防火墙的公网上裸跑**（WebUI 没鉴权）。运行时也支持 `--web-listen <addr>` / `--no-web` 命令行覆盖。
 
 ### Endpoints
 
-| Method | Path | 返回 / 行为 |
+| Method | Path | 行为 |
 |---|---|---|
 | `GET` | `/api/networks` | 网络列表 + 每网的 `device_count` / `online_count` |
-| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备的合并视图 |
-| `PATCH` | `/api/networks/:nid/devices/:cid` | 改 admitted 设备字段（name / tap_ip / lan_subnets / `admitted=false` 踢人） |
-| `POST` | `/api/networks/:nid/devices/:cid/approve` | 批准 pending |
-| `POST` | `/api/networks/:nid/devices/:cid/deny` | 拒绝 pending |
-| `POST` | `/api/networks/:nid/routes/push` | 重新派生路由表 + 下发 |
-| `GET` | `/ws` | WebSocket，推送 `metrics.tick` / `device.{online,offline,changed,pending,removed}` / `routes.changed` |
+| `POST` | `/api/networks` | 建网络。Body `{ "name": "..." }` |
+| `PATCH` | `/api/networks/:nid` | 改名。Body `{ "name": "..." }` |
+| `DELETE` | `/api/networks/:nid` | 级联删除网络 + 下属 device 行 + 落盘的 layout 文件 |
+| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备合并视图 |
+| `PATCH` | `/api/networks/:nid/devices/:cid` | 改 device 字段：`name` / `tap_ip` / `lan_subnets` / **`admitted`**（true 升级 pending，false 踢回 pending） |
+| `POST` | `/api/networks/:nid/routes/push` | 重新派生路由表 + 下发 `SetRoutes` 到所有 joined peers |
+| `GET` | `/api/networks/:nid/layout` | 拿 graph 节点位置：`{ positions: { "<id>": { x, y } } }`。新网络返 `{}` 不是 404；网络不存在才 404 |
+| `PUT` | `/api/networks/:nid/layout` | 整张 map 替换写入，atomic write 到 `<save_dir>/layouts/<nid>.json` |
+| `GET` | `/ws` | WebSocket：推 `metrics.tick`（1Hz 吞吐采样）/ `device.{online,offline,changed,pending,removed}` / `routes.changed` / `network.{created,changed,deleted}`，25s 心跳 ping |
+
+错误统一信封 `{"error": "..."}`：4xx 是用户可修复的（未知网络、CIDR 格式错、IP 冲突），5xx 留给 hub 故障。
 
 ### 生产部署：单二进制
 
@@ -324,12 +330,13 @@ npm run dev        # http://127.0.0.1:5173；/api 与 /ws 自动 proxy 到 8080
 
 当前能用的页面：
 
-- `/networks`：虚拟网络列表；事件驱动，30 秒兜底轮询
-- `/networks/:nid`：该网下所有设备，**两种可切换视图**——表格视图 / 节点图视图（React Flow），切换状态写 localStorage
-  - 行内可编辑名字 / TAP IP / LAN 子网，乐观更新 + 失败回滚
-  - 实时上下行 sparkline，由 1Hz `metrics.tick` 喂数
-  - admit / deny / kick / push routes 都在 UI 上
-- 顶栏连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动
+- `/networks` —— 虚拟网络列表。**+ New network** 内联建；点名字 InlineEdit 改名；每行 Delete 按钮带 confirm 弹窗。30s 兜底轮询，事件驱动刷新。
+- `/networks/:nid` —— 该网下所有设备，**两种可切换视图**（per-tab 持久化到 localStorage）：
+  - **Table 视图**：单一 admit 开关替代旧 approve/deny/kick；行内编辑 name / TAP IP / LAN 子网，乐观更新 + 失败回滚 + 校验失败弹 toast；ThroughputCell 同时显示数字 bps + sparkline。
+  - **Graph 视图**：React Flow 画布全屏。Hub 居中，设备首次按确定环形布局；Hub 卡片网络名 InlineEdit（与列表页同步）。**节点拖拽位置服务端持久化**——drag end 后 debounce 300 ms PUT 到 `/api/networks/:nid/layout`，换浏览器 / 换设备打开都看到一样的布局。**连线浮动**：每个节点四边中点都是隐藏 handle，FloatingEdge 每帧选两节点距离最近的一对中点画 bezier。画布右上角 chip 显示保存状态：`Saving layout… → Layout saved → idle`，失败显示 `Save failed`。
+- `Push routes` 按钮：LAN 子网改了之后变琥珀色 + 微脉冲 + 末尾加 "•" 提示需要点击下发；同时弹 info toast。push 成功清掉提示。
+- 顶栏连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动。
+- 每个设备的实时吞吐：数字 `B/s` / `KB/s` / `MB/s` + 60 采样 sparkline，由 1 Hz `metrics.tick` 事件驱动。
 
 ---
 
@@ -359,9 +366,15 @@ bifrost/
 │  └─ bifrost-client/              # 二进制 + lib：ConnTask 重连 / App / admin / repl
 │
 ├─ web/                            # React + Vite + TS + Tailwind 前端
-│  ├─ src/views/                   #   NetworkList、DeviceTable
-│  ├─ src/lib/                     #   api / ws / types / cn
-│  └─ src/components/ui/           #   Button、Card、Badge、Table
+│  ├─ src/views/                   #   NetworkList、NetworkDetail、
+│  │                                 #   DevicesAsTable、DevicesAsGraph
+│  ├─ src/components/
+│  │  ├─ Layout、InlineEdit、Sparkline、ThroughputCell、Toaster
+│  │  ├─ graph/                    #   ServerNode、DeviceNode、
+│  │  │                              #   FloatingEdge、graphLayout
+│  │  └─ ui/                       #   Button、Card、Badge、Switch、Table
+│  └─ src/lib/                     #   api / ws / types / metrics /
+│                                    #   eventInvalidator / toast / format / cn
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -438,22 +451,25 @@ Admin RPC 是另一份独立协议：
 - ✅ 跨编译：x86_64-linux-gnu + aarch64-linux-gnu via `cross`
 - ✅ systemd unit + 部署脚本，已在生产 Arch + Ubuntu aarch64 跑通端到端
 
-### 已完成（Phase 1.0–1.5 — WebUI v1）
+### 已完成（Phase 1.0–1.6 — WebUI v1）
 
 - ✅ **per-device `lan_subnets`** 取代全局 `[[routes]]`；路由表按需派生。CLI 改为 `device list/set/push`。
-- ✅ **`bifrost-web` crate** — axum HTTP/WS server，默认 `127.0.0.1:8080`，提供完整 CRUD + 实时事件流（`metrics.tick` / `device.{online,offline,changed,pending,removed}` / `routes.changed`）。
-- ✅ **`web/` SPA** — React + Vite + TS + Tailwind，**两种可切换视图**（表格 / React Flow 节点图，per-tab 持久化）；行内编辑、乐观更新 + 回滚、approve/deny/kick/push routes 全在 UI；实时 sparkline。
-- ✅ **per-session 字节计数 + 1 Hz 采样**喂前端 sparkline；事件驱动让前端不再轮询。
-- ✅ **单二进制部署**：`rust-embed` 把 `web/dist/` 编进 `bifrost-server`；同一端口服务 API + WS + SPA；深链接回退到 `index.html`；哈希资产 immutable cache。
-- ✅ **156 个测试**通过，clippy `-D warnings` 干净。
+- ✅ **单一 admit 开关**取代 approve / deny / kick：CLI 用 `device set --admit true|false`，HTTP 用 `PATCH … {admitted:…}`；被踢的设备保留为 pending 行，重连重发 `Join` 落回 pending —— 不需要协议层改动。
+- ✅ **WebUI 网络 CRUD** —— 列表页和 Graph 视图的 Hub 卡片都能新建 / 改名 / 删除网络；后端 `POST/PATCH/DELETE /api/networks[/:nid]` 配合三个新事件 `network.{created,changed,deleted}`。
+- ✅ **`bifrost-web` crate** —— axum HTTP/WS，代码默认 `127.0.0.1:8080`，部署示例改 `0.0.0.0:8080`。提供完整 CRUD + `/api/.../layout`（graph 节点位置）+ `/api/.../routes/push` + WS 事件流。错误统一 `{"error": "..."}`。
+- ✅ **`web/` SPA** —— React + Vite + TS + Tailwind。两种可切换视图（per-tab 持久化）；行内编辑乐观更新 + 失败回滚 + 校验失败弹 toast；admit 开关；"Push routes" 按钮在 LAN 改了之后琥珀色脉冲。
+- ✅ **Graph 视图（React Flow）**：Hub 卡片网络名 InlineEdit；**连线浮动吸附**到两节点最近的一对边中点；**节点位置服务端持久化** + 画布右上角 saving/saved/error 状态 chip；fitView 首次居中；带 minimap。
+- ✅ **per-session 字节计数 + 1 Hz 采样**：每台设备同时显示数字 bps + 60 采样 sparkline。WS 事件驱动 TanStack Query invalidate，UI 不轮询，30 s 兜底刷一次。
+- ✅ **单二进制部署**：`rust-embed` 把 `web/dist/` 编进 `bifrost-server`；同端口服务 SPA + API + WS；深链接回退 `index.html`；哈希资产 immutable cache；`<save_dir>/layouts/<nid>.json` 存 per-network UI 状态。
+- ✅ **164 个测试**通过，clippy `-D warnings` 干净。
 
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
 |---|---|---|
-| 2.x | 多虚拟网：`HubManager`、per-net `HubHandle`、网络 CRUD | URL 已经是 `/api/networks/:nid/...`，主要工作是 actor 拆分 |
+| 2.x | 每个虚拟网独立 bridge：把现在的单一 `br-bifrost` 拆分，每网一个 L2 广播域 | 当前所有网络共享一座桥（小规模够用，但阻断真正的多租户隔离）。actor 模型已经按 `net_uuid` keying，主要是 `bifrost-net` 层的工作 |
 | —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
-| —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基） |
+| —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基；`[metrics]` 配置段已存在但目前是空挂） |
 | —   | **per-session pcap dump** | `SessionCmd::PcapStart/Stop` 已经定义，只缺实现 |
 | —   | **macOS / Windows 客户端** | `bifrost-net::macos::utun`（IP-only）；`bifrost-net::windows::wintun`（完整 L2） |
 
@@ -471,7 +487,8 @@ Admin RPC 是另一份独立协议：
 |---|---|
 | `bifrost-server.service: status=1/FAILURE` 启动后 `create bridge: No such device` | 内核没加载 `bridge` 模块。`modprobe bridge` 然后 `systemctl restart bifrost-server` |
 | `[!] connect failed: Connection refused` 客户端反复重试 | 服务端没起 / 防火墙 / SOCKS5 代理路径不通；`bifrost-client admin status` 看 `connected` |
-| 浏览器打开 `http://<server-ip>:8080` 看到 connection reset | WebUI 默认只绑 `127.0.0.1`。`ssh -L 8080:127.0.0.1:8080 root@<server-ip>` 转发即可，或者改 `[web].listen` |
+| 浏览器打开 `http://<server-ip>:8080` 看到 connection reset | 代码默认 `[web] listen = "127.0.0.1:8080"`，`ssh -L 8080:127.0.0.1:8080 root@<server-ip>` 转发即可。`deploy/server.toml.example` 改成了 `0.0.0.0:8080`，**前提是 VPS 那一层有外部防火墙挡 8080**，否则不要公开监听 |
+| 浏览器透过代理打 `http://<server-ip>:8080` 慢且 WS 一直 connecting | xray-core HTTP inbound 默认对 plain-HTTP 做 forward-proxy 并按 RFC 2616 把 `Connection: Upgrade` 当 hop-by-hop 头剥掉，axum 拒绝 400。对策：daed/客户端的代理出口换成 SOCKS5（xray 同时开 socks-inbound 即可），SOCKS5 是纯 TCP 隧道不动 HTTP 头，WS Upgrade 能通过 |
 | `scp: dest open ...: Failure` | ETXTBSY，二进制正在跑。deploy 脚本应该已经处理；如果手动覆盖记得先 `systemctl stop` |
 | `WARN Specified IFLA_INET6_CONF NLA attribute holds more...` | `netlink-packet-route 0.19` 的良性兼容警告，新 kernel 加了字段。可忽略 |
 | 升级后老 `server.toml` 里仍有 `[[routes]]` | 这一段已被删除，新 daemon 加载时直接忽略；下一次保存会丢弃。要保留之前的路由信息，对照其 `via`，在对应 client 的行加 `lan_subnets = [...]` |
