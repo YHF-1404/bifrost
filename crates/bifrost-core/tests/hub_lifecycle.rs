@@ -139,6 +139,17 @@ async fn recv_bind(
         .expect("bind_rx closed")
 }
 
+/// Phase 3 — `handle_hello` always pushes one `AssignNet` so the
+/// client knows its server-authoritative assignment. Tests that only
+/// care about post-Hello behavior call this to consume it.
+async fn drain_hello_assign(rx: &mut mpsc::Receiver<Frame>) {
+    let f = recv(rx).await;
+    assert!(
+        matches!(f, Frame::AssignNet { .. }),
+        "expected AssignNet from Hello, got {f:?}"
+    );
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -154,6 +165,7 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
 
     let mut c = fake_conn(&h, "1.2.3.4:1").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     // Expect JoinOk first.
@@ -185,6 +197,7 @@ async fn unknown_network_is_denied() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, Uuid::new_v4(), PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, Uuid::new_v4()).await; // wrong net
 
     match recv(&mut c.frame_rx).await {
@@ -228,6 +241,7 @@ async fn fresh_hello_creates_pending_unassigned_row() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     // Give the hub a beat to write the pending_clients row.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -261,6 +275,7 @@ async fn assign_then_join_creates_pending_admit_row_and_holds_conn() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Admin assigns. This sends `Frame::AssignNet { Some(net) }` to the
@@ -303,6 +318,7 @@ async fn admit_toggle_on_promotes_pending_to_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     let _ = h.hub.assign_client(client, Some(net)).await;
     // Drain the AssignNet frame.
@@ -347,6 +363,7 @@ async fn admit_toggle_off_kicks_session_keeps_row_in_pending() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -409,6 +426,7 @@ async fn disconnect_unbinds_session_but_keeps_tap() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await; // bound
@@ -438,6 +456,7 @@ async fn reconnect_reuses_session_no_new_tap() {
     // First join.
     let mut c1 = fake_conn(&h, "x1").await;
     h.hub.hello(c1.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c1.frame_rx).await;
     h.hub.join(c1.id, net).await;
     let _ = recv(&mut c1.frame_rx).await;
     let _ = recv_bind(&mut c1.bind_rx).await;
@@ -449,6 +468,7 @@ async fn reconnect_reuses_session_no_new_tap() {
     // Second conn reconnects.
     let mut c2 = fake_conn(&h, "x2").await;
     h.hub.hello(c2.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c2.frame_rx).await;
     h.hub.join(c2.id, net).await;
 
     // Still only 1 TAP.
@@ -477,6 +497,7 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
 
     let mut c1 = fake_conn(&h, "x1").await;
     h.hub.hello(c1.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c1.frame_rx).await;
     h.hub.join(c1.id, net).await;
     let _ = recv(&mut c1.frame_rx).await;
     let _ = recv_bind(&mut c1.bind_rx).await; // initial bind
@@ -484,6 +505,7 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
     // Second conn from same client without disconnecting the first.
     let mut c2 = fake_conn(&h, "x2").await;
     h.hub.hello(c2.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c2.frame_rx).await;
     h.hub.join(c2.id, net).await;
 
     // First conn must observe an unbind (`None` on bind_rx).
@@ -506,6 +528,7 @@ async fn disconnect_then_timeout_removes_session_and_tap() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await;
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -546,6 +569,7 @@ async fn routes_pushed_after_join_and_filter_self_via() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     let _ = recv(&mut c.frame_rx).await; // JoinOk
@@ -573,6 +597,7 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await;
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -603,6 +628,7 @@ async fn device_set_ip_pushes_to_live_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -819,6 +845,7 @@ async fn device_push_pushes_to_each_bound_session() {
 
     let mut a = fake_conn(&h, "x:1").await;
     h.hub.hello(a.id, client_a, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut a.frame_rx).await;
     h.hub.join(a.id, net).await;
     let _ = recv(&mut a.frame_rx).await; // JoinOk
     let _ = recv(&mut a.frame_rx).await; // SetRoutes (initial push)
@@ -826,6 +853,7 @@ async fn device_push_pushes_to_each_bound_session() {
 
     let mut b = fake_conn(&h, "x:2").await;
     h.hub.hello(b.id, client_b, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut b.frame_rx).await;
     h.hub.join(b.id, net).await;
     let _ = recv(&mut b.frame_rx).await;
     let _ = recv(&mut b.frame_rx).await;
@@ -920,6 +948,7 @@ async fn metrics_tick_broadcasts_one_sample_per_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -992,6 +1021,7 @@ async fn admit_toggle_emits_device_online() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
 
     // First a DevicePending(network=nil) arrives — unassigned client.
     let pending = next_matching(&mut events, Duration::from_millis(500), |e| {
@@ -1173,6 +1203,7 @@ async fn admit_attaches_tap_to_owning_network_bridge_only() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net_a).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
 
@@ -1285,6 +1316,7 @@ async fn assign_pending_to_network_emits_assignnet_and_creates_row() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Sanity: client is in the pending pool now (no approved row).

@@ -459,6 +459,10 @@ async fn assign_client_pending_to_network_clears_admit_and_ip() {
         .unwrap();
     h.hub.hello(conn, cid, PROTOCOL_VERSION).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
+    // Phase 3 — `handle_hello` now pushes one `AssignNet` so the client
+    // knows its server-authoritative assignment (None for a pending
+    // pool entry). Drain it before we trigger the explicit assign.
+    let _ = tokio::time::timeout(Duration::from_millis(100), frame_rx.recv()).await;
 
     let resp = reqwest::Client::new()
         .post(url(&h, &format!("/api/clients/{cid}/assign")))

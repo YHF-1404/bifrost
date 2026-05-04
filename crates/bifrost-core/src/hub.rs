@@ -951,6 +951,28 @@ impl Hub {
                 });
             }
         }
+
+        // Phase 3 — server is authoritative; the client's
+        // `joined_network` in its toml is just a hint. Push the
+        // current assignment to the conn so it knows where it
+        // belongs, regardless of whatever (possibly stale) value
+        // it had locally. `Some(net)` triggers an automatic
+        // `Join { net }` on the client; `None` parks it idle.
+        let assigned_net = self
+            .cfg
+            .approved_clients
+            .iter()
+            .find(|a| a.client_uuid == client_uuid)
+            .map(|a| a.net_uuid);
+        if let Some(c) = self.conns.get(&conn) {
+            let _ = c
+                .link
+                .frame_tx
+                .send(Frame::AssignNet {
+                    net_uuid: assigned_net,
+                })
+                .await;
+        }
     }
 
     async fn handle_disconnect(&mut self, conn: ConnId) {
