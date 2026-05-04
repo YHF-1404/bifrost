@@ -581,6 +581,83 @@ async fn patch_network_rejects_unsupported_prefix() {
 }
 
 #[tokio::test]
+async fn ui_layout_round_trip() {
+    let h = spawn_with(vec![]).await;
+    // Empty initial GET.
+    let r: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["table"].is_object());
+    assert!(r["graph"]["positions"].as_object().unwrap().is_empty());
+
+    // PUT something, then GET back.
+    let body = json!({
+        "table": { "left_ratio": 0.4, "left_collapsed": false },
+        "graph": {
+            "positions": { "client:abc": { "x": 1.5, "y": 2.5 } },
+            "frames": { h.net.to_string(): { "x": 0.0, "y": 0.0, "width": 600.0, "height": 400.0 } }
+        }
+    });
+    let put = reqwest::Client::new()
+        .put(url(&h, "/api/ui-layout"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let got: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["table"]["left_ratio"], 0.4);
+    assert_eq!(got["graph"]["positions"]["client:abc"]["x"], 1.5);
+    assert_eq!(
+        got["graph"]["frames"][h.net.to_string()]["width"],
+        600.0
+    );
+}
+
+#[tokio::test]
+async fn delete_network_drops_frame_from_ui_layout() {
+    let h = spawn_with(vec![]).await;
+    let body = json!({
+        "graph": {
+            "frames": { h.net.to_string(): { "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0 } }
+        }
+    });
+    let _ = reqwest::Client::new()
+        .put(url(&h, "/api/ui-layout"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let _ = reqwest::Client::new()
+        .delete(url(&h, &format!("/api/networks/{}", h.net)))
+        .send()
+        .await
+        .unwrap();
+
+    let got: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(got["graph"]["frames"]
+        .as_object()
+        .unwrap()
+        .get(&h.net.to_string())
+        .is_none());
+}
+
+#[tokio::test]
 async fn patch_network_24_to_16_rewrites_client_tap_ip_prefix() {
     // Spawn with bridge /24 + a client at 10.0.0.5/24. Switch bridge
     // to /16; client's tap_ip should auto-rewrite to 10.0.0.5/16.
