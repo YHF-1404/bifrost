@@ -6,12 +6,14 @@
 // floating nodes outside any frame.
 //
 // Interactions:
-// * Drag a client into a frame ⇒ assign_client(cid, frame_nid).
+// * Drag a client across frames ⇒ assign_client(cid, target_nid).
 // * Drag a client out of every frame ⇒ assign_client(cid, null).
 // * Right-click a Hub card ⇒ "Delete network" (clients fall out as
 //   free nodes via the Phase-3 detach behavior).
-// * Right-click the canvas blank ⇒ "Create new network" (immediately
-//   inline-edit its name).
+// * Right-click the canvas blank ⇒ "Create new network".
+// * Click any field on a card to edit (admit switch, name, IP, LAN
+//   subnets, bridge IP). Cards have a small drag handle (⠿) on the
+//   left so editing inputs doesn't grab the node.
 //
 // Layout (frame x/y/w/h, node x/y) persists to `/api/ui-layout` via
 // `useUiLayout`.
@@ -23,44 +25,83 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
+  useEdgesState,
+  useNodesState,
   useReactFlow,
   type Edge,
   type Node,
-  type NodeChange,
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "@/lib/api";
-import { fmtErr, shortUuid } from "@/lib/format";
+import { api, type DeviceUpdateBody } from "@/lib/api";
+import { fmtErr, isCidr, shortUuid } from "@/lib/format";
 import { pushToast } from "@/lib/toast";
 import type { Device, Network } from "@/lib/types";
 import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { Switch } from "@/components/ui/Switch";
+import { InlineEdit } from "@/components/InlineEdit";
+import { IpSegmentInput, type Prefix } from "@/components/IpSegmentInput";
+import { ThroughputCell } from "@/components/ThroughputCell";
 import { useUiLayout } from "@/lib/useUiLayout";
 import { cn } from "@/lib/cn";
 
 // ── Node-data types ─────────────────────────────────────────────────────
 
 type FrameData = { net: Network };
-type HubData = { net: Network; onDelete: () => void };
-type ClientData = { client: Device };
+type HubData = {
+  net: Network;
+  onRename: (name: string) => void;
+  onSetBridgeIp: (ip: string) => void;
+  onDelete: () => void;
+  onPushRoutes: () => void;
+  deviceCount: number;
+};
+type ClientData = {
+  client: Device;
+  bridgeIp: string;
+  bridgePrefix: Prefix | null;
+  collisions: string[];
+  onUpdateAdmitted: (body: DeviceUpdateBody) => void;
+  onUpdatePending: (body: { name?: string; lan_subnets?: string[] }) => void;
+};
 
-const DEFAULT_FRAME = { x: 0, y: 0, width: 520, height: 360 };
-const DEFAULT_HUB_OFFSET = { x: 20, y: 30 };
+const DEFAULT_FRAME = { x: 0, y: 0, width: 720, height: 480 };
+const DEFAULT_HUB_OFFSET = { x: 24, y: 36 };
+const CLIENT_W = 280;
+const CLIENT_H = 150;
+const HUB_W = 240;
+const HUB_H = 110;
+const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
+const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
+const COLS = 2;
+
+// Pull /16 ↔ /24 prefix length from a CIDR or empty.
+function prefixOf(cidr: string | null | undefined): Prefix | null {
+  if (!cidr) return null;
+  const m = /\/(\d{1,2})$/.exec(cidr);
+  if (!m) return null;
+  const p = Number(m[1]);
+  return p === 16 || p === 24 ? p : null;
+}
 
 // ── Node renderers ──────────────────────────────────────────────────────
 
 function FrameNode({ data, selected }: NodeProps<Node<FrameData>>) {
+  // The frame itself can be dragged by clicking on its border / title
+  // strip. The whole inner area is NOT a drag handle so children can
+  // be interacted with.
   return (
     <div
       className={cn(
-        "h-full w-full rounded-xl border-2 border-solid border-border bg-card/30 backdrop-blur-sm",
+        "h-full w-full rounded-xl border-2 border-solid border-border bg-card/30",
         selected && "border-primary",
       )}
     >
-      <div className="px-3 py-1 text-xs font-semibold text-muted-foreground">
+      <div className="drag-handle cursor-grab px-3 py-1 text-xs font-semibold text-muted-foreground">
         {data.net.name || "(unnamed)"}
       </div>
     </div>
@@ -68,16 +109,53 @@ function FrameNode({ data, selected }: NodeProps<Node<FrameData>>) {
 }
 
 function HubNode({ data }: NodeProps<Node<HubData>>) {
+  const { net } = data;
   return (
-    <div className="rounded-lg border-2 border-primary bg-card px-3 py-2 text-sm shadow-md">
+    <div className="rounded-lg border-2 border-primary bg-card text-sm shadow-md">
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
-      <div className="flex items-center gap-2">
-        <span className="font-mono text-xs">⬢</span>
-        <span className="font-semibold">{data.net.name || "(unnamed)"}</span>
+      {/* The whole header strip is the drag handle: a wide easy-to-
+          hit grab area, marked with a ⠿ icon for affordance. The
+          inputs below intentionally LACK the .drag-handle class so
+          clicks on them edit instead of starting a drag. */}
+      <div className="drag-handle flex cursor-grab items-center gap-2 border-b border-border bg-primary/5 px-3 py-2 active:cursor-grabbing">
+        <span className="text-muted-foreground">⠿</span>
+        <span className="font-semibold">{net.name || "(unnamed)"}</span>
+        <Badge variant="muted" className="ml-auto">
+          {data.deviceCount} dev
+        </Badge>
       </div>
-      <div className="mt-1 font-mono text-[10px] text-muted-foreground">
-        {data.net.bridge_ip || "no IP"} · {data.net.bridge_name}
+      <div className="space-y-1.5 px-3 py-2">
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">name</span>
+          <InlineEdit
+            value={net.name}
+            placeholder="(unnamed)"
+            onCommit={(v) => data.onRename(v)}
+          />
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">br IP</span>
+          <IpSegmentInput
+            value={net.bridge_ip}
+            onCommit={(ip) => data.onSetBridgeIp(ip)}
+            bridgePrefix={null}
+            allowPrefixToggle
+            placeholder="click to set"
+          />
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px]">
+          <span className="font-mono text-muted-foreground">{net.bridge_name}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => data.onPushRoutes()}
+            className="ml-auto h-6 px-2 text-[10px]"
+            title="Re-derive routes from LAN subnets and push"
+          >
+            push
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -85,30 +163,126 @@ function HubNode({ data }: NodeProps<Node<HubData>>) {
 
 function ClientNode({ data }: NodeProps<Node<ClientData>>) {
   const c = data.client;
+  const isPending = c.net_uuid === null;
   const status: "online" | "pending" | "offline" =
     c.online && c.admitted ? "online" : !c.admitted ? "pending" : "offline";
-  const variant =
+  const statusVariant =
     status === "online" ? "success" : status === "pending" ? "default" : "muted";
+
+  const setName = (name: string) => {
+    if (isPending) data.onUpdatePending({ name });
+    else data.onUpdateAdmitted({ name });
+  };
+  const setLan = (list: string[]) => {
+    if (isPending) data.onUpdatePending({ lan_subnets: list });
+    else data.onUpdateAdmitted({ lan_subnets: list });
+  };
+  const setIp = (ip: string) => data.onUpdateAdmitted({ tap_ip: ip });
+  const setAdmit = (next: boolean) => data.onUpdateAdmitted({ admitted: next });
+
   return (
     <div
       className={cn(
-        "rounded-lg border bg-card px-3 py-2 text-xs shadow-sm",
-        c.net_uuid ? "border-border" : "border-dashed border-amber-400",
+        "flex flex-col rounded-lg border bg-card text-xs shadow-sm",
+        isPending ? "border-dashed border-amber-400" : "border-border",
       )}
     >
       <Handle type="target" position={Position.Left} style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
-      <div className="flex items-center gap-1.5">
-        <Badge variant={variant}>{status}</Badge>
-        <span className="truncate font-medium">
-          {c.display_name || `client ${shortUuid(c.client_uuid)}…`}
+
+      {/* Top header strip = the drag handle. Wide and tall enough to
+          hit reliably. Inputs below intentionally lack `.drag-handle`
+          so they receive clicks for editing. */}
+      <div
+        className={cn(
+          "drag-handle flex cursor-grab items-center gap-1.5 rounded-t-lg border-b border-border px-2.5 py-1.5 active:cursor-grabbing",
+          isPending ? "bg-amber-50/60" : "bg-muted/30",
+        )}
+        title="drag to another network or out to detach"
+      >
+        <span className="text-muted-foreground">⠿</span>
+        <Badge variant={statusVariant}>{status}</Badge>
+        {!isPending && (
+          <Switch
+            checked={c.admitted}
+            onChange={setAdmit}
+            label={c.admitted ? "Kick this device" : "Admit this device"}
+          />
+        )}
+        <span
+          className="ml-auto font-mono text-[10px] text-muted-foreground"
+          title={c.client_uuid}
+        >
+          {shortUuid(c.client_uuid)}…
         </span>
       </div>
-      {c.tap_ip && (
-        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
-          {c.tap_ip}
+      <div className="flex flex-col gap-1.5 px-2.5 py-2">
+
+      {/* Name + IP row */}
+      <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-0.5">
+        <span className="text-[10px] text-muted-foreground">name</span>
+        <InlineEdit
+          value={c.display_name}
+          placeholder="click to name"
+          onCommit={setName}
+        />
+        {!isPending && (
+          <>
+            <span className="text-[10px] text-muted-foreground">IP</span>
+            <IpSegmentInput
+              value={c.tap_ip ?? ""}
+              bridgePrefix={data.bridgePrefix}
+              pinFromBridge={data.bridgeIp}
+              collisions={data.collisions}
+              onCommit={setIp}
+              placeholder="click to set"
+            />
+          </>
+        )}
+        <span className="text-[10px] text-muted-foreground">LAN</span>
+        <InlineEdit
+          value={c.lan_subnets.join(", ")}
+          placeholder="comma-separated CIDRs"
+          examplePlaceholder="e.g. 192.168.1.0/24"
+          inputClassName="w-full font-mono"
+          display={(v) =>
+            v === "" ? (
+              <span className="italic text-muted-foreground">click to set</span>
+            ) : (
+              <div className="flex flex-wrap gap-0.5">
+                {v.split(/\s*,\s*/).map((s) => (
+                  <Badge key={s} variant="outline" className="font-mono text-[9px]">
+                    {s}
+                  </Badge>
+                ))}
+              </div>
+            )
+          }
+          validate={(v) => {
+            if (v === "") return null;
+            for (const p of v.split(/\s*,\s*/)) {
+              if (!isCidr(p)) return `bad CIDR: ${p}`;
+            }
+            return null;
+          }}
+          onCommit={(v) => {
+            const list = v === "" ? [] : v.split(/\s*,\s*/).filter(Boolean);
+            setLan(list);
+          }}
+        />
+      </div>
+
+      {/* Throughput (only useful when admitted + online) */}
+      {!isPending && c.net_uuid && (
+        <div className="border-t border-border pt-1">
+          <ThroughputCell
+            network={c.net_uuid}
+            clientUuid={c.client_uuid}
+            online={c.online && c.admitted}
+          />
         </div>
       )}
+      </div>
     </div>
   );
 }
@@ -134,8 +308,6 @@ interface CtxMenu {
   y: number;
   kind: "hub" | "blank";
   netId?: string;
-  /** Flow-space position for "create here" so the new frame lands
-   *  under the cursor, not at the origin. */
   flowX?: number;
   flowY?: number;
 }
@@ -160,15 +332,44 @@ function UnifiedGraphInner() {
   const layout = useUiLayout();
 
   // ── Mutations ─────────────────────────────────────────────────────────
+  // Optimistic update on assign: write the client's new net_uuid into
+  // the cache the instant the user releases the drag, so the card
+  // doesn't snap back to the source frame while the round-trip
+  // settles. Also clear the saved position for that client so the
+  // re-derived node lands at the new frame's default slot rather than
+  // re-using a coordinate that meant something inside the old frame.
   const assignMut = useMutation({
     mutationFn: ({ cid, nid }: { cid: string; nid: string | null }) =>
       api.assignClient(cid, nid),
-    onSuccess: () => {
+    onMutate: async ({ cid, nid }) => {
+      await qc.cancelQueries({ queryKey: ["clients"] });
+      const prev = qc.getQueryData<Device[]>(["clients"]);
+      qc.setQueryData<Device[]>(["clients"], (old) =>
+        (old ?? []).map((d) =>
+          d.client_uuid === cid
+            ? { ...d, net_uuid: nid, admitted: false, tap_ip: null }
+            : d,
+        ),
+      );
+      // Reset saved position so the moved client gets a fresh default
+      // inside its new frame (or its free-node slot when detaching).
+      layout.update((p) => {
+        const positions = { ...p.graph.positions };
+        delete positions[`client:${cid}`];
+        return { ...p, graph: { ...p.graph, positions } };
+      });
+      return { prev };
+    },
+    onError: (e, _v, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["clients"], ctx.prev);
+      pushToast("error", `assign failed: ${fmtErr(e)}`);
+    },
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: ["clients"] });
       qc.invalidateQueries({ queryKey: ["networks"] });
     },
-    onError: (e) => pushToast("error", `assign failed: ${fmtErr(e)}`),
   });
+
   const deleteNetMut = useMutation({
     mutationFn: (nid: string) => api.deleteNetwork(nid),
     onSuccess: () => {
@@ -183,20 +384,69 @@ function UnifiedGraphInner() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["networks"] }),
     onError: (e) => pushToast("error", `create failed: ${fmtErr(e)}`),
   });
+  const renameNetMut = useMutation({
+    mutationFn: ({ nid, name }: { nid: string; name: string }) =>
+      api.renameNetwork(nid, name),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["networks"] }),
+    onError: (e) => pushToast("error", `rename failed: ${fmtErr(e)}`),
+  });
+  const setBridgeIpMut = useMutation({
+    mutationFn: ({ nid, ip }: { nid: string; ip: string }) =>
+      api.patchNetwork(nid, { bridge_ip: ip }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["networks"] });
+      qc.invalidateQueries({ queryKey: ["clients"] });
+    },
+    onError: (e) => pushToast("error", `bridge IP failed: ${fmtErr(e)}`),
+  });
+  const updateAdmittedMut = useMutation({
+    mutationFn: ({
+      nid,
+      cid,
+      body,
+    }: {
+      nid: string;
+      cid: string;
+      body: DeviceUpdateBody;
+    }) => api.updateDevice(nid, cid, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["clients"] }),
+    onError: (e) => pushToast("error", `update failed: ${fmtErr(e)}`),
+  });
+  const patchPendingMut = useMutation({
+    mutationFn: ({
+      cid,
+      body,
+    }: {
+      cid: string;
+      body: { name?: string; lan_subnets?: string[] };
+    }) => api.patchPendingClient(cid, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["clients"] }),
+    onError: (e) => pushToast("error", `update failed: ${fmtErr(e)}`),
+  });
+  const pushRoutesMut = useMutation({
+    mutationFn: (nid: string) => api.pushRoutes(nid),
+    onSuccess: (r) =>
+      pushToast("success", `pushed ${r.routes.length} route(s) to ${r.count} client(s)`),
+    onError: (e) => pushToast("error", `push failed: ${fmtErr(e)}`),
+  });
 
   // ── Derive nodes/edges from data + persisted positions ────────────────
-  const { nodes, edges } = useMemo(() => {
+  const derived = useMemo(() => {
     const ns: Node[] = [];
     const es: Edge[] = [];
     const positions = layout.layout.graph.positions;
     const frames = layout.layout.graph.frames;
 
-    // Fan unsaved frames out horizontally so a fresh deploy with N
-    // networks doesn't stack them all at (0,0). Vertical wrap at 2
-    // per row keeps them above the fold on a typical viewport.
-    const FRAME_GAP_X = DEFAULT_FRAME.width + 80;
-    const FRAME_GAP_Y = DEFAULT_FRAME.height + 80;
-    const COLS = 2;
+    // Devices grouped by net_uuid for quick lookup.
+    const byNet = new Map<string, Device[]>();
+    for (const c of clients) {
+      if (c.net_uuid) {
+        const list = byNet.get(c.net_uuid) ?? [];
+        list.push(c);
+        byNet.set(c.net_uuid, list);
+      }
+    }
+
     networks.forEach((n, i) => {
       const f = frames[n.id] ?? {
         x: (i % COLS) * FRAME_GAP_X,
@@ -210,46 +460,83 @@ function UnifiedGraphInner() {
         data: { net: n },
         position: { x: f.x, y: f.y },
         style: { width: f.width, height: f.height, zIndex: -1 },
-        // The frame is a draggable container; clients are children
-        // and get clipped to it.
-        draggable: true,
+        // Frame uses its title strip as the drag handle so clients
+        // can be clicked / dragged independently.
+        dragHandle: ".drag-handle",
       });
       const hubKey = `hub:${n.id}`;
       const hubPos = positions[hubKey] ?? DEFAULT_HUB_OFFSET;
+      const inThis = byNet.get(n.id) ?? [];
       ns.push({
         id: hubKey,
         type: "hub",
-        data: { net: n, onDelete: () => deleteNetMut.mutate(n.id) },
+        data: {
+          net: n,
+          deviceCount: inThis.length,
+          onRename: (name: string) => renameNetMut.mutate({ nid: n.id, name }),
+          onSetBridgeIp: (ip: string) =>
+            setBridgeIpMut.mutate({ nid: n.id, ip }),
+          onDelete: () => deleteNetMut.mutate(n.id),
+          onPushRoutes: () => pushRoutesMut.mutate(n.id),
+        },
         position: hubPos,
         parentId: `frame:${n.id}`,
+        // Hub stays inside its frame; clients do NOT (so they can be
+        // dragged across to other frames — see #2 in the bug list).
         extent: "parent",
+        dragHandle: ".drag-handle",
+        style: { width: HUB_W, height: HUB_H },
       });
     });
 
-    // Per-frame counter so each network's clients fan vertically
-    // inside their own frame instead of stacking on the hub card.
-    // React Flow v12 hides child nodes (`visibility: hidden`) until
-    // they're measured — supplying explicit `width`/`height` via the
-    // node's `style` skips that delay so pending clients appear on
-    // first paint instead of waiting on a ResizeObserver tick.
-    const CLIENT_W = 220;
-    const CLIENT_H = 60;
     const inFrameSeq = new Map<string, number>();
     let freeStackY = 20;
     for (const c of clients) {
       const ckey = `client:${c.client_uuid}`;
       const stored = positions[ckey];
+      const net =
+        c.net_uuid !== null ? networks.find((n) => n.id === c.net_uuid) : null;
+      const bridgePrefix = prefixOf(net?.bridge_ip);
+      const collisions: string[] = c.net_uuid
+        ? (byNet.get(c.net_uuid) ?? [])
+            .filter((d) => d.client_uuid !== c.client_uuid && d.tap_ip)
+            .map((d) => d.tap_ip as string)
+        : [];
+
+      const sharedData: ClientData = {
+        client: c,
+        bridgeIp: net?.bridge_ip ?? "",
+        bridgePrefix,
+        collisions,
+        onUpdateAdmitted: (body) => {
+          if (c.net_uuid) {
+            updateAdmittedMut.mutate({
+              nid: c.net_uuid,
+              cid: c.client_uuid,
+              body,
+            });
+          }
+        },
+        onUpdatePending: (body) =>
+          patchPendingMut.mutate({ cid: c.client_uuid, body }),
+      };
+
       if (c.net_uuid) {
         const seq = inFrameSeq.get(c.net_uuid) ?? 0;
         inFrameSeq.set(c.net_uuid, seq + 1);
-        const pos = stored ?? { x: 220, y: 100 + seq * (CLIENT_H + 10) };
+        const pos = stored ?? {
+          x: HUB_W + 60,
+          y: 36 + seq * (CLIENT_H + 16),
+        };
         ns.push({
           id: ckey,
           type: "client",
-          data: { client: c },
+          data: sharedData,
           position: pos,
           parentId: `frame:${c.net_uuid}`,
-          extent: "parent",
+          // No `extent: "parent"` — clients must be draggable across
+          // frame boundaries to trigger assign_client on drop.
+          dragHandle: ".drag-handle",
           style: { width: CLIENT_W, height: CLIENT_H },
         });
         if (c.admitted) {
@@ -261,29 +548,46 @@ function UnifiedGraphInner() {
           });
         }
       } else {
-        // Free-floating; sit to the right of the rightmost frame.
         const rightEdge =
           (Math.min(networks.length, COLS) - 1) * FRAME_GAP_X +
           DEFAULT_FRAME.width +
           80;
         const pos = stored ?? { x: rightEdge, y: freeStackY };
-        freeStackY += CLIENT_H + 10;
+        freeStackY += CLIENT_H + 16;
         ns.push({
           id: ckey,
           type: "client",
-          data: { client: c },
+          data: sharedData,
           position: pos,
+          dragHandle: ".drag-handle",
           style: { width: CLIENT_W, height: CLIENT_H },
         });
       }
     }
     return { nodes: ns, edges: es };
-  }, [networks, clients, layout.layout, deleteNetMut]);
+    // The mutations are stable (TanStack Query memoises them); we
+    // intentionally exclude them from deps so the memo only recomputes
+    // when actual data changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [networks, clients, layout.layout]);
 
-  // ── Drag → assign_client ──────────────────────────────────────────────
+  // React Flow's controlled state. Without these, position changes
+  // during a drag don't propagate to the DOM — the user only sees
+  // the final position on release (issue #1 in the bug list).
+  const [rfNodes, setRfNodes, onNodesChange] = useNodesState<Node>([]);
+  const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState<Edge>([]);
+
+  // Re-sync when underlying data or the persisted layout changes.
+  // Drags don't trigger this (they don't change either input until
+  // onNodeDragStop runs), so the dragged node tracks the cursor.
+  useEffect(() => {
+    setRfNodes(derived.nodes);
+    setRfEdges(derived.edges);
+  }, [derived, setRfNodes, setRfEdges]);
+
+  // ── Drag end → persist position + cross-frame assignment ──────────────
   const onNodeDragStop = useCallback(
     (_e: unknown, node: Node) => {
-      // Persist position right away (debounced inside useUiLayout).
       if (node.type === "frame") {
         const nid = node.id.replace(/^frame:/, "");
         layout.update((prev) => ({
@@ -303,51 +607,60 @@ function UnifiedGraphInner() {
         }));
         return;
       }
-      // Client / hub move — store position by node id.
-      layout.update((prev) => ({
-        ...prev,
-        graph: {
-          ...prev.graph,
-          positions: {
-            ...prev.graph.positions,
-            [node.id]: { x: node.position.x, y: node.position.y },
-          },
-        },
-      }));
 
-      if (node.type !== "client") return;
+      if (node.type !== "client") {
+        // Hub move — just remember its (relative-to-frame) position.
+        layout.update((prev) => ({
+          ...prev,
+          graph: {
+            ...prev.graph,
+            positions: {
+              ...prev.graph.positions,
+              [node.id]: { x: node.position.x, y: node.position.y },
+            },
+          },
+        }));
+        return;
+      }
+
+      // Client move — figure out which frame (if any) we ended up in.
       const cuid = node.id.replace(/^client:/, "");
       const client = clients.find((c) => c.client_uuid === cuid);
       if (!client) return;
 
-      // Find the frame node we're physically inside, if any.
-      // `flow.getIntersectingNodes` returns frames + other clients;
-      // filter to frames.
-      const intersect = flow.getIntersectingNodes(node).filter(
-        (n) => n.type === "frame",
-      );
-      const targetFrame = intersect[0];
+      const targetFrame = flow
+        .getIntersectingNodes(node)
+        .find((n) => n.type === "frame");
       const targetNid = targetFrame
         ? targetFrame.id.replace(/^frame:/, "")
         : null;
       const currentNid = client.net_uuid;
-      if (currentNid === targetNid) return; // no-op (B3)
+
+      if (currentNid === targetNid) {
+        // Same frame (or both null) — just save the new position.
+        layout.update((prev) => ({
+          ...prev,
+          graph: {
+            ...prev.graph,
+            positions: {
+              ...prev.graph.positions,
+              [node.id]: { x: node.position.x, y: node.position.y },
+            },
+          },
+        }));
+        return;
+      }
+      // Cross-frame move (or detach to free) — fire assign_client; the
+      // mutation's onMutate clears the saved position so the new frame
+      // can lay it out fresh.
       assignMut.mutate({ cid: cuid, nid: targetNid });
     },
     [clients, flow, layout, assignMut],
   );
 
-  // React Flow change handler — kept minimal; we drive most state
-  // through the queries.
-  const onNodesChange = useCallback((_changes: NodeChange[]) => {
-    /* React Flow tracks node selection internally; we don't need to
-     * mirror it. Position changes flow through onNodeDragStop. */
-  }, []);
-
   // ── Right-click menus ─────────────────────────────────────────────────
   const [menu, setMenu] = useState<CtxMenu | null>(null);
   const closeMenu = () => setMenu(null);
-  // Close on any global click.
   useEffect(() => {
     if (!menu) return;
     const fn = () => closeMenu();
@@ -388,26 +701,18 @@ function UnifiedGraphInner() {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    // Two-layer wrapper: the OUTER one is the flex item that takes
-    // its height from the page's flex-col chain; the INNER one is
-    // absolutely positioned with `inset: 0` so React Flow gets a
-    // hard-pixel parent (its `.react-flow { width:100%; height:100% }`
-    // CSS doesn't reliably resolve against a flex-grow-only ancestor —
-    // browsers compute parent.height but don't always treat it as
-    // "explicit" for percentage-height resolution, leaving the
-    // canvas with height=0).
     <div ref={wrapperRef} className="relative min-h-0 w-full flex-1">
       <div className="absolute inset-0">
         <ReactFlow
-          nodes={nodes}
-          edges={edges}
+          nodes={rfNodes}
+          edges={rfEdges}
           nodeTypes={NODE_TYPES}
           onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeContextMenu={onNodeContextMenu}
           onPaneContextMenu={onPaneContextMenu}
           nodesConnectable={false}
-          // Allow children to be dragged outside their parent? No — extent='parent' clips.
           fitView={networks.length > 0}
           proOptions={{ hideAttribution: true }}
         >
@@ -445,9 +750,6 @@ function UnifiedGraphInner() {
                       if (!name?.trim()) return;
                       createNetMut.mutate(name.trim(), {
                         onSuccess: (resp) => {
-                          // Pre-place the frame at the right-click
-                          // position so the new card lands where the
-                          // user expected.
                           if (
                             menu.flowX !== undefined &&
                             menu.flowY !== undefined
