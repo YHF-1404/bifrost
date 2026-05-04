@@ -30,7 +30,7 @@ pub use error::CoreError;
 pub use events::{HubEvent, MetricsSample, RouteRow};
 pub use hub::{
     AssignClientResult, ConnLink, DevicePushResult, DeviceSetResult, DeviceUpdate, Hub, HubCmd,
-    HubHandle, HubSnapshot, PendingInfo, SessionInfo,
+    HubHandle, HubSnapshot, PendingInfo, SessionInfo, SetNetBridgeIpResult,
 };
 pub use ids::{ConnId, SessionId};
 pub use session::{

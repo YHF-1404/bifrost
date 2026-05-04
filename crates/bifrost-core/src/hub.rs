@@ -115,6 +115,18 @@ pub enum DeviceSetResult {
     Conflict { msg: String },
 }
 
+/// Outcome of a [`HubHandle::set_net_bridge_ip`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetNetBridgeIpResult {
+    /// Update applied; full updated network record returned.
+    Ok(NetRecord),
+    /// `net_uuid` is unknown.
+    NotFound,
+    /// `bridge_ip` is malformed or has an unsupported prefix (Phase 3
+    /// constrains to `/16` or `/24` only).
+    Invalid(String),
+}
+
 /// Outcome of a [`HubHandle::assign_client`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignClientResult {
@@ -172,6 +184,17 @@ pub enum HubCmd {
         name: String,
         ack: oneshot::Sender<bool>,
     },
+    /// **Phase 3.** Update a network's bridge IP/CIDR. Empty string
+    /// clears it (pure-L2 mode). Only `/16` and `/24` prefixes are
+    /// accepted. When the prefix length changes, every admitted
+    /// client's `tap_ip` in this network has its prefix rewritten in
+    /// place (address octets unchanged) and a fresh `SetIp` is pushed
+    /// to live sessions.
+    SetNetBridgeIp {
+        net_uuid: Uuid,
+        bridge_ip: String,
+        ack: oneshot::Sender<SetNetBridgeIpResult>,
+    },
     /// Cascade-delete a network and every approved-client row in it.
     /// Active sessions are killed; pending conns are dropped.
     DeleteNet {
@@ -207,6 +230,14 @@ pub enum HubCmd {
         client_uuid: Uuid,
         net_uuid: Option<Uuid>,
         ack: oneshot::Sender<AssignClientResult>,
+    },
+    /// **Phase 3.** Edit metadata of a pending (unassigned) client.
+    /// Returns `None` if the client isn't in the pending pool.
+    PatchPendingClient {
+        client_uuid: Uuid,
+        name: Option<String>,
+        lan_subnets: Option<Vec<String>>,
+        ack: oneshot::Sender<Option<DeviceEntry>>,
     },
     BroadcastText {
         msg: String,
@@ -365,6 +396,55 @@ impl HubHandle {
             return DeviceSetResult::NotFound;
         }
         rx.await.unwrap_or(DeviceSetResult::NotFound)
+    }
+
+    /// **Phase 3.** Update a network's bridge IP/CIDR.
+    pub async fn set_net_bridge_ip(
+        &self,
+        net_uuid: Uuid,
+        bridge_ip: String,
+    ) -> SetNetBridgeIpResult {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(HubCmd::SetNetBridgeIp {
+                net_uuid,
+                bridge_ip,
+                ack: tx,
+            })
+            .await
+            .is_err()
+        {
+            return SetNetBridgeIpResult::NotFound;
+        }
+        rx.await.unwrap_or(SetNetBridgeIpResult::NotFound)
+    }
+
+    /// **Phase 3.** Edit display_name and/or lan_subnets of a pending
+    /// (unassigned) client. Returns the post-update [`DeviceEntry`],
+    /// or `None` if the client isn't in the pending pool. For admitted
+    /// clients use [`HubHandle::device_set`] instead.
+    pub async fn patch_pending_client(
+        &self,
+        client_uuid: Uuid,
+        name: Option<String>,
+        lan_subnets: Option<Vec<String>>,
+    ) -> Option<DeviceEntry> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(HubCmd::PatchPendingClient {
+                client_uuid,
+                name,
+                lan_subnets,
+                ack: tx,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     /// **Phase 3.** Move a client into a network (or detach it to the
@@ -760,6 +840,20 @@ impl Hub {
                 net_uuid,
                 ack,
             } => self.handle_assign_client(client_uuid, net_uuid, ack).await,
+            HubCmd::PatchPendingClient {
+                client_uuid,
+                name,
+                lan_subnets,
+                ack,
+            } => {
+                self.handle_patch_pending_client(client_uuid, name, lan_subnets, ack)
+                    .await
+            }
+            HubCmd::SetNetBridgeIp {
+                net_uuid,
+                bridge_ip,
+                ack,
+            } => self.handle_set_net_bridge_ip(net_uuid, bridge_ip, ack).await,
             HubCmd::BroadcastText { msg, ack } => self.handle_broadcast_text(msg, ack).await,
             HubCmd::BroadcastFile { name, data, ack } => {
                 self.handle_broadcast_file(name, data, ack).await
@@ -1304,6 +1398,105 @@ impl Hub {
         let _ = ack.send(uuid);
     }
 
+    async fn handle_set_net_bridge_ip(
+        &mut self,
+        net_uuid: Uuid,
+        new_ip: String,
+        ack: oneshot::Sender<SetNetBridgeIpResult>,
+    ) {
+        // Validate.
+        let new_prefix = if new_ip.is_empty() {
+            None
+        } else {
+            match new_ip.parse::<IpNet>() {
+                Ok(net) => match net.prefix_len() {
+                    16 | 24 => Some(net.prefix_len()),
+                    other => {
+                        let _ = ack.send(SetNetBridgeIpResult::Invalid(format!(
+                            "prefix /{other} not supported (use /16 or /24)"
+                        )));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = ack.send(SetNetBridgeIpResult::Invalid(e.to_string()));
+                    return;
+                }
+            }
+        };
+
+        let Some(rec) = self.cfg.networks.iter_mut().find(|n| n.uuid == net_uuid) else {
+            let _ = ack.send(SetNetBridgeIpResult::NotFound);
+            return;
+        };
+
+        let old_ip = rec.bridge_ip.clone();
+        let old_prefix = old_ip.parse::<IpNet>().ok().map(|n| n.prefix_len());
+        rec.bridge_ip = new_ip.clone();
+        let updated_rec = rec.clone();
+
+        // Phase 3 — when only the prefix changed (e.g. /24 → /16),
+        // rewrite each client's tap_ip to the new prefix length. The
+        // address octets are kept; this is the "auto-rewrite" promise
+        // from the spec (B5).
+        let prefix_changed = match (old_prefix, new_prefix) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let mut sessions_to_notify: Vec<(Uuid, String)> = Vec::new();
+        if prefix_changed {
+            let new_p = new_prefix.expect("prefix_changed implies Some");
+            for ac in self
+                .cfg
+                .approved_clients
+                .iter_mut()
+                .filter(|a| a.net_uuid == net_uuid && !a.tap_ip.is_empty())
+            {
+                if let Ok(parsed) = ac.tap_ip.parse::<IpNet>() {
+                    let rewritten = format!("{}/{}", parsed.addr(), new_p);
+                    ac.tap_ip = rewritten.clone();
+                    sessions_to_notify.push((ac.client_uuid, rewritten));
+                }
+            }
+        }
+
+        self.persist().await;
+
+        // Push the new IP down to any live session whose tap_ip we
+        // just rewrote.
+        for (cuid, ip) in &sessions_to_notify {
+            if let Some(s) = self.sessions.get_mut(&(*cuid, net_uuid)) {
+                s.tap_ip = Some(ip.clone());
+                if let Some(conn_id) = s.bound_conn {
+                    if let Some(c) = self.conns.get(&conn_id) {
+                        let _ = c
+                            .link
+                            .frame_tx
+                            .send(Frame::SetIp {
+                                ip: Some(ip.clone()),
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Routes are derived from tap_ip — re-sync now that prefixes
+        // shifted.
+        if prefix_changed {
+            self.sync_local_routes().await;
+        }
+
+        info!(%net_uuid, old=%old_ip, new=%new_ip, "bridge_ip updated");
+        // Reuse NetworkChanged for both rename and bridge-ip updates so
+        // the WebUI just refreshes the network row.
+        self.emit(HubEvent::NetworkChanged {
+            network: net_uuid,
+            name: updated_rec.name.clone(),
+        });
+        let _ = ack.send(SetNetBridgeIpResult::Ok(updated_rec));
+    }
+
     async fn handle_rename_net(
         &mut self,
         net_uuid: Uuid,
@@ -1575,6 +1768,60 @@ impl Hub {
             device: entry.clone(),
         });
         let _ = ack.send(AssignClientResult::Ok(entry));
+    }
+
+    async fn handle_patch_pending_client(
+        &mut self,
+        client_uuid: Uuid,
+        name: Option<String>,
+        lan_subnets: Option<Vec<String>>,
+        ack: oneshot::Sender<Option<DeviceEntry>>,
+    ) {
+        // Validate lan_subnets first (cheap, do it before mutating).
+        if let Some(subs) = lan_subnets.as_deref() {
+            for s in subs {
+                if IpNet::from_str(s).is_err() {
+                    let _ = ack.send(None);
+                    return;
+                }
+            }
+        }
+
+        let Some(row) = self
+            .cfg
+            .pending_clients
+            .iter_mut()
+            .find(|p| p.client_uuid == client_uuid)
+        else {
+            let _ = ack.send(None);
+            return;
+        };
+        if let Some(n) = name {
+            row.display_name = n;
+        }
+        if let Some(subs) = lan_subnets {
+            row.lan_subnets = subs;
+        }
+        let display_name = row.display_name.clone();
+        let lan_clone = row.lan_subnets.clone();
+        self.persist().await;
+
+        let entry = DeviceEntry {
+            client_uuid,
+            net_uuid: None,
+            display_name,
+            admitted: false,
+            tap_ip: None,
+            lan_subnets: lan_clone,
+            online: self.conn_for_client(client_uuid).is_some(),
+            sid: None,
+            tap_name: None,
+        };
+        self.emit(HubEvent::DeviceChanged {
+            network: Uuid::nil(),
+            device: entry.clone(),
+        });
+        let _ = ack.send(Some(entry));
     }
 
     /// Build a DeviceEntry view of the client's current state, regardless

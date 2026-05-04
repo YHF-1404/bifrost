@@ -3,13 +3,16 @@
 //! ```text
 //!   GET    /networks
 //!   POST   /networks
-//!   PATCH  /networks/:nid
-//!   DELETE /networks/:nid
+//!   PATCH  /networks/:nid                       (name and/or bridge_ip)
+//!   DELETE /networks/:nid                       (Phase 3: detaches devices to pending)
 //!   GET    /networks/:nid/devices
 //!   PATCH  /networks/:nid/devices/:cid
 //!   POST   /networks/:nid/routes/push
 //!   GET    /networks/:nid/layout
 //!   PUT    /networks/:nid/layout
+//!   GET    /clients                             (Phase 3: pending + admitted)
+//!   PATCH  /clients/:cid                        (Phase 3: pending edits)
+//!   POST   /clients/:cid/assign                 (Phase 3: drag-to-assign)
 //! ```
 //!
 //! Admit / kick are not separate endpoints — they're a field on PATCH:
@@ -26,7 +29,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use bifrost_core::atomic_write::write_atomic;
-use bifrost_core::{DeviceSetResult, DeviceUpdate};
+use bifrost_core::{
+    AssignClientResult, DeviceSetResult, DeviceUpdate, SetNetBridgeIpResult,
+};
 use bifrost_proto::admin::DeviceEntry;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -38,7 +43,7 @@ pub fn router() -> Router<AppState> {
         .route("/networks", get(list_networks).post(create_network))
         .route(
             "/networks/:nid",
-            patch(rename_network).delete(delete_network),
+            patch(patch_network).delete(delete_network),
         )
         .route("/networks/:nid/devices", get(list_devices))
         .route("/networks/:nid/devices/:cid", patch(patch_device))
@@ -47,12 +52,16 @@ pub fn router() -> Router<AppState> {
             "/networks/:nid/layout",
             get(get_layout).put(put_layout),
         )
+        .route("/clients", get(list_clients))
+        .route("/clients/:cid", patch(patch_client))
+        .route("/clients/:cid/assign", post(assign_client))
 }
 
 // ── GET handlers (unchanged from 1.1) ─────────────────────────────────────
 
-/// JSON view of one virtual network. `bridge_*` are global in v0.1
-/// (Phase 2 will give each network its own bridge).
+/// JSON view of one virtual network. `bridge_*` are per-network as of
+/// Phase 2.0; the WebUI uses `bridge_ip` to render the IP-segment
+/// picker and to derive the prefix constraint for client TAP IPs.
 #[derive(Debug, Serialize)]
 struct Network {
     id: Uuid,
@@ -70,21 +79,19 @@ async fn list_networks(State(state): State<AppState>) -> Response {
     };
     let devices = state.hub.device_list(None).await;
 
-    // 1.x will plumb bridge_name/bridge_ip through HubHandle.
-    let bridge_name = String::new();
-    let bridge_ip = String::new();
-
     let nets: Vec<Network> = snap
         .networks
         .iter()
         .map(|n| {
-            let in_net: Vec<&DeviceEntry> =
-                devices.iter().filter(|d| d.net_uuid == Some(n.uuid)).collect();
+            let in_net: Vec<&DeviceEntry> = devices
+                .iter()
+                .filter(|d| d.net_uuid == Some(n.uuid))
+                .collect();
             Network {
                 id: n.uuid,
                 name: n.name.clone(),
-                bridge_name: bridge_name.clone(),
-                bridge_ip: bridge_ip.clone(),
+                bridge_name: n.bridge_name.clone(),
+                bridge_ip: n.bridge_ip.clone(),
                 device_count: in_net.len(),
                 online_count: in_net.iter().filter(|d| d.online).count(),
             }
@@ -126,27 +133,56 @@ async fn create_network(
     .into_response()
 }
 
-/// `PATCH /api/networks/:nid` body — `{ "name": "..." }`. Only the
-/// name is renameable for now; other config fields are config-file
-/// territory.
+/// `PATCH /api/networks/:nid` body. Either or both of `name` and
+/// `bridge_ip` may be provided. Empty `bridge_ip` clears it; non-empty
+/// must be a `/16` or `/24` CIDR (Phase 3 constraint, B4).
 #[derive(Debug, Deserialize)]
-struct RenameNetworkBody {
-    name: String,
+struct PatchNetworkBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    bridge_ip: Option<String>,
 }
 
-async fn rename_network(
+async fn patch_network(
     State(state): State<AppState>,
     Path(nid): Path<Uuid>,
-    Json(body): Json<RenameNetworkBody>,
+    Json(body): Json<PatchNetworkBody>,
 ) -> Response {
-    let trimmed = body.name.trim().to_string();
-    if trimmed.is_empty() {
-        return bad_request("name is required");
-    }
-    if !state.hub.rename_net(nid, trimmed.clone()).await {
+    if !network_exists(&state, nid).await {
         return not_found("unknown network");
     }
-    Json(serde_json::json!({ "id": nid, "name": trimmed })).into_response()
+    if let Some(name) = body.name.as_ref() {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return bad_request("name is required");
+        }
+        if !state.hub.rename_net(nid, trimmed).await {
+            return not_found("unknown network");
+        }
+    }
+    if let Some(ip) = body.bridge_ip {
+        match state.hub.set_net_bridge_ip(nid, ip).await {
+            SetNetBridgeIpResult::Ok(_) => {}
+            SetNetBridgeIpResult::NotFound => return not_found("unknown network"),
+            SetNetBridgeIpResult::Invalid(msg) => return bad_request(&msg),
+        }
+    }
+    // Return the freshly-listed network so the caller sees the merged
+    // post-patch view.
+    let Some(snap) = state.hub.list().await else {
+        return service_unavailable("hub gone");
+    };
+    let Some(rec) = snap.networks.iter().find(|n| n.uuid == nid) else {
+        return not_found("unknown network");
+    };
+    Json(serde_json::json!({
+        "id": rec.uuid,
+        "name": rec.name,
+        "bridge_name": rec.bridge_name,
+        "bridge_ip": rec.bridge_ip,
+    }))
+    .into_response()
 }
 
 /// `DELETE /api/networks/:nid` — cascade-delete the network and every
@@ -248,6 +284,97 @@ async fn push_routes(State(state): State<AppState>, Path(nid): Path<Uuid>) -> Re
             .collect(),
     })
     .into_response()
+}
+
+// ── Phase 3: cross-network client endpoints ──────────────────────────────
+
+/// `GET /api/clients` — list every known client in one shot, both the
+/// network-assigned ones (admitted or pending-admit) and the unassigned
+/// ones in the pending pool. Used by the unified WebUI to populate
+/// both panes from a single fetch.
+async fn list_clients(State(state): State<AppState>) -> Response {
+    let devices = state.hub.device_list(None).await;
+    Json(devices).into_response()
+}
+
+/// `PATCH /api/clients/:cid` body. Used by the WebUI to edit metadata
+/// of a pending (unassigned) client — name and lan_subnets only;
+/// admitted/tap_ip are meaningless without a network. For admitted
+/// clients use `PATCH /api/networks/:nid/devices/:cid`.
+#[derive(Debug, Deserialize)]
+struct PatchClientBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    lan_subnets: Option<Vec<String>>,
+}
+
+async fn patch_client(
+    State(state): State<AppState>,
+    Path(cid): Path<Uuid>,
+    Json(body): Json<PatchClientBody>,
+) -> Response {
+    // Find the client. If admitted, route to device_set; if pending,
+    // route to assign_client(same net=None) which preserves the row but
+    // updates its fields. Simplest path: for an admitted client we
+    // delegate to the existing device_set handler.
+    let devices = state.hub.device_list(None).await;
+    let Some(d) = devices.iter().find(|d| d.client_uuid == cid) else {
+        return not_found("unknown client");
+    };
+
+    match d.net_uuid {
+        Some(nid) => {
+            let update = DeviceUpdate {
+                name: body.name,
+                admitted: None,
+                tap_ip: None,
+                lan_subnets: body.lan_subnets,
+            };
+            match state.hub.device_set(cid, nid, update).await {
+                DeviceSetResult::Ok(d) => Json(d).into_response(),
+                DeviceSetResult::NotFound => not_found("client gone"),
+                DeviceSetResult::InvalidIp => bad_request("invalid IP/CIDR"),
+                DeviceSetResult::Conflict { msg } => conflict(msg),
+            }
+        }
+        None => {
+            // Pending client — patch the pending_clients row directly.
+            // Hub doesn't expose a dedicated command for this (we don't
+            // need a whole new HubCmd for two scalar fields), so we
+            // round-trip through assign_client(None) after we mutate.
+            // Actually the cleanest path: emit a new dedicated command.
+            match state
+                .hub
+                .patch_pending_client(cid, body.name, body.lan_subnets)
+                .await
+            {
+                Some(d) => Json(d).into_response(),
+                None => not_found("client gone"),
+            }
+        }
+    }
+}
+
+/// `POST /api/clients/:cid/assign` body. `net_uuid: null` detaches the
+/// client to the pending pool; `Some(nid)` assigns it to that network
+/// (admitted=false, tap_ip cleared, per spec B3).
+#[derive(Debug, Deserialize)]
+struct AssignClientBody {
+    #[serde(default)]
+    net_uuid: Option<Uuid>,
+}
+
+async fn assign_client(
+    State(state): State<AppState>,
+    Path(cid): Path<Uuid>,
+    Json(body): Json<AssignClientBody>,
+) -> Response {
+    match state.hub.assign_client(cid, body.net_uuid).await {
+        AssignClientResult::Ok(d) => Json(d).into_response(),
+        AssignClientResult::NotFound => not_found("unknown client"),
+        AssignClientResult::UnknownNetwork => bad_request("unknown network"),
+    }
 }
 
 // ── Graph layout (per-network UI state) ───────────────────────────────────
