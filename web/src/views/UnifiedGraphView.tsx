@@ -362,7 +362,12 @@ function UnifiedGraphInner() {
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div ref={wrapperRef} className="relative flex min-h-0 flex-1">
+    // The wrapper is BLOCK (not flex): React Flow's CSS sets
+    // `width: 100%; height: 100%`, but only when the parent has a
+    // resolvable height. `flex-1 min-h-0` does that in the
+    // outer flex-col without the row-flex hazard that used to
+    // collapse the ReactFlow child to width=0.
+    <div ref={wrapperRef} className="relative min-h-0 w-full flex-1">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -375,6 +380,7 @@ function UnifiedGraphInner() {
         // Allow children to be dragged outside their parent? No — extent='parent' clips.
         fitView={networks.length > 0}
         proOptions={{ hideAttribution: true }}
+        style={{ width: "100%", height: "100%" }}
       >
         <Background />
         <Controls position="bottom-right" />

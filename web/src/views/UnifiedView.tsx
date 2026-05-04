@@ -25,19 +25,27 @@
 
 import {
   DndContext,
+  DragOverlay,
   PointerSensor,
   useDraggable,
   useDroppable,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ImperativePanelHandle,
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+} from "react-resizable-panels";
 import { api, type DeviceUpdateBody } from "@/lib/api";
 import { fmtErr, isCidr, shortUuid } from "@/lib/format";
 import { pushToast } from "@/lib/toast";
+import { useWSStatus } from "@/lib/useWS";
 import type { Device, Network } from "@/lib/types";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -51,8 +59,7 @@ import { useUiLayout } from "@/lib/useUiLayout";
 import { cn } from "@/lib/cn";
 import { UnifiedGraphView } from "./UnifiedGraphView";
 
-const DEFAULT_LEFT_RATIO = 33; // 1/3, %
-const COLLAPSE_KEY = "bifrost.left-collapsed";
+const DEFAULT_LEFT_RATIO = 0.33; // 1/3
 const VIEW_MODE_KEY = "bifrost.viewMode";
 
 type ViewMode = "table" | "graph";
@@ -96,18 +103,21 @@ export function UnifiedView() {
 
   // ── Layout state ──────────────────────────────────────────────────────
   const layout = useUiLayout();
-  const [leftCollapsed, setLeftCollapsed] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(COLLAPSE_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
-  // Sync collapse state from persisted layout once it loads.
+  // Phase 3 — use react-resizable-panels' Imperative collapse handle.
+  // The Panel stays mounted across collapse/expand so its dragged
+  // size survives a round-trip (fixes the "expand width drifts every
+  // click" issue from Phase 3.0e).
+  const leftPanelRef = useRef<ImperativePanelHandle | null>(null);
+  const [leftCollapsed, setLeftCollapsed] = useState<boolean>(false);
+  // Sync collapse state from persisted layout the first time it loads.
+  const persistedCollapseApplied = useRef(false);
   useEffect(() => {
-    if (layout.isLoading) return;
-    if (typeof layout.layout.table.left_collapsed === "boolean") {
-      setLeftCollapsed(layout.layout.table.left_collapsed);
+    if (layout.isLoading || persistedCollapseApplied.current) return;
+    persistedCollapseApplied.current = true;
+    const persisted = layout.layout.table.left_collapsed === true;
+    setLeftCollapsed(persisted);
+    if (persisted) {
+      leftPanelRef.current?.collapse();
     }
   }, [layout.isLoading, layout.layout.table.left_collapsed]);
 
@@ -128,12 +138,40 @@ export function UnifiedView() {
   }, [viewMode]);
 
   // ── Mutations ─────────────────────────────────────────────────────────
+  // Phase 3 — assign is the high-frequency drag-end mutation, so it
+  // gets full optimistic-update treatment: we rewrite the cached
+  // `clients` array immediately in `onMutate` so the dragged card
+  // appears in its new home the instant the user drops it (instead
+  // of bouncing back to the source pane until the round-trip lands).
   const assignMut = useMutation({
     mutationFn: ({ cid, nid }: { cid: string; nid: string | null }) =>
       api.assignClient(cid, nid),
-    onSuccess: (_d, vars) => {
+    onMutate: async ({ cid, nid }) => {
+      await qc.cancelQueries({ queryKey: ["clients"] });
+      const prev = qc.getQueryData<Device[]>(["clients"]);
+      qc.setQueryData<Device[]>(["clients"], (old) =>
+        (old ?? []).map((d) =>
+          d.client_uuid === cid
+            ? {
+                ...d,
+                net_uuid: nid,
+                admitted: false,
+                tap_ip: null,
+              }
+            : d,
+        ),
+      );
+      return { prev };
+    },
+    onError: (e, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(["clients"], ctx.prev);
+      pushToast("error", `assign failed: ${fmtErr(e)}`);
+    },
+    onSettled: () => {
       qc.invalidateQueries({ queryKey: ["clients"] });
       qc.invalidateQueries({ queryKey: ["networks"] });
+    },
+    onSuccess: (_d, vars) => {
       if (vars.nid === null) {
         pushToast("info", "client detached to pending pool");
       } else {
@@ -143,7 +181,6 @@ export function UnifiedView() {
         );
       }
     },
-    onError: (e) => pushToast("error", `assign failed: ${fmtErr(e)}`),
   });
 
   const updateAdmittedDeviceMut = useMutation({
@@ -216,7 +253,20 @@ export function UnifiedView() {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
+  // Phase 3 — track the current drag victim so <DragOverlay> can
+  // render a portal-mounted preview that survives stacking-context
+  // boundaries (the resize panes used to clip it at the divider).
+  const [activeDrag, setActiveDrag] = useState<Device | null>(null);
+  const onDragStart = (e: DragStartEvent) => {
+    const d = e.active?.data?.current as
+      | { kind: "client"; cuid: string }
+      | undefined;
+    if (!d) return;
+    const c = clients.find((c) => c.client_uuid === d.cuid) ?? null;
+    setActiveDrag(c);
+  };
   const onDragEnd = (e: DragEndEvent) => {
+    setActiveDrag(null);
     const dragged = e.active?.data?.current as
       | { kind: "client"; cuid: string; from: string | null }
       | undefined;
@@ -236,15 +286,28 @@ export function UnifiedView() {
     }
   };
 
+  // Persist the divider position only when the user is *actively
+  // dragging* it — the first onLayout fires on mount with the same
+  // value we just supplied as defaultSize, which would otherwise
+  // round-trip and accumulate drift across sessions.
+  const isFirstLayoutCall = useRef(true);
+
   // ── Render ────────────────────────────────────────────────────────────
+  const wsStatus = useWSStatus();
   return (
-    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+    <DndContext
+      sensors={sensors}
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
+      onDragCancel={() => setActiveDrag(null)}
+    >
       <div className="flex min-h-0 flex-1 flex-col">
         <Toolbar
           viewMode={viewMode}
           onViewMode={setViewMode}
           isDirty={layout.isDirty}
           isSaving={layout.isSaving}
+          wsStatus={wsStatus}
         />
         {viewMode === "graph" ? (
           <UnifiedGraphView />
@@ -253,10 +316,13 @@ export function UnifiedView() {
             direction="horizontal"
             className="min-h-0 flex-1"
             onLayout={(sizes) => {
-              // Persist as fraction of total (0–1); use the FIRST pane.
+              if (isFirstLayoutCall.current) {
+                isFirstLayoutCall.current = false;
+                return;
+              }
               if (leftCollapsed) return;
               const ratio = (sizes[0] ?? 0) / 100;
-              if (Number.isFinite(ratio) && ratio > 0) {
+              if (Number.isFinite(ratio) && ratio > 0.001) {
                 layout.update((prev) => ({
                   ...prev,
                   table: { ...prev.table, left_ratio: ratio },
@@ -264,27 +330,30 @@ export function UnifiedView() {
               }
             }}
           >
-            {!leftCollapsed && (
-              <>
-                <Panel
-                  defaultSize={
-                    (layout.layout.table.left_ratio ?? DEFAULT_LEFT_RATIO / 100) * 100
-                  }
-                  minSize={15}
-                  maxSize={60}
-                  className="overflow-y-auto"
-                >
-                  <PendingPane
-                    clients={pending}
-                    onUpdate={(cid, body) =>
-                      patchPendingMut.mutate({ cid, body })
-                    }
-                  />
-                </Panel>
-                <PanelResizeHandle className="w-px bg-border hover:bg-primary/50" />
-              </>
-            )}
-            <Panel className="overflow-y-auto" minSize={40}>
+            <Panel
+              ref={leftPanelRef}
+              id="pending"
+              order={1}
+              collapsible
+              collapsedSize={0}
+              defaultSize={
+                (layout.layout.table.left_ratio ?? DEFAULT_LEFT_RATIO) * 100
+              }
+              minSize={15}
+              maxSize={60}
+              onCollapse={() => setLeftCollapsed(true)}
+              onExpand={() => setLeftCollapsed(false)}
+              className="overflow-hidden"
+            >
+              <PendingPane
+                clients={pending}
+                onUpdate={(cid, body) =>
+                  patchPendingMut.mutate({ cid, body })
+                }
+              />
+            </Panel>
+            <PanelResizeHandle className="w-1.5 bg-border transition-colors hover:bg-primary/50 data-[resize-handle-active]:bg-primary" />
+            <Panel id="networks" order={2} className="overflow-y-auto" minSize={40}>
               <NetworksPane
                 networks={networks}
                 byNet={byNet}
@@ -304,12 +373,12 @@ export function UnifiedView() {
           collapsed={leftCollapsed}
           onToggle={() => {
             const next = !leftCollapsed;
+            // Drive the panel through its imperative handle so the
+            // dragged size survives across collapse/expand.
+            const ref = leftPanelRef.current;
+            if (next) ref?.collapse();
+            else ref?.expand();
             setLeftCollapsed(next);
-            try {
-              localStorage.setItem(COLLAPSE_KEY, next ? "1" : "0");
-            } catch {
-              /* ignore */
-            }
             layout.update((prev) => ({
               ...prev,
               table: { ...prev.table, left_collapsed: next },
@@ -317,7 +386,38 @@ export function UnifiedView() {
           }}
         />
       </div>
+      <DragOverlay>
+        {activeDrag ? <DragPreview client={activeDrag} /> : null}
+      </DragOverlay>
     </DndContext>
+  );
+}
+
+/** Phase 3 — portal-rendered preview that follows the cursor while
+ *  a client card is being dragged. Lives outside the resize-pane
+ *  stacking contexts so it stays visible across the divider. */
+function DragPreview({ client }: { client: Device }) {
+  const isPending = client.net_uuid === null;
+  return (
+    <div
+      className={cn(
+        "rounded-md border bg-card px-3 py-2 text-sm shadow-xl",
+        isPending ? "border-amber-400" : "border-primary",
+      )}
+      style={{ minWidth: 200 }}
+    >
+      <div className="flex items-center gap-2">
+        <span className="font-mono text-xs text-muted-foreground">⠿</span>
+        <span className="font-medium">
+          {client.display_name || `client ${shortUuid(client.client_uuid)}…`}
+        </span>
+      </div>
+      {client.tap_ip && (
+        <div className="mt-1 font-mono text-[10px] text-muted-foreground">
+          {client.tap_ip}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -328,11 +428,13 @@ function Toolbar({
   onViewMode,
   isDirty,
   isSaving,
+  wsStatus,
 }: {
   viewMode: ViewMode;
   onViewMode: (m: ViewMode) => void;
   isDirty: boolean;
   isSaving: boolean;
+  wsStatus: ReturnType<typeof useWSStatus>;
 }) {
   return (
     <div className="flex items-center gap-3 border-b border-border bg-background px-3 py-2 text-sm">
@@ -340,8 +442,29 @@ function Toolbar({
       <div className="ml-auto flex items-center gap-3">
         <SaveStatusChip isDirty={isDirty} isSaving={isSaving} />
         <ViewModeToggle value={viewMode} onChange={onViewMode} />
+        <WsStatusBadge status={wsStatus} />
       </div>
     </div>
+  );
+}
+
+function WsStatusBadge({ status }: { status: ReturnType<typeof useWSStatus> }) {
+  return (
+    <Badge
+      variant={status === "open" ? "success" : status === "connecting" ? "muted" : "destructive"}
+    >
+      <span
+        className={cn(
+          "inline-block h-1.5 w-1.5 rounded-full",
+          status === "open"
+            ? "bg-emerald-500"
+            : status === "connecting"
+              ? "bg-muted-foreground"
+              : "bg-destructive",
+        )}
+      />
+      {status === "open" ? "live" : status === "connecting" ? "connecting" : "offline"}
+    </Badge>
   );
 }
 
@@ -405,26 +528,42 @@ function PendingPane({
     id: "pending",
     data: { kind: "pending" },
   });
+  // Two-layer wrapper: the OUTER one is the droppable + scroll
+  // viewport (full panel height + always overflows-y), the INNER
+  // one stretches to at least the viewport height so an empty pane
+  // is still 100% drop-zone (fixes "you have to drop on a specific
+  // strip" — the whole pane now accepts the drop).
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "flex h-full flex-col gap-2 p-3",
+        "h-full overflow-y-auto transition-colors",
         isOver && "bg-amber-50/60",
       )}
     >
-      <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-        Pending ({clients.length})
-      </h2>
-      {clients.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
-          No unassigned clients. Drag here from a network to detach.
-        </div>
-      ) : (
-        clients.map((c) => (
-          <PendingClientCard key={c.client_uuid} client={c} onUpdate={onUpdate} />
-        ))
-      )}
+      <div className="flex min-h-full flex-col gap-2 p-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Pending ({clients.length})
+        </h2>
+        {clients.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center rounded-md border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+            No unassigned clients. Drag here from a network to detach.
+          </div>
+        ) : (
+          <>
+            {clients.map((c) => (
+              <PendingClientCard
+                key={c.client_uuid}
+                client={c}
+                onUpdate={onUpdate}
+              />
+            ))}
+            {/* Spacer so the empty area below the cards still
+                participates in the drop zone. */}
+            <div className="flex-1" aria-hidden />
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -436,21 +575,19 @@ function PendingClientCard({
   client: Device;
   onUpdate: (cid: string, body: { name?: string; lan_subnets?: string[] }) => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } =
-    useDraggable({
-      id: `client:${client.client_uuid}`,
-      data: { kind: "client", cuid: client.client_uuid, from: null },
-    });
-  const style: React.CSSProperties | undefined = transform
-    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`, zIndex: 50 }
-    : undefined;
+  // Phase 3 — no inline transform: the dragged image is rendered by
+  // <DragOverlay> in a portal so it isn't clipped at the resize-pane
+  // divider. The original card just dims while dragging.
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `client:${client.client_uuid}`,
+    data: { kind: "client", cuid: client.client_uuid, from: null },
+  });
   return (
     <div
       ref={setNodeRef}
-      style={style}
       className={cn(
         "rounded-md border bg-card p-2 text-sm shadow-sm",
-        isDragging && "opacity-60",
+        isDragging && "opacity-40",
       )}
     >
       <div className="flex items-center gap-2">
@@ -541,7 +678,7 @@ function NetworksPane({
 }) {
   const [newName, setNewName] = useState("");
   return (
-    <div className="grid auto-rows-min grid-cols-1 gap-3 p-3 xl:grid-cols-2">
+    <div className="flex flex-col gap-3 p-3">
       {networks.map((n) => (
         <NetworkCard
           key={n.id}
@@ -700,21 +837,18 @@ function AdmittedClientRow({
   collisions: string[];
   onUpdate: (body: DeviceUpdateBody) => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } =
-    useDraggable({
-      id: `client:${client.client_uuid}`,
-      data: { kind: "client", cuid: client.client_uuid, from: netUuid },
-    });
-  const style: React.CSSProperties | undefined = transform
-    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`, zIndex: 50 }
-    : undefined;
+  // Phase 3 — DragOverlay handles the dragged preview at the document
+  // level; the in-place row just dims while a drag is active.
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `client:${client.client_uuid}`,
+    data: { kind: "client", cuid: client.client_uuid, from: netUuid },
+  });
   return (
     <li
       ref={setNodeRef}
-      style={style}
       className={cn(
         "grid grid-cols-[auto_auto_1fr_auto_auto_auto_auto] items-center gap-2 py-2 text-sm",
-        isDragging && "opacity-60",
+        isDragging && "opacity-40",
       )}
     >
       <button
