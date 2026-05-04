@@ -93,6 +93,20 @@ async fn admin_client(socket: PathBuf, cmd: AdminCmd) -> Result<()> {
                 lan_subnets: lan,
             },
         },
+        AdminCmd::Assign { client_uuid, net } => {
+            let net_uuid = if net == "none" || net == "-" {
+                None
+            } else {
+                Some(
+                    net.parse::<Uuid>()
+                        .with_context(|| format!("bad net uuid: {net:?} (use a UUID or `none`)"))?,
+                )
+            };
+            ServerAdminReq::AssignClient {
+                client_uuid,
+                net_uuid,
+            }
+        }
         AdminCmd::List => ServerAdminReq::List,
         AdminCmd::Send { msg } => ServerAdminReq::Send { msg },
         AdminCmd::Sendfile { path } => {

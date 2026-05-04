@@ -24,11 +24,16 @@ trivially carried by any of those tunnels — the SOCKS5 client is built
 in.
 
 In addition to the classic CLI, recent versions ship a **WebUI** (HTTP
-+ WebSocket, default `127.0.0.1:8080`) for inspecting networks,
-admitting/kicking devices, editing per-device fields, pushing routes,
-and visualising the topology as a draggable node graph. The frontend
-is a small React app under `web/`; the backend is the same daemon
-binary. See [WebUI](#webui).
++ WebSocket, default `127.0.0.1:8080`) with a single unified page
+covering everything: a **drag-and-drop unified Networks + Devices
+view** (left pane = pending clients waiting for an assignment, right
+pane = a card per virtual network — drag a client between them to
+move it), with a **Table** mode and a **Graph** mode (one canvas,
+networks as bordered group frames). Each network's bridge IP is
+edited with a segment-locked picker (only `/16` or `/24`); each
+client's TAP IP is locked to the bridge's prefix so collisions are
+caught at type-time. The frontend is a small React app under `web/`;
+the backend is the same daemon binary. See [WebUI](#webui).
 
 ---
 
@@ -138,6 +143,13 @@ delegated to a tool that already solves them well.
   stitches them into a per-network routing table at push time —
   installed on that network's bridge only, not globally. No more
   `[[routes]]` to keep in sync.
+* **Server-authoritative assignment (Phase 3).** A client can be in
+  at most one network at a time; the *server* decides which one
+  (admin-driven, via drag-to-assign in the WebUI or `assign` over
+  CLI). A new connecting client lands in the pending pool, is
+  rejected from `Join` until assigned, and gets a server-pushed
+  `Frame::AssignNet { net_uuid }` whenever the assignment changes —
+  the client tears down its TAP and re-Joins the new network.
 * **Two control surfaces, one source of truth.** The Unix-socket
   admin RPC (`bifrost-server admin <cmd>`) and the HTTP API
   (`/api/...`) both go through the same `HubHandle` methods —
@@ -164,21 +176,25 @@ CLIENT_HOST=root@<client-ip>  ./scripts/deploy-client.sh
 ssh root@<server-ip> 'bifrost-server admin mknet hml-net'
 # → network created  uuid=<NET_UUID>
 
-# 4. Have the client request to join
-ssh root@<client-ip> "bifrost-client admin join <NET_UUID>"
-
-# 5. Admit and configure the client in one go.
-#    A `device set` with `--admit true` promotes a pending row; without
-#    it the client stays in pending state. Each flag is independent —
-#    pass only the ones you want to change.
+# 4. As soon as the client connects (it does on its own), the server
+#    creates a pending_clients row. Phase 3 — the server now decides
+#    which network a client belongs to. Assign it:
 CLIENT_UUID=$(ssh root@<client-ip> \
   'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
+ssh root@<server-ip> "bifrost-server admin assign $CLIENT_UUID <NET_UUID>"
+# (the client receives `Frame::AssignNet`, tears down any old TAP,
+#  and Joins the new net automatically — but admitted=false at first)
+
+# 5. Configure and admit. Each flag is independent — pass only the
+#    ones you want to change.
 ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
   --admit true --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
 
 # 6. (later, optional) Kick a device back to pending without removing
 #    its row, e.g. for maintenance:
 #    ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID --admit false"
+#    Or fully detach to the pending pool:
+#    ssh root@<server-ip> "bifrost-server admin assign $CLIENT_UUID none"
 
 # 7. Push the derived route table to all members
 ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
@@ -188,7 +204,9 @@ ssh root@<server-ip> 'ping -c3 10.0.0.2'
 ```
 
 Optional — open `http://127.0.0.1:8080` (over an SSH port-forward) to
-get the same picture in a browser. See [WebUI](#webui).
+get the same picture in a browser, then **drag the pending client
+card from the left pane onto the network card** instead of running
+steps 4 and 5 by hand. See [WebUI](#webui).
 
 Subsequent reconnects auto-reuse the persisted state — both
 `approved_clients` and `joined_network` are written to TOML at the
@@ -202,7 +220,7 @@ appropriate moments.
 
 ```bash
 cargo build  --workspace
-cargo test   --workspace                                 # ~164 tests
+cargo test   --workspace                                 # ~187 tests
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Frontend (optional — only if you're going to touch the WebUI)
@@ -367,15 +385,24 @@ listen = "127.0.0.1:9090"
 #   bridge_name  = "br-bifrost"        # auto-derived `bf-<8-hex>` for fresh
 #                                      # networks; legacy bridge name preserved
 #                                      # for the first network on upgrade
-#   bridge_ip    = "10.0.0.1/24"       # empty = pure-L2, no host-side address
+#   bridge_ip    = "10.0.0.1/24"       # only `/16` and `/24` accepted
+#                                      # (Phase 3 — empty = pure-L2)
 #
 # Each [[approved_clients]] row carries:
 #   client_uuid  = "..."               # set by the daemon
-#   net_uuid     = "..."               # set by the daemon
+#   net_uuid     = "..."               # set by the daemon (one row per
+#                                      #   client_uuid as of Phase 3)
 #   tap_ip       = "10.0.0.2/24"       # `device set --ip`
 #   display_name = "router"            # `device set --name`
 #   lan_subnets  = ["192.168.200.0/24"]  # `device set --lan`
 #   admitted     = true                # `device set --admit`
+#
+# Phase 3 — clients that have connected but aren't yet in any
+# network live in a sibling section:
+# [[pending_clients]]
+#   client_uuid  = "..."
+#   display_name = ""                  # editable while pending
+#   lan_subnets  = []                  # editable while pending
 #
 # Each network's route table is **derived** from its members'
 # `lan_subnets` and installed on that network's bridge only —
@@ -429,8 +456,9 @@ which performs a single request-reply RPC and exits.
 |---|---|
 | `mknet <name>` | Create a virtual network; returns its UUID. |
 | `rename <net-uuid> <new-name>` | Rename an existing network. |
-| `rmnet <net-uuid>` | Delete a network and cascade-remove its devices (kills live sessions, drops conns, clears persisted rows, re-syncs routes). |
-| `device list [<net-uuid>]` | List devices (admitted + pending). Filter by network if given. |
+| `rmnet <net-uuid>` | **Phase 3** — delete a network. Clients **detach to the pending pool** (preserving display_name + lan_subnets) instead of being removed; the kernel bridge is destroyed and routes re-synced. |
+| `assign <client-uuid> <net-uuid|none>` | **Phase 3** — assign a client to a network or `none` to detach. Sends `Frame::AssignNet` to the live conn so the client tears down its TAP and re-joins the new target. After this, run `device set --ip ... --admit true` to bring it online. |
+| `device list [<net-uuid>]` | List devices (admitted + pending). With no `<net-uuid>` includes the pending pool too (rows with `net=-`). |
 | `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | Mutate one device. Each flag is independent: omitted = no change; `--ip ""` clears; `--lan ""` clears the list. `--admit true` promotes a pending row to admitted (allocates the TAP, sends `JoinOk`); `--admit false` kicks a session back to pending (kills the live socket, leaves the row in place). Live `SET_IP` is pushed if the device is online. |
 | `device push <net-uuid>` | Re-derive routes for the network (from every member's `lan_subnets`), install them on the server bridge, and send `SetRoutes` to each joined client. |
 | `list` | Snapshot of networks, sessions, and pending requests. |
@@ -446,6 +474,12 @@ which performs a single request-reply RPC and exits.
 > global routes table; `device set --ip` replaces `setip`. There is
 > no migration path — Bifrost is alpha; remove old `[[routes]]` from
 > `server.toml` by hand, then re-create them with `device set --lan`.
+>
+> **Phase 3** added one new verb (`assign`) and changed `rmnet`'s
+> semantics — clients detach to the pending pool instead of being
+> deleted. The wire-protocol version bumped from 1 to 2 (added
+> `Frame::AssignNet`), so old clients are rejected on Hello with a
+> `version_mismatch` `JoinDeny` until they're upgraded too.
 
 ### `bifrost-client admin`
 
@@ -498,15 +532,18 @@ block, or with the CLI flags `--web-listen <addr>` / `--no-web`.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `GET` | `/api/networks` | Network list with `device_count` / `online_count`. |
+| `GET` | `/api/networks` | Network list with `device_count` / `online_count` and per-network `bridge_name` / `bridge_ip`. |
 | `POST` | `/api/networks` | Create a virtual network. Body `{ "name": "..." }`. |
-| `PATCH` | `/api/networks/:nid` | Rename. Body `{ "name": "..." }`. |
-| `DELETE` | `/api/networks/:nid` | Cascade-delete network and all its device rows (also drops the saved layout file). |
-| `GET` | `/api/networks/:nid/devices` | Combined view of admitted + pending devices. |
+| `PATCH` | `/api/networks/:nid` | Edit `name` and/or `bridge_ip`. **Phase 3:** `bridge_ip` is constrained to `/16` or `/24` — non-empty values with other prefixes return 400. Changing prefix length auto-rewrites every member's `tap_ip` (octets preserved) and pushes `SetIp` to live sessions. |
+| `DELETE` | `/api/networks/:nid` | **Phase 3** — destroys the network's kernel bridge and detaches its clients to the pending pool (carrying `display_name` + `lan_subnets`); does NOT delete device rows. |
+| `GET` | `/api/networks/:nid/devices` | Combined view of admitted + pending-admit devices for one network. |
 | `PATCH` | `/api/networks/:nid/devices/:cid` | In-place edit: `name`, `tap_ip`, `lan_subnets`, **`admitted`** (true admits, false kicks back to pending). All fields optional. |
 | `POST` | `/api/networks/:nid/routes/push` | Re-derive routes from every member's `lan_subnets`, push `SetRoutes` to all joined peers. |
-| `GET` | `/api/networks/:nid/layout` | Saved graph node positions: `{ positions: { "<id>": { x, y } } }`. Returns empty object on a fresh network (200 OK), 404 for unknown network. |
-| `PUT` | `/api/networks/:nid/layout` | Atomic full-replace of saved positions; `<save_dir>/layouts/<nid>.json`. |
+| `GET` | `/api/clients` | **Phase 3** — list every known client in one shot, both network-assigned and pending-unassigned. The unified WebUI uses this. |
+| `PATCH` | `/api/clients/:cid` | **Phase 3** — edit a client's `name` and/or `lan_subnets` regardless of whether it's pending or admitted. |
+| `POST` | `/api/clients/:cid/assign` | **Phase 3** — drag-to-assign. Body `{ "net_uuid": <uuid> | null }`; `null` detaches to the pending pool. Same-net is a no-op. Sends `Frame::AssignNet` to the conn; `admitted` and `tap_ip` are reset on every cross-network move. |
+| `GET` | `/api/ui-layout` | **Phase 3** — single-file unified layout: `{ table: { left_ratio, left_collapsed }, graph: { positions, frames } }`. Replaces the old per-network `layout` files. Returns the current persisted state, or an empty default. |
+| `PUT` | `/api/ui-layout` | **Phase 3** — atomic full-replace of the unified layout. The frontend ships a debounced PUT after each interaction. |
 | `GET` | `/ws` | WebSocket; pushes `metrics.tick` (1 Hz throughput sample), `device.{online,offline,changed,pending,removed}`, `routes.changed`, `network.{created,changed,deleted}`. Server keeps it warm with 25 s pings. |
 
 Errors all share the envelope `{ "error": "<message>" }`. 4xx for
@@ -552,45 +589,47 @@ npm run dev        # http://127.0.0.1:5173, proxies /api and /ws to backend
 Set `BIFROST_BACKEND=http://<host>:<port>` if the server is somewhere
 other than `127.0.0.1:8080`. HMR works as expected.
 
-Pages currently shipping:
+**Phase 3** drops the old Networks → Devices hierarchy in favor of a
+single unified page (`/`):
 
-* `/networks` — table of virtual networks; **create** with the inline
-  "+ New network" button, **rename** by clicking the name (inline
-  edit), **delete** with the per-row Delete button (confirm dialog).
-  Counts and edits stream in via `network.*` and `device.*` WS events,
-  with a 30 s safety-net poll.
-* `/networks/:nid` — devices in a network, with two interchangeable
-  views toggled per-tab and persisted to `localStorage`:
-  * **Table view** — admit toggle (a single switch per row replaces
-    the old approve/deny/kick buttons), inline edit on name / TAP IP
-    / LAN subnets, throughput cell with numeric bps + sparkline.
-  * **Graph view** — React Flow canvas filling the viewport. Hub
-    card centers; device cards orbit on a deterministic ring on
-    first load. **Node positions persist server-side** (PUT to
-    `/api/networks/:nid/layout` debounced 300 ms after each drag),
-    so a fresh browser on a different machine sees the same
-    arrangement. **Floating edges** snap to the closest pair of
-    side-midpoints between any two nodes — drag a device around
-    the hub and the line follows. **Saving / Saved chip** in the
-    canvas's top-right corner gives explicit feedback on each
-    drag-release. Hub card's network name is editable inline (same
-    PATCH endpoint the index page uses, both views stay in sync via
-    `network.changed` WS events).
-* `Push routes` button in the toolbar recomputes the derived table
-  and pushes `SetRoutes` to every joined peer. After any
-  `lan_subnets` edit, the button switches to amber + soft pulse +
-  trailing dot to remind the user the change isn't live until pushed
-  — plus an info toast at the moment of the edit. Cleared on a
-  successful push.
+* **Table mode** — left/right split with a draggable divider. The
+  left pane lists pending (unassigned) clients; the right pane is one
+  card per virtual network. **Drag a client between panes/cards** to
+  assign — the server sends `Frame::AssignNet` to the live conn and
+  the client tears down its TAP and re-joins the new target. Every
+  cross-network move clears `admitted` and `tap_ip` per spec, so the
+  user always re-confirms. Pending cards expose only `name` and
+  `lan_subnets` (no IP, no throughput); admitted rows get the full
+  set plus a per-row throughput cell with a 60-sample sparkline. The
+  bottom-left FAB toggles the left pane's collapse state; the
+  divider's position and the collapse flag persist via
+  `/api/ui-layout`.
+* **Graph mode** — React Flow canvas with one solid-bordered group
+  frame per network containing its Hub card and admitted clients.
+  Pending clients float free outside any frame. **Drag a client into
+  a frame** ⇒ assign; **drag out of every frame** ⇒ detach. **Right-
+  click a Hub card** ⇒ "Delete network" (clients fall back to
+  pending). **Right-click the canvas blank** ⇒ "Create new network"
+  (the new frame lands at the cursor). Frame x/y/w/h, hub/client
+  positions all persist server-side.
+* **IP-segment pickers** — bridge IPs use a four-octet input with a
+  `/16 ↔ /24` toggle. Client TAP IPs lock the octets pinned by the
+  bridge's prefix (e.g. bridge `10.0.0.1/24` ⇒ client picker shows
+  `10.0.0.[__]/24`); inline collision detection rejects duplicates
+  in the same network before submit.
+* **`Push routes` per card** — the per-network card's button
+  recomputes routes and sends `SetRoutes` to its peers. After any
+  `lan_subnets` edit a toast reminds the user to click it.
+* **Layout save chip** — top-right of the toolbar; flips between
+  *saved* / *unsaved* / *saving* as the debounced PUT round-trips.
 * Header status badge — live / connecting / offline, driven by the
   WebSocket connection.
-* Live throughput on every device — both the numeric `B/s` / `KB/s`
-  / `MB/s` value and a 60-sample sparkline, fed by 1 Hz
+* Live throughput on every admitted device — fed by 1 Hz
   `metrics.tick` events.
 
 ---
 
-## Wire protocol (v1)
+## Wire protocol (v2)
 
 Frame format:
 
@@ -600,13 +639,14 @@ Frame format:
 └────────────────────────┴──────────────────────────────────┘
 ```
 
-`Frame` is a 12-variant enum. A summary:
+`Frame` is a 13-variant enum. A summary:
 
 | Variant | Direction | Purpose |
 |---|---|---|
 | `Hello` / `HelloAck` | C↔S | First-frame handshake; carries `version` and `caps` bits. |
 | `Join` / `JoinOk` / `JoinDeny` | C→S / S→C | Network membership negotiation. |
 | `Eth(Vec<u8>)` | bidirectional | Data plane: a single Ethernet frame. |
+| `AssignNet { net_uuid }` | S→C | **v2** — server-driven re-assignment. `Some(uuid)` switches the client to that network; `None` detaches to idle. The client tears down any existing TAP and (if `Some`) issues a fresh `Join`. |
 | `SetIp { ip }` | S→C | Online TAP-IP update. |
 | `SetRoutes(Vec<RouteEntry>)` | S→C | Push a routing table to the client. |
 | `Text(String)` | bidirectional | Out-of-band text broadcast / echo. |
@@ -642,15 +682,15 @@ bifrost/
 │  └─ bifrost-client/              # daemon binary + driver lib
 │
 ├─ web/                            # React + Vite + TS + Tailwind frontend
-│  ├─ src/views/                   #   NetworkList, NetworkDetail,
-│  │                                 #   DevicesAsTable, DevicesAsGraph
+│  ├─ src/views/                   #   UnifiedView (table) + UnifiedGraphView
 │  ├─ src/components/
 │  │  ├─ Layout, InlineEdit, Sparkline, ThroughputCell, Toaster
-│  │  ├─ graph/                    #   ServerNode, DeviceNode,
-│  │  │                              #   FloatingEdge, graphLayout
+│  │  ├─ IpSegmentInput              #   /16 vs /24 octet-locked picker
+│  │  ├─ SaveStatusChip              #   layout: saved / unsaved / saving
 │  │  └─ ui/                       #   Button, Card, Badge, Switch, Table
 │  └─ src/lib/                     #   api / ws / types / metrics /
-│                                    #   eventInvalidator / toast / format / cn
+│                                    #   useUiLayout / eventInvalidator /
+│                                    #   toast / format / cn
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -699,7 +739,7 @@ Crate dependency graph:
   server and an Ubuntu 24.04 aarch64 client (tunnelling through
   Xray's SOCKS5)
 
-### Completed (Phase 1.0–1.6 — WebUI v1, Phase 2.0 — multi-tenant L2)
+### Completed (Phase 1.0–1.6 — WebUI v1, Phase 2.0 — multi-tenant L2, Phase 3.0 — unified WebUI + server-driven assignment)
 
 * **Per-device `lan_subnets`** replaces the global `[[routes]]`
   table; the route table is derived per-network at push time. CLI
@@ -744,13 +784,32 @@ Crate dependency graph:
   (auto-derived `bf-<8-hex>` from UUID) and optional `bridge_ip`
   (host-side gateway address). One-shot migration on upgrade
   hands the legacy `[bridge]` config to the first network.
-* **168 tests passing**, clippy-clean with `-D warnings`.
+* **Server-authoritative assignment + protocol v2 (Phase 3.0).**
+  A new `pending_clients` table tracks connected-but-unassigned
+  clients persistently; new `Frame::AssignNet { net_uuid }` lets
+  the server move a client between networks (the client tears down
+  its TAP and re-joins the new target). One client = at most one
+  network at a time, enforced by Hub state-machine + a Phase-2 →
+  Phase-3 config migration. New endpoints: `GET /api/clients`,
+  `PATCH /api/clients/:cid`, `POST /api/clients/:cid/assign`.
+  `PATCH /api/networks/:nid` extended with `bridge_ip` (limited to
+  `/16` or `/24`; prefix changes auto-rewrite every member's
+  `tap_ip`). `delete_net` no longer deletes devices — they detach
+  to the pending pool. New CLI verb: `assign <client> <net|none>`.
+* **Unified WebUI (Phase 3.0).** Single page replaces the old
+  Networks index + per-network detail pages. Drag-and-drop
+  (`@dnd-kit/core`) in Table mode + a single React Flow canvas in
+  Graph mode (with bordered group frames per network and right-
+  click context menus). Segment-locked IP pickers; single-file
+  `ui-layout.json` replaces the per-network layout files (with a
+  one-shot migration that folds old files in).
+* **187 tests passing**, clippy-clean with `-D warnings`.
 
 ### Roadmap
 
 | Phase | Item | Notes |
 |---|---|---|
-| 2.x | `--ip <cidr>` flag on `mknet` CLI + `POST /api/networks` body, plus a per-network bridge editor in the WebUI | Phase 2.0 ships kernel-level isolation but new networks default to `bridge_ip = ""` — the operator can hand-edit `server.toml` to give a network a host-side address until the surface ships. |
+| 3.x | `--ip <cidr>` flag on `mknet` CLI | Phase 3.0 adds a WebUI bridge-IP picker + `PATCH /api/networks/:nid` with a `bridge_ip` field, but the CLI form still requires hand-editing `server.toml` to set a fresh network's bridge IP. |
 | —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (`[metrics]` config exists but is currently a no-op) |
 | —   | **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |

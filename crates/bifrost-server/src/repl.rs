@@ -35,6 +35,7 @@ pub fn run_blocking(tx: mpsc::Sender<(ServerAdminReq, oneshot::Sender<String>)>)
     println!(
         "REPL — same commands as `bifrost-server admin <cmd>`:\n  \
          mknet <name> |\n  \
+         assign <client-uuid> <net-uuid|none>  (Phase 3) |\n  \
          device list [<net-uuid>] |\n  \
          device set <client-uuid> [name=X] [ip=Y/CIDR] [admit=true|false] [lan=A,B,...] |\n  \
          device push <net-uuid> |\n  \
@@ -89,6 +90,7 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
             }
         }
         "device" => parse_device(rest)?,
+        "assign" => parse_assign(rest)?,
         "list" => ServerAdminReq::List,
         "send" => {
             if rest.is_empty() {
@@ -117,6 +119,28 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
         other => return Err(format!("unknown command {other:?}")),
     };
     Ok(ReplCmd::Req(req))
+}
+
+/// `assign <client-uuid> <net-uuid|none>` — Phase 3 drag-to-assign over CLI.
+fn parse_assign(rest: &str) -> Result<ServerAdminReq, String> {
+    let mut it = rest.split_whitespace();
+    let client = it
+        .next()
+        .ok_or("usage: assign <client-uuid> <net-uuid|none>")?;
+    let target = it
+        .next()
+        .ok_or("usage: assign <client-uuid> <net-uuid|none>")?;
+    let client_uuid =
+        Uuid::parse_str(client).map_err(|e| format!("bad client uuid: {e}"))?;
+    let net_uuid = if target == "none" || target == "-" {
+        None
+    } else {
+        Some(Uuid::parse_str(target).map_err(|e| format!("bad net uuid: {e}"))?)
+    };
+    Ok(ServerAdminReq::AssignClient {
+        client_uuid,
+        net_uuid,
+    })
 }
 
 /// `device list [<net-uuid>]`
