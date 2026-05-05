@@ -111,6 +111,18 @@ pub enum HubEvent {
         count: u64,
     },
 
+    /// The set of routes derived from `lan_subnets` changed and no
+    /// longer matches what was last pushed to peers (`dirty=true`),
+    /// or it just got back into sync (`dirty=false`). Subscribers use
+    /// this to nudge admins to click "push routes" — typically by
+    /// pulsing the button amber. The hub emits an event only on
+    /// state TRANSITIONS (false → true or true → false).
+    #[serde(rename = "routes.dirty")]
+    RoutesDirty {
+        network: Uuid,
+        dirty: bool,
+    },
+
     /// A new virtual network was created.
     #[serde(rename = "network.created")]
     NetworkCreated {

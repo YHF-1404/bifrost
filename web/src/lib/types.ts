@@ -9,6 +9,12 @@ export interface Network {
   bridge_ip: string;
   device_count: number;
   online_count: number;
+  /** True when the network's currently-derived routes (the union of
+   *  every admitted device's `lan_subnets`) don't match what was
+   *  last broadcast via `device_push`. The WebUI pulses the hub
+   *  card's "push routes" button amber while this is true. Updated
+   *  in real time via the `routes.dirty` WS event. */
+  routes_dirty: boolean;
 }
 
 export interface Throughput {
@@ -51,6 +57,7 @@ export type ServerEvent =
       routes: Array<{ dst: string; via: string }>;
       count: number;
     }
+  | { type: "routes.dirty"; network: string; dirty: boolean }
   | { type: "network.created"; network: string; name: string }
   | { type: "network.changed"; network: string; name: string }
   | { type: "network.deleted"; network: string };

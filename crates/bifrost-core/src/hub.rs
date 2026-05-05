@@ -67,6 +67,12 @@ pub struct HubSnapshot {
     pub networks: Vec<NetRecord>,
     pub sessions: Vec<SessionInfo>,
     pub pending: Vec<PendingInfo>,
+    /// Networks whose currently-derived routes don't match what was
+    /// last broadcast via `device_push`. The WebUI uses this to
+    /// pulse the hub-card "push routes" button amber on first page
+    /// load (the per-event `routes.dirty` WS message handles updates
+    /// after that).
+    pub routes_dirty: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -620,6 +626,21 @@ pub struct Hub {
     /// Previous (in, out) byte counters per session, for delta
     /// computation in the metrics tick.
     metrics_prev: HashMap<SessionId, (u64, u64)>,
+
+    /// Snapshot of the route table last broadcast to all bound peers
+    /// of each network via [`Self::handle_device_push`]. The
+    /// `routes.dirty` event compares this against
+    /// [`derive_routes_for_network`] after every config-mutating
+    /// handler — when they diverge (e.g. an admin admitted a new
+    /// device whose `lan_subnets` aren't yet known to existing
+    /// peers), the WebUI's "push routes" button starts pulsing.
+    /// In-memory only: at startup [`Self::run`] seeds it from the
+    /// derived set so a clean restart is `dirty=false`.
+    last_pushed_routes: HashMap<Uuid, Vec<WireRoute>>,
+    /// Mirror of the WebUI's "needs push?" boolean per network. Used
+    /// to avoid re-emitting `routes.dirty` for unchanged states (we
+    /// want a transition signal, not a stream of identical events).
+    routes_dirty: HashMap<Uuid, bool>,
 }
 
 impl Hub {
@@ -648,6 +669,8 @@ impl Hub {
             disconnect_timeout,
             events_tx: events_tx.clone(),
             metrics_prev: HashMap::new(),
+            last_pushed_routes: HashMap::new(),
+            routes_dirty: HashMap::new(),
         };
         (
             hub,
@@ -699,6 +722,91 @@ impl Hub {
                 warn!(network = %net.uuid, error = %e, "bridge.apply_routes failed");
             }
         }
+    }
+
+    /// Re-evaluate whether `net_uuid` needs a route push and emit a
+    /// `HubEvent::RoutesDirty` on state TRANSITIONS only.
+    ///
+    /// Phase 3.x — the pulse is an *operator-completion-cue*, not a
+    /// raw equality check. It only fires once a network is fully set
+    /// up (every client in it admitted with a valid `tap_ip`) AND the
+    /// derived route table differs from what was last pushed. While
+    /// any client is still pending an IP or the admit toggle, no
+    /// pulse — the operator's attention belongs on those incomplete
+    /// rows (where the IP picker pulses amber and the admit switch
+    /// is locked) rather than on a route push that wouldn't carry the
+    /// in-flight client's subnets anyway.
+    ///
+    /// Concretely:
+    ///
+    /// * **Empty network** (no clients in `net_uuid`): `dirty=false`.
+    ///   Nothing to push.
+    /// * **Any unadmitted or IP-missing client**: `dirty=false`. The
+    ///   operator is mid-setup; pushing now would be premature.
+    /// * **All clients admitted with a valid `tap_ip`**: `dirty=true`
+    ///   iff `derive_routes_for_network ≠ last_pushed_routes`.
+    ///   Catches `lan_subnets` edits, drift after a kick, etc.
+    ///
+    /// Both route vectors are sorted by `(dst, via)` before equality
+    /// so insertion-order differences across operations don't cause
+    /// false dirty signals.
+    fn recheck_routes_dirty(&mut self, net_uuid: Uuid) {
+        if !self.cfg.networks.iter().any(|n| n.uuid == net_uuid) {
+            return;
+        }
+        // Determine "fully online" — every client row in this
+        // network is admitted AND has a valid `tap_ip`. Rows with an
+        // empty / unparseable `tap_ip` count as not-yet-online even
+        // when `admitted=true` (defense in depth: derive_routes
+        // already drops them, but the pulse gate is a UX rule about
+        // operator intent).
+        let mut any_in_net = false;
+        let mut all_online = true;
+        for ac in self
+            .cfg
+            .approved_clients
+            .iter()
+            .filter(|a| a.net_uuid == net_uuid)
+        {
+            any_in_net = true;
+            let ip_ok = !ac.tap_ip.is_empty()
+                && (ac.tap_ip.parse::<ipnet::IpNet>().is_ok()
+                    || ac.tap_ip.parse::<std::net::IpAddr>().is_ok());
+            if !ac.admitted || !ip_ok {
+                all_online = false;
+                break;
+            }
+        }
+        let new_dirty = if any_in_net && all_online {
+            let mut derived = derive_routes_for_network(&self.cfg, net_uuid);
+            derived.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
+            let mut pushed = self
+                .last_pushed_routes
+                .get(&net_uuid)
+                .cloned()
+                .unwrap_or_default();
+            pushed.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
+            derived != pushed
+        } else {
+            false
+        };
+        let old_dirty = self.routes_dirty.get(&net_uuid).copied().unwrap_or(false);
+        if new_dirty != old_dirty {
+            self.emit(HubEvent::RoutesDirty {
+                network: net_uuid,
+                dirty: new_dirty,
+            });
+        }
+        self.routes_dirty.insert(net_uuid, new_dirty);
+    }
+
+    /// Snapshot of which networks currently need a route push, for the
+    /// WebUI's `routes_dirty` field on `GET /api/networks`.
+    pub fn routes_dirty_set(&self) -> std::collections::HashSet<Uuid> {
+        self.routes_dirty
+            .iter()
+            .filter_map(|(k, v)| if *v { Some(*k) } else { None })
+            .collect()
     }
 
     /// Stand up one bridge per persisted network. Persists the config
@@ -763,6 +871,22 @@ impl Hub {
         // server toward LANs behind a client would 'no route to host'
         // until someone re-ran `route push`.
         self.sync_local_routes().await;
+
+        // Seed `last_pushed_routes` from each network's *currently
+        // pushable* derived set (admitted+tapped clients only) and
+        // run `recheck_routes_dirty` so the initial state lines up
+        // with the gate. With derived freshly seeded into pushed,
+        // the post-restart steady state is dirty=false (the seed
+        // pretends we just pushed). Networks with unadmitted /
+        // IP-less clients also land at dirty=false because the
+        // gate suppresses the pulse mid-setup — the WebUI surfaces
+        // those incomplete rows directly (pulsing IP picker, locked
+        // admit switch) rather than via the push button.
+        for net in self.cfg.networks.clone() {
+            let derived = derive_routes_for_network(&self.cfg, net.uuid);
+            self.last_pushed_routes.insert(net.uuid, derived);
+            self.recheck_routes_dirty(net.uuid);
+        }
 
         let mut sampler = tokio::time::interval(METRICS_TICK);
         // Hub is the bottleneck for these — if we ever fall behind
@@ -1413,6 +1537,11 @@ impl Hub {
             sid: sid.0,
             tap_name: tap_name.clone(),
         });
+
+        // Newly admitting a device may have introduced lan_subnets
+        // not in the last-pushed set; flag the network as needing a
+        // route push so the WebUI's button pulses amber.
+        self.recheck_routes_dirty(net_uuid);
     }
 
     /// Push the derived route table for `net_uuid` to a freshly-bound
@@ -1480,6 +1609,12 @@ impl Hub {
         self.create_bridge_for(&rec).await;
         self.cfg.networks.push(rec);
         self.persist().await;
+        // Empty network → empty derived → empty last_pushed →
+        // dirty=false. Initialising the entries explicitly keeps the
+        // WebUI's `routes_dirty` snapshot complete from the moment
+        // the network exists.
+        self.last_pushed_routes.insert(uuid, Vec::new());
+        self.routes_dirty.insert(uuid, false);
         info!(%name, %uuid, ?validated_ip, "network created");
         self.emit(HubEvent::NetworkCreated {
             network: uuid,
@@ -1729,6 +1864,9 @@ impl Hub {
 
         self.persist().await;
         self.sync_local_routes().await;
+        // Network is gone — drop its routes-tracking entries.
+        self.last_pushed_routes.remove(&net_uuid);
+        self.routes_dirty.remove(&net_uuid);
         info!(%net_uuid, "network deleted; clients detached to pending");
         self.emit(HubEvent::NetworkDeleted { network: net_uuid });
 
@@ -1858,6 +1996,19 @@ impl Hub {
 
         // Old admitted row (if any) is gone, so re-sync local routes.
         self.sync_local_routes().await;
+
+        // Both networks need a recheck — the old one because a row
+        // (with possibly non-empty lan_subnets) just left, the new
+        // one because a row just arrived (admitted=false for now,
+        // so its subnets aren't in `derive_routes` yet — but the
+        // recheck covers the case where the previous derived was
+        // also empty and stays empty, no event fires).
+        if let Some(old_net) = current_net {
+            self.recheck_routes_dirty(old_net);
+        }
+        if let Some(n) = new_net {
+            self.recheck_routes_dirty(n);
+        }
 
         let entry = DeviceEntry {
             client_uuid,
@@ -2258,6 +2409,11 @@ impl Hub {
             network: net_uuid,
             device: entry.clone(),
         });
+        // Any of {lan_subnets, admitted, member-row added/removed}
+        // can have shifted the derived route set vs what's currently
+        // pushed to peers. The recheck is a no-op when nothing
+        // actually moved.
+        self.recheck_routes_dirty(net_uuid);
         let _ = ack.send(DeviceSetResult::Ok(entry));
     }
 
@@ -2309,6 +2465,13 @@ impl Hub {
                 .collect(),
             count,
         });
+        // After a successful push the network's view of the world is
+        // back in sync with what every bound peer holds. Update the
+        // baseline and emit a `routes.dirty=false` (if it was true)
+        // so the WebUI stops pulsing the button.
+        self.last_pushed_routes
+            .insert(net_uuid, routes.clone());
+        self.recheck_routes_dirty(net_uuid);
         let _ = ack.send(DevicePushResult { routes, count });
     }
 
@@ -2370,6 +2533,7 @@ impl Hub {
                     conn: *conn,
                 })
                 .collect(),
+            routes_dirty: self.routes_dirty_set(),
         };
         let _ = ack.send(snap);
     }

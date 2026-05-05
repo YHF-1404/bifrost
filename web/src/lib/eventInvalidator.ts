@@ -49,6 +49,13 @@ export function useEventInvalidator() {
           }
           break;
         }
+        case "routes.dirty": {
+          // The network's `routes_dirty` boolean changed — refresh the
+          // network list so the hub-card "push routes" button picks up
+          // the new pulse state.
+          qc.invalidateQueries({ queryKey: ["networks"] });
+          break;
+        }
         // metrics.tick handled by the metrics store; routes.changed
         // has no cached UI surface (yet).
         default:

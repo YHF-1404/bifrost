@@ -962,6 +962,38 @@ Diagnostic notes worth keeping (full perf trace in commit log):
 
 ### Completed (Phase 3.x — small follow-ups)
 
+* **Server-driven `routes.dirty` signal — gated on all-clients-online.**
+  The hub explicitly tracks the per-network "needs push?" state: a
+  `last_pushed_routes` in-memory snapshot is updated by `device_push`
+  and compared to the current derived route table after every
+  config-mutating handler (admit, kick, edit `lan_subnets`, assign
+  across networks, delete). The pulse is *gated* on operator
+  completion — it only fires once **every** client in the network is
+  admitted with a valid `tap_ip`; while any row is still mid-setup
+  (no IP yet, or admit toggle off) the gate stays closed and the
+  push button is silent. The operator's attention belongs on the
+  unfinished row's pulsing IP picker (next bullet) rather than on a
+  premature route push. State transitions emit
+  `HubEvent::RoutesDirty { network, dirty }` and `HubSnapshot::routes_dirty`
+  carries the current set, so a freshly-loaded WebUI tab paints the
+  right pulse without polling. The `Network` API row gains a
+  `routes_dirty: bool` field; both Table and Graph views drive the
+  amber pulse from it (with a small optimistic-overlay so a
+  save+pulse round-trip feels immediate).
+
+* **IP-first client setup flow.** Drag a client into a network and
+  Phase-3 spec clears its `admitted` flag and `tap_ip`. The WebUI
+  now reflects this with two visual cues that funnel the operator
+  through the right order: (1) the IP picker pulses amber
+  (`animate-pulse` + amber ring/background) demanding attention,
+  and (2) the admit toggle is `disabled` (greyed-out, click-blocked)
+  with a tooltip "Set an IP first, then flip to bring this device
+  online". Both views (Table row and Graph card) share the same
+  cue. Once the operator commits an IP the picker stops pulsing
+  and the toggle unlocks; flipping it admits the device and — if
+  it was the last hold-out — opens the network's `routes.dirty`
+  gate, turning the push button amber.
+
 * **`mknet --ip <cidr>` CLI flag.** `bifrost-server admin mknet
   <name> --ip 10.0.0.1/24` now creates the network *and* sets the
   host-side bridge IP in one step, validated to `/16` or `/24` to

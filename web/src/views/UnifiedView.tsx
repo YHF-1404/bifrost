@@ -198,11 +198,23 @@ export function UnifiedView() {
     },
   });
 
-  // Networks whose lan_subnets have been edited since the last push.
-  // The card's push button pulses amber while a net is here.
-  const [pendingPush, setPendingPush] = useState<Set<string>>(new Set());
+  // Networks whose currently-derived routes don't match what was
+  // last broadcast via `device_push`. Driven by the server's
+  // `routes_dirty` field on each network row + the `routes.dirty`
+  // WS event invalidating the cache. We additionally maintain a
+  // local "just-edited" overlay so the amber pulse appears the
+  // instant the admin saves a `lan_subnets` change instead of
+  // waiting for the round-trip.
+  const [optimisticDirty, setOptimisticDirty] = useState<Set<string>>(new Set());
+  const pendingPush = useMemo(() => {
+    const s = new Set<string>(optimisticDirty);
+    for (const n of networks) {
+      if (n.routes_dirty) s.add(n.id);
+    }
+    return s;
+  }, [networks, optimisticDirty]);
   const markPending = useCallback((nid: string) => {
-    setPendingPush((prev) => {
+    setOptimisticDirty((prev) => {
       if (prev.has(nid)) return prev;
       const next = new Set(prev);
       next.add(nid);
@@ -283,7 +295,11 @@ export function UnifiedView() {
         "success",
         `pushed ${r.routes.length} route(s) to ${r.count} client(s)`,
       );
-      setPendingPush((prev) => {
+      // Clear our optimistic overlay — the server's `routes.dirty=false`
+      // event then arrives via the invalidator and refreshes the
+      // network row's `routes_dirty` field for the authoritative
+      // post-push state.
+      setOptimisticDirty((prev) => {
         if (!prev.has(nid)) return prev;
         const next = new Set(prev);
         next.delete(nid);
@@ -935,6 +951,10 @@ function AdmittedClientRow({
     id: `client:${client.client_uuid}`,
     data: { kind: "client", cuid: client.client_uuid, from: netUuid },
   });
+  // Phase 3.x — IP-first flow: a freshly dragged-in client has empty
+  // tap_ip. Pulse the IP picker to demand attention; lock the admit
+  // switch so users can't try to bring it online without an address.
+  const ipMissing = !client.tap_ip;
   return (
     <li
       ref={setNodeRef}
@@ -960,7 +980,15 @@ function AdmittedClientRow({
       <Switch
         checked={client.admitted}
         onChange={(next) => onUpdate({ admitted: next })}
+        disabled={ipMissing}
         label={client.admitted ? "Kick this device" : "Admit this device"}
+        title={
+          ipMissing
+            ? "Set an IP first, then flip to bring this device online"
+            : client.admitted
+              ? "Kick this device"
+              : "Admit this device"
+        }
       />
       <InlineEdit
         value={client.display_name}
@@ -974,6 +1002,10 @@ function AdmittedClientRow({
         collisions={collisions}
         onCommit={(v) => onUpdate({ tap_ip: v })}
         placeholder="click to set"
+        className={cn(
+          ipMissing &&
+            "animate-pulse bg-amber-100 ring-2 ring-amber-400 ring-offset-1",
+        )}
       />
       <InlineEdit
         value={client.lan_subnets.join(", ")}
