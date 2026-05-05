@@ -291,6 +291,24 @@ Each script does:
 4. `systemctl daemon-reload && systemctl enable --now`
 5. Print `systemctl status` for verification
 
+### Optional: kernel tuning for higher throughput
+
+Bifrost's bulk-throughput ceiling on a host with a **single-queue NIC**
+(USB Ethernet adapters, most ARM SBCs, lots of embedded boards) is set
+by `NET_RX` softirq pinning to one core. To distribute that work in
+software run once per host, after each boot:
+
+```bash
+sudo scripts/tune-host.sh             # auto-detect default-route NIC
+sudo scripts/tune-host.sh end0        # or specify the NIC
+```
+
+The script enables RPS / RFS / XPS on the chosen NIC. On the
+project's LAN testbed (Cortex-A55 4-core, single-queue gigabit) it
+lifted single-stream upload from 361 Mbps → 451 Mbps (~+25 %). The
+settings are runtime only — re-run after each reboot, or wire it
+into `/etc/rc.local` / a systemd-tmpfiles drop-in / a udev rule.
+
 ### systemd integration
 
 Units are bundled at `deploy/systemd/`:
@@ -890,6 +908,57 @@ Crate dependency graph:
   wrapper; the IP-segment editor's input width grew (`w-9 → w-12`)
   so 3-digit octets fit; the throughput value column got `w-20` +
   `whitespace-nowrap` so `99.9 GB/s` stays on one line.
+
+### Completed (Phase 3.2 — bulk throughput in a controlled LAN testbed)
+
+Single-stream measurements between an aarch64 Cortex-A55 client and
+an x86_64 server over gigabit LAN (direct LAN baseline: 940 Mbps):
+
+| Path                                | upload   | download |
+|-------------------------------------|----------|----------|
+| bifrost direct                       | 497 Mbps | 446 Mbps |
+| bifrost + xray-core (VLESS Reality) | 316 Mbps | 335 Mbps |
+
+Three layered changes on top of the Phase 3.1 baseline:
+
+* **`scripts/tune-host.sh`** — RPS / RFS / XPS configuration helper
+  for hosts with a single-queue NIC (USB-Ethernet adapters and most
+  embedded ARM SBCs). Without it `NET_RX` softirq pins to whichever
+  CPU first handled the IRQ; the script distributes that work in
+  software across all cores. Lifted single-stream upload 361 Mbps
+  → 451 Mbps in the testbed.
+
+* **Bounded batched send (32 frames or 32 KB, whichever first).**
+  Replaces per-frame `framed.send` on both ends. With per-frame
+  writes the kernel TCP layer can't TSO-coalesce — every 1.4 KB
+  Ethernet frame became its own MSS-sized segment; an intermediate
+  proxy (xray-core) also paid full per-write VLESS-framing-and-crypto
+  cost for each tiny chunk. The bounded batch produces one ~30 KB
+  userspace write per flush — small enough to stay well under any
+  reasonable receive buffer (xray's autotuned ~256 KB), big enough
+  that the NIC's TSO splits it into ~22 wire packets per syscall and
+  xray sees one read instead of 22. Re-bounds the scheme that an
+  earlier "drain whole channel into one flush" version got wrong:
+  unbounded batching had crashed RWND to 0 on a long-RTT VPS xray
+  tunnel; the 32 KB cap keeps that safe.
+
+* **Live `bridge_ip` updates** (carry-over from 3.1's bug fix).
+  `Bridge::set_ip` on the trait + matching netlink push from
+  `Hub::handle_set_net_bridge_ip` so a WebUI/API edit takes effect
+  without a server restart.
+
+Diagnostic notes worth keeping (full perf trace in commit log):
+
+* The remaining gap to LAN line rate (940 → 497 Mbps for bifrost
+  alone, ~50 % loss) is fundamental for a user-space VPN: 6 stack
+  traversals per inner Ethernet frame vs the 1 that direct iperf3
+  pays, and per-frame outer TCP writes that can't be amortized into
+  TSO-size SKBs without breaking proxy receive buffers.
+
+* Going past ~500 Mbps on this hardware needs an architectural
+  change — multi-connection per client, GSO-style super-frames, or
+  io_uring batched I/O. Each comes with non-trivial protocol-side
+  changes; deferred.
 
 ### Roadmap
 
