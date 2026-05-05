@@ -73,7 +73,10 @@ async fn resolve_admin_socket(socket: Option<PathBuf>, config: &PathBuf) -> Resu
 
 async fn admin_client(socket: PathBuf, cmd: AdminCmd) -> Result<()> {
     let req = match cmd {
-        AdminCmd::Mknet { name } => ServerAdminReq::MakeNet { name },
+        AdminCmd::Mknet { name, ip } => ServerAdminReq::MakeNet {
+            name,
+            bridge_ip: ip,
+        },
         AdminCmd::Rename { net_uuid, name } => ServerAdminReq::RenameNet { net_uuid, name },
         AdminCmd::Rmnet { net_uuid } => ServerAdminReq::DeleteNet { net_uuid },
         AdminCmd::Device { action } => match action {

@@ -126,14 +126,24 @@ async fn create_network(
     if trimmed.is_empty() {
         return bad_request("name is required");
     }
-    let Some(uuid) = state.hub.make_net(trimmed.clone()).await else {
-        return service_unavailable("hub gone");
-    };
-    Json(CreateNetworkResp {
-        id: uuid,
-        name: trimmed,
-    })
-    .into_response()
+    // The WebUI's create-network flow sets `bridge_ip` as a follow-up
+    // PATCH (segment-locked picker on the network card), so we pass
+    // `None` here. Programmatic CLI / `bifrost-server admin mknet
+    // --ip` callers can pre-populate `bridge_ip` instead.
+    match state.hub.make_net(trimmed.clone(), None).await {
+        Some(bifrost_core::MakeNetResult::Ok(uuid)) => Json(CreateNetworkResp {
+            id: uuid,
+            name: trimmed,
+        })
+        .into_response(),
+        Some(bifrost_core::MakeNetResult::InvalidBridgeIp(msg)) => {
+            // Cannot happen from this code path (we passed None) but
+            // mirror the typed result so adding a body field later is
+            // a one-line change.
+            bad_request(&format!("invalid bridge_ip: {msg}"))
+        }
+        None => service_unavailable("hub gone"),
+    }
 }
 
 /// `PATCH /api/networks/:nid` body. Either or both of `name` and

@@ -472,7 +472,7 @@ which performs a single request-reply RPC and exits.
 
 | Command | Action |
 |---|---|
-| `mknet <name>` | Create a virtual network; returns its UUID. |
+| `mknet <name> [--ip <cidr>]` | Create a virtual network; returns its UUID. `--ip` is an optional host-side bridge gateway in CIDR form (e.g. `--ip 10.0.0.1/24`). Only `/16` or `/24` prefixes are accepted (matches the WebUI segment-locked picker). Without `--ip` the bridge is created without a host-side address and admins can set it later via the WebUI / `PATCH /api/networks/:nid`. |
 | `rename <net-uuid> <new-name>` | Rename an existing network. |
 | `rmnet <net-uuid>` | **Phase 3** — delete a network. Clients **detach to the pending pool** (preserving display_name + lan_subnets) instead of being removed; the kernel bridge is destroyed and routes re-synced. |
 | `assign <client-uuid> <net-uuid|none>` | **Phase 3** — assign a client to a network or `none` to detach. Sends `Frame::AssignNet` to the live conn so the client tears down its TAP and re-joins the new target. After this, run `device set --ip ... --admit true` to bring it online. |
@@ -960,11 +960,33 @@ Diagnostic notes worth keeping (full perf trace in commit log):
   io_uring batched I/O. Each comes with non-trivial protocol-side
   changes; deferred.
 
+### Completed (Phase 3.x — small follow-ups)
+
+* **`mknet --ip <cidr>` CLI flag.** `bifrost-server admin mknet
+  <name> --ip 10.0.0.1/24` now creates the network *and* sets the
+  host-side bridge IP in one step, validated to `/16` or `/24` to
+  match the WebUI segment-locked picker. The kernel bridge gets the
+  address via netlink at creation; no follow-up `PATCH` (and no
+  `server.toml` hand-edit) required. Same `ip=<cidr>` syntax in
+  the in-process REPL. The admin protocol's `MakeNet` request and
+  the `NetEntry` snapshot row now both carry `bridge_ip`; an
+  invalid CIDR fails fast and leaves no half-created network.
+
+* **Phase-3 stale-config join race fixed.** Previously a client
+  whose toml carried a `joined_network` from a previous server
+  would auto-`Join` that stale UUID right after `HelloAck`,
+  racing the server's `AssignNet` and producing
+  `JoinDeny: unknown_network` followed by
+  `WARN JoinOk without prior Join — ignoring`, leaving the
+  session permanently stuck. The client no longer auto-joins
+  from cache — the server's `AssignNet` is the single source of
+  truth, with REPL/admin `join <net>` traffic carried separately
+  in a `pending_user_join` slot.
+
 ### Roadmap
 
 | Phase | Item | Notes |
 |---|---|---|
-| 3.x | `--ip <cidr>` flag on `mknet` CLI | Phase 3.0 adds a WebUI bridge-IP picker + `PATCH /api/networks/:nid` with a `bridge_ip` field, but the CLI form still requires hand-editing `server.toml` to set a fresh network's bridge IP. |
 | —   | **Noise XX transport** | `Hello.caps` bit already reserved; add a `snow`-backed `Transport` impl, no business-logic changes |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`; per-session bytes / frames / drops (`[metrics]` config exists but is currently a no-op) |
 | —   | **Per-session pcap dump** | `SessionCmd::PcapStart/Stop` already defined in core |
