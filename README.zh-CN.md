@@ -535,6 +535,28 @@ Admin RPC 是另一份独立协议：
 - ✅ **Table 视图**：每行升级成圆角卡片（细边框 + 浅阴影 + hover 高亮），相邻行有清晰边界；列模板和顶部表头条共享同一份 grid，`name` / `tap IP` / `LAN subnets` / `throughput` / `uuid` 永远纵向对齐；`dnd-kit` 改用 `pointerWithin` 碰撞检测，PENDING 区任何位置（包括紧贴顶部）都能放进去 —— 之前默认 `rectIntersection` 让 200px 宽的拖动预览框跟更宽的 Networks 区相交面积更大，落点会被吃掉。
 - ✅ **Graph 视图**：客户端卡片高度按 LAN 子网数量自动算（`base + (lan_rows - 1) * 22 px`），5 个 LAN 也不会把流量图挤出 React Flow 包装；IP 段位拣选器输入框宽度从 `w-9 → w-12`，3 位数（`255`）也宽松；流量数值列改 `w-20 + whitespace-nowrap`，`99.9 GB/s` 也能单行。
 
+### 已完成（Phase 3.2 — LAN 测试床上的批量吞吐）
+
+aarch64 Cortex-A55 client → x86_64 server，千兆 LAN 单流（直连 LAN 基线 940 Mbps）：
+
+| 路径 | 上行 | 下行 |
+|---|---|---|
+| bifrost 直连 | 497 Mbps | 446 Mbps |
+| bifrost + xray-core (VLESS Reality) | 316 Mbps | 335 Mbps |
+
+在 Phase 3.1 基础上新增三层改动：
+
+- ✅ **`scripts/tune-host.sh`** —— 单队列 NIC 主机的 RPS / RFS / XPS 配置脚本（USB 以太网适配器、多数嵌入式 ARM 板都属于此类）。不开启时 `NET_RX` softirq 钉死在第一次处理 IRQ 的那个核上；脚本把这部分活在软件层面分散到所有核。LAN 测试床上单流上行从 361 Mbps 涨到 451 Mbps。
+
+- ✅ **有界批量发送（每次最多 32 帧或 32 KB，谁先到为准）**。两端都从单帧 `framed.send` 改成累一批后再 flush。单帧写入时内核 TCP 没法 TSO 合并 —— 每个 1.4 KB 的以太帧只能变成一个 MSS 段；中间的代理（xray-core）也得对每 1.4 KB 跑一遍完整的 VLESS framing + 加密。有界批量后每次 flush 出去 ~30 KB —— 远小于任何合理的接收 buffer（xray 自调到 ~256 KB），但又大到让 NIC TSO 把它一次拆成 ~22 个网线包，xray 看到的是一次大读而不是 22 次小读。这次有界版修了之前"无界一把梭"的翻车 —— 之前在长 RTT 的 VPS xray 隧道上把 RWND 砸到 0，cwnd 直接重置到 10；32 KB 的上限把这条路也保住。
+
+- ✅ **`bridge_ip` 实时更新**（继承自 3.1 的 bug 修复）。`Bridge::set_ip` 加进 trait + `Hub::handle_set_net_bridge_ip` 经 netlink 推到内核桥，WebUI/API 改桥 IP 不用再重启 server。
+
+诊断笔记（commit log 里有完整 perf 痕迹）：
+
+- 还差 LAN 线速的那部分（940 → 497 Mbps，bifrost 单跑丢一半）是用户态 VPN 的根本代价：每个内层以太帧得跨 6 次内核网络栈（直连 iperf3 只跨 1 次），而且单帧 outer TCP 写法没法在不打爆代理 recv buffer 的前提下被 TSO 合并。
+- 突破 ~500 Mbps 单流要架构改动 —— per-client 多连接、GSO 风格的 super-frame、或者 io_uring 批量 I/O。每一项都涉及协议级改动，先押后。
+
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
