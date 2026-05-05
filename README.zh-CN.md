@@ -269,7 +269,7 @@ socket = "/run/bifrost/client.sock"
 
 | 命令 | 行为 |
 |---|---|
-| `mknet <name>` | 创建虚拟网络，返回 UUID |
+| `mknet <name> [--ip <cidr>]` | 创建虚拟网络，返回 UUID。`--ip` 可选，给虚拟网桥配主机侧 gateway IP（如 `--ip 10.0.0.1/24`），仅接受 `/16` 或 `/24` 前缀（和 WebUI 段位拣选器一致）；不带 `--ip` 时网桥不带 host 地址，可后续通过 WebUI / `PATCH /api/networks/:nid` 设置 |
 | `rename <net-uuid> <new-name>` | 重命名网络 |
 | `rmnet <net-uuid>` | **Phase 3** —— 删网络。下属 client 不删，**统一搬到 pending pool**（保留 display_name 和 lan_subnets），同时拆掉内核网桥并重派生路由 |
 | `assign <client-uuid> <net-uuid|none>` | **Phase 3** —— 把 client 分配到某网络（`none` 则拆出去回到 pending pool）。服务端发 `Frame::AssignNet` 让 client 销毁 TAP 重新 Join；分到新网后 admitted=false、tap_ip="" 需要再 `device set --ip ... --admit true` |
@@ -557,11 +557,16 @@ aarch64 Cortex-A55 client → x86_64 server，千兆 LAN 单流（直连 LAN 基
 - 还差 LAN 线速的那部分（940 → 497 Mbps，bifrost 单跑丢一半）是用户态 VPN 的根本代价：每个内层以太帧得跨 6 次内核网络栈（直连 iperf3 只跨 1 次），而且单帧 outer TCP 写法没法在不打爆代理 recv buffer 的前提下被 TSO 合并。
 - 突破 ~500 Mbps 单流要架构改动 —— per-client 多连接、GSO 风格的 super-frame、或者 io_uring 批量 I/O。每一项都涉及协议级改动，先押后。
 
+### 已完成（Phase 3.x — 零碎收尾）
+
+- ✅ **`mknet --ip <cidr>` CLI flag**。`bifrost-server admin mknet <name> --ip 10.0.0.1/24` 一次性建网络 + 配桥 IP，校验只允许 `/16` 或 `/24`（和 WebUI 段位拣选器一致）。kernel 桥在创建时就经 netlink 装上 IP，不需要再 `PATCH`，更不用手编 `server.toml`。in-process REPL 上是 `ip=<cidr>` 同义语法。admin 协议的 `MakeNet` 请求和 `NetEntry` snapshot 行都新增了 `bridge_ip` 字段；非法 CIDR 会立即报错且不留半截创建好的网络。
+
+- ✅ **Phase 3 stale-config Join 竞态**修复。之前 client 配置文件里残留旧 server 的 `joined_network` 时，`HelloAck` 之后会立刻按这个旧 UUID 发 `Join`，与服务端的 `AssignNet` 抢跑，结果是 `JoinDeny: unknown_network` 然后是 `WARN JoinOk without prior Join — ignoring`，session 永久卡死。现在 client 不再从 cache 自动 Join —— 服务端 `AssignNet` 是唯一的 source of truth，REPL/admin 的 `join <net>` 走单独的 `pending_user_join` 字段不会和缓存值打架。
+
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
 |---|---|---|
-| 3.x | `mknet` CLI 加 `--ip <cidr>` flag | Phase 3.0 已经在 WebUI + `PATCH /api/networks/:nid` 加上了网桥 IP 段位拣选器，但 `mknet` CLI 还得手编 `server.toml` 给新网络配 IP。 |
 | —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基；`[metrics]` 配置段已存在但目前是空挂） |
 | —   | **per-session pcap dump** | `SessionCmd::PcapStart/Stop` 已经定义，只缺实现 |

@@ -89,6 +89,7 @@ async fn mknet_round_trip_returns_uuid() {
         &h.socket,
         ServerAdminReq::MakeNet {
             name: "hml".into(),
+            bridge_ip: None,
         },
     )
     .await;
@@ -97,6 +98,63 @@ async fn mknet_round_trip_returns_uuid() {
             assert_ne!(uuid, Uuid::nil());
         }
         other => panic!("expected NetCreated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mknet_with_bridge_ip_persists_it() {
+    let h = spawn(vec![], vec![]).await;
+    let resp = rpc(
+        &h.socket,
+        ServerAdminReq::MakeNet {
+            name: "ipd".into(),
+            bridge_ip: Some("10.7.0.1/24".into()),
+        },
+    )
+    .await;
+    let uuid = match resp {
+        ServerAdminResp::NetCreated { uuid } => uuid,
+        other => panic!("expected NetCreated, got {other:?}"),
+    };
+    // Verify the IP made it into the snapshot.
+    let resp = rpc(&h.socket, ServerAdminReq::List).await;
+    match resp {
+        ServerAdminResp::Snapshot(snap) => {
+            let net = snap
+                .networks
+                .iter()
+                .find(|n| n.uuid == uuid)
+                .expect("created net not in snapshot");
+            assert_eq!(net.bridge_ip, "10.7.0.1/24");
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mknet_with_invalid_bridge_ip_errors_out_no_network_created() {
+    let h = spawn(vec![], vec![]).await;
+    let resp = rpc(
+        &h.socket,
+        ServerAdminReq::MakeNet {
+            name: "bad".into(),
+            bridge_ip: Some("not-an-ip".into()),
+        },
+    )
+    .await;
+    match resp {
+        ServerAdminResp::Error(msg) => assert!(
+            msg.contains("invalid bridge_ip"),
+            "unexpected error message: {msg}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // The failed mknet must NOT have left a half-created network.
+    let resp = rpc(&h.socket, ServerAdminReq::List).await;
+    if let ServerAdminResp::Snapshot(snap) = resp {
+        assert!(snap.networks.iter().all(|n| n.name != "bad"));
+    } else {
+        panic!("expected Snapshot");
     }
 }
 

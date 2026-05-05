@@ -34,7 +34,7 @@ pub fn run_blocking(tx: mpsc::Sender<(ServerAdminReq, oneshot::Sender<String>)>)
 
     println!(
         "REPL — same commands as `bifrost-server admin <cmd>`:\n  \
-         mknet <name> |\n  \
+         mknet <name> [ip=<cidr>] |\n  \
          assign <client-uuid> <net-uuid|none>  (Phase 3) |\n  \
          device list [<net-uuid>] |\n  \
          device set <client-uuid> [name=X] [ip=Y/CIDR] [admit=true|false] [lan=A,B,...] |\n  \
@@ -81,14 +81,7 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
     let rest = parts.next().unwrap_or("").trim();
 
     let req = match head {
-        "mknet" => {
-            if rest.is_empty() {
-                return Err("usage: mknet <name>".into());
-            }
-            ServerAdminReq::MakeNet {
-                name: rest.to_string(),
-            }
-        }
+        "mknet" => parse_mknet(rest)?,
         "device" => parse_device(rest)?,
         "assign" => parse_assign(rest)?,
         "list" => ServerAdminReq::List,
@@ -119,6 +112,33 @@ pub fn parse(line: &str) -> Result<ReplCmd, String> {
         other => return Err(format!("unknown command {other:?}")),
     };
     Ok(ReplCmd::Req(req))
+}
+
+/// `mknet <name> [ip=<cidr>]` — accepts a single name token plus an
+/// optional `ip=…` kv pair. Mirrors the `--ip` flag on the
+/// `bifrost-server admin mknet` CLI subcommand.
+fn parse_mknet(rest: &str) -> Result<ServerAdminReq, String> {
+    if rest.is_empty() {
+        return Err("usage: mknet <name> [ip=<cidr>]".into());
+    }
+    let mut it = rest.split_whitespace();
+    let name = it
+        .next()
+        .ok_or("usage: mknet <name> [ip=<cidr>]")?
+        .to_string();
+    let mut bridge_ip: Option<String> = None;
+    for tok in it {
+        if let Some(v) = tok.strip_prefix("ip=") {
+            if !v.is_empty() {
+                bridge_ip = Some(v.to_string());
+            }
+        } else {
+            return Err(format!(
+                "unknown mknet arg {tok:?} (expected ip=<cidr>)"
+            ));
+        }
+    }
+    Ok(ServerAdminReq::MakeNet { name, bridge_ip })
 }
 
 /// `assign <client-uuid> <net-uuid|none>` — Phase 3 drag-to-assign over CLI.
@@ -226,8 +246,29 @@ mod tests {
     fn parses_basic_commands() {
         assert_eq!(
             parse("mknet hml").unwrap(),
-            ReplCmd::Req(ServerAdminReq::MakeNet { name: "hml".into() })
+            ReplCmd::Req(ServerAdminReq::MakeNet {
+                name: "hml".into(),
+                bridge_ip: None,
+            })
         );
+        assert_eq!(
+            parse("mknet hml ip=10.0.0.1/24").unwrap(),
+            ReplCmd::Req(ServerAdminReq::MakeNet {
+                name: "hml".into(),
+                bridge_ip: Some("10.0.0.1/24".into()),
+            })
+        );
+        // ip= with empty value normalises to None (matches the
+        // "no flag" semantics of the CLI).
+        assert_eq!(
+            parse("mknet hml ip=").unwrap(),
+            ReplCmd::Req(ServerAdminReq::MakeNet {
+                name: "hml".into(),
+                bridge_ip: None,
+            })
+        );
+        assert!(parse("mknet hml ip=10.0.0.1/24 stray").is_err());
+        assert!(parse("mknet hml unknown=foo").is_err());
         assert_eq!(parse("list").unwrap(), ReplCmd::Req(ServerAdminReq::List));
         assert_eq!(
             parse("send hi there").unwrap(),

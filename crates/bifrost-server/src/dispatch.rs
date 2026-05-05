@@ -4,7 +4,7 @@
 //! admin server route requests through [`dispatch`] so behavior stays
 //! identical between the two paths.
 
-use bifrost_core::{DevicePushResult, DeviceSetResult, DeviceUpdate, HubHandle};
+use bifrost_core::{DevicePushResult, DeviceSetResult, DeviceUpdate, HubHandle, MakeNetResult};
 use bifrost_proto::admin::{
     NetEntry, PendingEntry, RouteRow, ServerAdminReq, ServerAdminResp, SessionEntry, SnapshotData,
 };
@@ -13,8 +13,11 @@ use bifrost_proto::admin::{
 /// call(s) and return the wire response.
 pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
     match req {
-        ServerAdminReq::MakeNet { name } => match hub.make_net(name).await {
-            Some(uuid) => ServerAdminResp::NetCreated { uuid },
+        ServerAdminReq::MakeNet { name, bridge_ip } => match hub.make_net(name, bridge_ip).await {
+            Some(MakeNetResult::Ok(uuid)) => ServerAdminResp::NetCreated { uuid },
+            Some(MakeNetResult::InvalidBridgeIp(msg)) => {
+                ServerAdminResp::Error(format!("invalid bridge_ip: {msg}"))
+            }
             None => ServerAdminResp::Error("hub gone".into()),
         },
         ServerAdminReq::RenameNet { net_uuid, name } => {
@@ -82,6 +85,7 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
                     .map(|n| NetEntry {
                         name: n.name.clone(),
                         uuid: n.uuid,
+                        bridge_ip: n.bridge_ip.clone(),
                     })
                     .collect(),
                 sessions: snap

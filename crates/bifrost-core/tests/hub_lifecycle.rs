@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_core::config::{ApprovedClient, NetRecord, ServerConfig};
-use bifrost_core::{ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, SessionCmd};
+use bifrost_core::{
+    ConnId, ConnLink, DeviceUpdate, Hub, HubEvent, HubHandle, MakeNetResult, SessionCmd,
+};
 use bifrost_net::mock::{MockBridge, MockPlatform};
 use bifrost_net::{Platform, Tap};
 use bifrost_proto::{Frame, PROTOCOL_VERSION};
@@ -405,7 +407,9 @@ async fn admit_toggle_off_kicks_session_keeps_row_in_pending() {
 #[tokio::test]
 async fn make_net_persists_into_list() {
     let h = spawn(build_cfg(60)).await;
-    let uuid = h.hub.make_net("hml-net".into()).await.unwrap();
+    let MakeNetResult::Ok(uuid) = h.hub.make_net("hml-net".into(), None).await.unwrap() else {
+        panic!("expected MakeNetResult::Ok");
+    };
     let snap = h.hub.list().await.unwrap();
     assert!(snap
         .networks
@@ -922,7 +926,9 @@ async fn make_net_persists_to_disk() {
     cfg.save(&cfg_path).await.unwrap();
     let h = spawn_with_path(cfg, Some(cfg_path.clone())).await;
 
-    let uuid = h.hub.make_net("hml".into()).await.unwrap();
+    let MakeNetResult::Ok(uuid) = h.hub.make_net("hml".into(), None).await.unwrap() else {
+        panic!("expected MakeNetResult::Ok");
+    };
     let on_disk = ServerConfig::load(&cfg_path).await.unwrap();
     assert!(on_disk
         .networks

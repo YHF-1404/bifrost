@@ -51,9 +51,19 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum AdminCmd {
-    /// Create a virtual network and persist it.
+    /// Create a virtual network and persist it. Optionally set the
+    /// host-side bridge IP at creation time (`--ip 10.0.0.1/24`),
+    /// matching the `/16` or `/24` constraint of the WebUI picker.
+    /// Without `--ip` the bridge has no host-side address; admins
+    /// can set it later via the WebUI / API or by re-creating the
+    /// network with the flag.
     Mknet {
         name: String,
+        /// Bridge gateway address in CIDR form, e.g. `10.0.0.1/24`.
+        /// Only `/16` or `/24` prefixes are accepted (matches the
+        /// `IpSegmentInput` picker in the WebUI).
+        #[arg(long, value_name = "CIDR")]
+        ip: Option<String>,
     },
     /// Rename an existing network.
     Rename {

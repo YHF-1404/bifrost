@@ -28,7 +28,18 @@ pub const MAX_ADMIN_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerAdminReq {
-    MakeNet { name: String },
+    /// Create a virtual network. `bridge_ip` is the host-side gateway
+    /// address in CIDR form (e.g. `"10.0.0.1/24"`). `None` leaves the
+    /// bridge IP-less; admins can set it later via the WebUI / API
+    /// (`PATCH /api/networks/:nid`) or the CLI's still-to-be-built
+    /// `set bridge-ip` command. Validation (must parse as IpNet,
+    /// must be /16 or /24 to match the segment-locked picker) is on
+    /// the server side; an invalid value comes back as
+    /// `ServerAdminResp::Err`.
+    MakeNet {
+        name: String,
+        bridge_ip: Option<String>,
+    },
     RenameNet { net_uuid: Uuid, name: String },
     DeleteNet { net_uuid: Uuid },
     /// Mutate one or more fields of a client. `None` on a field means
@@ -116,6 +127,12 @@ pub struct SnapshotData {
 pub struct NetEntry {
     pub name: String,
     pub uuid: Uuid,
+    /// Host-side bridge IP in CIDR form. Empty means the bridge has
+    /// no host-side address (pure-L2). `#[serde(default)]` so an
+    /// older daemon without this field can still deserialize into
+    /// the new shape.
+    #[serde(default)]
+    pub bridge_ip: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +264,7 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(1024);
         let req = ServerAdminReq::MakeNet {
             name: "hml-net".into(),
+            bridge_ip: Some("10.0.0.1/24".into()),
         };
         write_admin(&mut a, &req).await.unwrap();
         let got: ServerAdminReq = read_admin(&mut b).await.unwrap();
@@ -260,6 +278,7 @@ mod tests {
             networks: vec![NetEntry {
                 name: "n".into(),
                 uuid: Uuid::new_v4(),
+                bridge_ip: "10.0.0.1/24".into(),
             }],
             sessions: vec![],
             pending: vec![],

@@ -115,6 +115,17 @@ pub enum DeviceSetResult {
     Conflict { msg: String },
 }
 
+/// Outcome of a [`HubHandle::make_net`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MakeNetResult {
+    /// Network created; UUID returned.
+    Ok(Uuid),
+    /// `bridge_ip` was supplied but is malformed or has an unsupported
+    /// prefix (Phase 3 constrains to `/16` or `/24` only). The network
+    /// was NOT created — admins re-run with a valid value.
+    InvalidBridgeIp(String),
+}
+
 /// Outcome of a [`HubHandle::set_net_bridge_ip`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetNetBridgeIpResult {
@@ -175,7 +186,8 @@ pub enum HubCmd {
     // ── REPL originated ───────────────────────────────────────────────
     MakeNet {
         name: String,
-        ack: oneshot::Sender<Uuid>,
+        bridge_ip: Option<String>,
+        ack: oneshot::Sender<MakeNetResult>,
     },
     /// Rename a network. Returns `true` on success, `false` if the
     /// network UUID is unknown.
@@ -308,10 +320,24 @@ impl HubHandle {
         let _ = self.cmd_tx.send(HubCmd::Disconnect { conn }).await;
     }
 
-    pub async fn make_net(&self, name: String) -> Option<Uuid> {
+    /// Create a virtual network. `bridge_ip` is an optional CIDR for
+    /// the host-side gateway address (e.g. `"10.0.0.1/24"`); `None`
+    /// leaves the bridge address-less. Validation happens in the hub
+    /// task; an invalid `bridge_ip` returns `InvalidBridgeIp(_)` and
+    /// the network is NOT persisted (callers can prompt the admin
+    /// to retry with a fixed value).
+    pub async fn make_net(
+        &self,
+        name: String,
+        bridge_ip: Option<String>,
+    ) -> Option<MakeNetResult> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(HubCmd::MakeNet { name, ack: tx })
+            .send(HubCmd::MakeNet {
+                name,
+                bridge_ip,
+                ack: tx,
+            })
             .await
             .ok()?;
         rx.await.ok()
@@ -819,7 +845,11 @@ impl Hub {
             } => self.handle_hello(conn, client_uuid, version).await,
             HubCmd::Join { conn, net_uuid } => self.handle_join(conn, net_uuid).await,
             HubCmd::Disconnect { conn } => self.handle_disconnect(conn).await,
-            HubCmd::MakeNet { name, ack } => self.handle_make_net(name, ack).await,
+            HubCmd::MakeNet {
+                name,
+                bridge_ip,
+                ack,
+            } => self.handle_make_net(name, bridge_ip, ack).await,
             HubCmd::RenameNet {
                 net_uuid,
                 name,
@@ -1406,22 +1436,56 @@ impl Hub {
 
     // ── REPL handlers ────────────────────────────────────────────────
 
-    async fn handle_make_net(&mut self, name: String, ack: oneshot::Sender<Uuid>) {
+    async fn handle_make_net(
+        &mut self,
+        name: String,
+        bridge_ip: Option<String>,
+        ack: oneshot::Sender<MakeNetResult>,
+    ) {
+        // Validate `bridge_ip` BEFORE creating anything — same prefix
+        // rules as `set_net_bridge_ip` (Phase 3 picker is /16 or /24
+        // only). Failing fast keeps a half-created network out of the
+        // persisted config.
+        let validated_ip = match bridge_ip.as_deref() {
+            None | Some("") => None,
+            Some(s) => match s.parse::<IpNet>() {
+                Ok(net) => match net.prefix_len() {
+                    16 | 24 => Some(net),
+                    other => {
+                        let _ = ack.send(MakeNetResult::InvalidBridgeIp(format!(
+                            "prefix /{other} not supported (use /16 or /24)"
+                        )));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = ack.send(MakeNetResult::InvalidBridgeIp(e.to_string()));
+                    return;
+                }
+            },
+        };
+
         let uuid = Uuid::new_v4();
-        let rec = NetRecord::new(name.clone(), uuid);
+        let mut rec = NetRecord::new(name.clone(), uuid);
+        if let Some(ip) = &validated_ip {
+            rec.bridge_ip = ip.to_string();
+        }
         // Create the kernel-side bridge first. If that fails the
         // record never lands in `cfg.networks` — better to surface the
         // error to the admin than to leave a half-created network in
         // a state where joins succeed but frames go nowhere.
+        // `create_bridge_for` reads `rec.bridge_ip`, so passing it
+        // here installs the IP on the kernel link in one step
+        // instead of requiring a follow-up `set bridge-ip` call.
         self.create_bridge_for(&rec).await;
         self.cfg.networks.push(rec);
         self.persist().await;
-        info!(%name, %uuid, "network created");
+        info!(%name, %uuid, ?validated_ip, "network created");
         self.emit(HubEvent::NetworkCreated {
             network: uuid,
             name,
         });
-        let _ = ack.send(uuid);
+        let _ = ack.send(MakeNetResult::Ok(uuid));
     }
 
     async fn handle_set_net_bridge_ip(
