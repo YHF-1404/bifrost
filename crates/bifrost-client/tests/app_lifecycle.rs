@@ -237,7 +237,22 @@ async fn auto_rejoin_after_disconnect() {
         .await
         .unwrap();
 
-    // After HelloAck the controller should re-emit Join automatically.
+    // Phase 3 — the client must NOT auto-Join from its cached
+    // `joined_network`; that's the race that produced
+    // `JoinDeny: unknown_network` in production. The server pushes
+    // `AssignNet` after `HelloAck` and that's what drives `Join`.
+    assert!(
+        try_recv(&mut h.out_rx, Duration::from_millis(50)).await.is_none(),
+        "client must wait for AssignNet, not Join from stale config"
+    );
+    h.events_tx
+        .send(ConnEvent::FrameIn(Frame::AssignNet {
+            net_uuid: Some(net),
+        }))
+        .await
+        .unwrap();
+
+    // After AssignNet the controller emits Join.
     match recv_frame(&mut h.out_rx).await {
         Frame::Join { net_uuid } => assert_eq!(net_uuid, net),
         other => panic!("expected Join, got {other:?}"),
@@ -353,9 +368,21 @@ async fn join_before_helloack_defers_until_handshake() {
 }
 
 #[tokio::test]
-async fn persisted_joined_network_triggers_auto_join_on_first_handshake() {
-    let net = Uuid::new_v4();
-    let mut h = spawn_app(Some(net)).await;
+async fn persisted_joined_network_does_not_auto_join_on_handshake() {
+    // Phase 3 — the server is authoritative on assignment, so a
+    // client that has a cached `joined_network` from a previous
+    // session does NOT auto-Join on `HelloAck`. It waits for the
+    // server's `AssignNet` (which a Phase 3 server always sends in
+    // `handle_hello`) and joins based on that.
+    //
+    // Pre-Phase-3 the client *did* auto-Join from cache, but that
+    // races with `AssignNet`: a stale cache produces
+    // `JoinDeny: unknown_network`, which clears `joining_net`, and
+    // then the real `AssignNet`-driven `Join` lands a `JoinOk` whose
+    // handler logs "JoinOk without prior Join — ignoring" and the
+    // session is permanently stuck.
+    let stale_cached = Uuid::new_v4();
+    let mut h = spawn_app(Some(stale_cached)).await;
 
     h.events_tx.send(ConnEvent::Connected).await.unwrap();
     match recv_frame(&mut h.out_rx).await {
@@ -371,9 +398,25 @@ async fn persisted_joined_network_triggers_auto_join_on_first_handshake() {
         .await
         .unwrap();
 
-    // No user command — Join must fire because of persisted state.
+    // The bug-now-fixed: client must NOT send Join from cache.
+    assert!(
+        try_recv(&mut h.out_rx, Duration::from_millis(80)).await.is_none(),
+        "client incorrectly auto-Joined from stale cached joined_network"
+    );
+
+    // Server picks the network and pushes AssignNet (which may
+    // disagree with the client's cache).
+    let server_pick = Uuid::new_v4();
+    h.events_tx
+        .send(ConnEvent::FrameIn(Frame::AssignNet {
+            net_uuid: Some(server_pick),
+        }))
+        .await
+        .unwrap();
+
+    // AssignNet triggers Join — for the server-picked network.
     match recv_frame(&mut h.out_rx).await {
-        Frame::Join { net_uuid } => assert_eq!(net_uuid, net),
+        Frame::Join { net_uuid } => assert_eq!(net_uuid, server_pick),
         other => panic!("expected Join, got {other:?}"),
     }
 

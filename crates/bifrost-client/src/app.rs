@@ -68,6 +68,13 @@ pub struct App {
     session_evt_tx: mpsc::Sender<SessionEvt>,
 
     joining_net: Option<Uuid>,
+    /// Network the user explicitly asked to join via REPL/admin while
+    /// the connection wasn't ready yet. Fires once on the next
+    /// `HelloAck`. We deliberately do NOT auto-join from
+    /// `joining_net` (which can be a stale value loaded from
+    /// `cfg.client.joined_network`) — the server's `AssignNet` is
+    /// authoritative. See the `HelloAck` handler.
+    pending_user_join: Option<Uuid>,
     joined_net: Option<Uuid>,
     /// Set when a session task is alive (we created a local TAP).
     joined_tap_name: Option<String>,
@@ -96,6 +103,7 @@ impl App {
             session_evt_rx: evt_rx,
             session_evt_tx: evt_tx,
             joining_net,
+            pending_user_join: None,
             joined_net: None,
             joined_tap_name: None,
             joined_tap_ip: None,
@@ -163,7 +171,34 @@ impl App {
                     );
                 }
                 self.hello_acked = true;
-                if let Some(net) = self.joining_net {
+                // Phase 3 — server is authoritative on assignment. We
+                // do NOT pre-emptively `Join` based on our cached
+                // `joining_net` here: that value comes from a possibly
+                // stale `joined_network` in the toml config, written
+                // the last time *some* server told us "you're in N",
+                // and N might not exist on the server we just
+                // connected to. A racing stale `Join(N)` produces a
+                // `JoinDeny: unknown_network`, which clears
+                // `joining_net`; then the real `AssignNet { Some(M) }`
+                // arrives, the auto-Join in `on_assign_net` fires for
+                // M, the server replies `JoinOk`, but our handler now
+                // sees `joining_net == None` and logs
+                //   "JoinOk without prior Join — ignoring"
+                // — leaving the session permanently stuck.
+                //
+                // For server-driven joins we wait for `AssignNet`
+                // (`handle_hello` always emits one — `Some(n)` for an
+                // approved client, `None` for a pending one), and
+                // `on_assign_net` issues the `Join`.
+                //
+                // The one caller that legitimately wants a `Join` to
+                // fire on `HelloAck` is the REPL / admin socket when
+                // the user typed `join <net>` while the connection
+                // wasn't ready yet — that intent is recorded in
+                // `pending_user_join` (NOT in `joining_net`) so the
+                // race above doesn't apply.
+                if let Some(net) = self.pending_user_join.take() {
+                    self.joining_net = Some(net);
                     self.out_tx.send(Frame::Join { net_uuid: net }).await?;
                 }
             }
@@ -285,7 +320,28 @@ impl App {
     /// Either way the local TAP comes down and is re-created from the
     /// next `JoinOk`.
     async fn on_assign_net(&mut self, net_uuid: Option<Uuid>) -> anyhow::Result<()> {
-        // Tear down whatever session we currently have.
+        // Reconnect-friendly: when the server is just reaffirming the
+        // network we're already in (post-HelloAck `AssignNet` after a
+        // brief disconnect), re-issue `Join` so the server can rebind
+        // the existing SessionTask via its reconnect path. Tearing
+        // the session down + recreating it would recycle the TAP for
+        // no reason and counts as a regression for transient
+        // network blips.
+        let same_as_current = match net_uuid {
+            Some(n) => self.joined_net == Some(n),
+            None => false,
+        };
+        if same_as_current {
+            let net = net_uuid.expect("same_as_current implies Some");
+            self.joining_net = Some(net);
+            if self.hello_acked {
+                self.out_tx.send(Frame::Join { net_uuid: net }).await?;
+            }
+            return Ok(());
+        }
+
+        // Different network (or unassigning) — tear down whatever
+        // session we currently have and start fresh.
         if let Some(tx) = self.session_tx.take() {
             let _ = tx.send(SessionCmd::Kill).await;
         }
@@ -355,11 +411,18 @@ impl App {
                     eprintln!("[!] already joined; type 'leave' first");
                     return Ok(());
                 }
-                self.joining_net = Some(net);
                 if self.hello_acked {
+                    self.joining_net = Some(net);
                     self.out_tx.send(Frame::Join { net_uuid: net }).await?;
                     println!("[*] join sent, awaiting approval...");
                 } else {
+                    // Defer until HelloAck, but record it in
+                    // `pending_user_join` (not `joining_net`): an
+                    // unconditional `joining_net = Some(net)` here
+                    // would let a stale config-cached value fire on
+                    // `HelloAck`, which is the very race the new
+                    // `HelloAck` handler is designed to avoid.
+                    self.pending_user_join = Some(net);
                     println!("[*] not yet handshaked; will join after the next HelloAck");
                 }
             }
