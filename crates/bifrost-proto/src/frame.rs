@@ -47,15 +47,24 @@ pub enum Frame {
     // ── Data plane ────────────────────────────────────────────────────
     /// **Bidirectional.** A raw Ethernet frame.
     ///
-    /// Postcard encodes `Vec<u8>` as varint-length + raw bytes, so the
-    /// per-frame overhead is 1–3 bytes on top of the wire header.
-    Eth(Vec<u8>),
+    /// `#[serde(with = "serde_bytes")]` is critical for performance:
+    /// without it, serde's default `Vec<u8>` impl calls `serialize_u8`
+    /// element-by-element, which postcard turns into 1500 individual
+    /// `try_push` calls per frame — `perf` showed `FrameCodec::encode`
+    /// at ~10 % of cycles on the upload hot path almost entirely from
+    /// this. The attribute switches it to `serialize_bytes`, which
+    /// postcard handles as one varint-length + a single `try_extend`.
+    Eth(#[serde(with = "serde_bytes")] Vec<u8>),
 
     /// **Bidirectional.** Free-form text broadcast (REPL `send`).
     Text(String),
 
     /// **Bidirectional.** File payload broadcast (REPL `sendfile`).
-    File { name: String, data: Vec<u8> },
+    File {
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
 
     // ── Online configuration push ─────────────────────────────────────
     /// **S → C, Phase 3.** Reassign the client to a different virtual
