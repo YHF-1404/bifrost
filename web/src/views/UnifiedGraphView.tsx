@@ -407,9 +407,13 @@ function UnifiedGraphInner() {
 
   const layout = useUiLayout();
 
-  // Networks whose `lan_subnets` have been edited since the last push.
-  // The Hub card's push button pulses amber while a net is here.
-  const [pendingPush, setPendingPush] = useState<Set<string>>(new Set());
+  // Networks whose currently-derived routes don't match what the
+  // server last broadcast via `device_push`. Authoritative source is
+  // each `Network.routes_dirty` field (refreshed by the
+  // `routes.dirty` WS event); the local `optimisticDirty` overlay
+  // makes the amber pulse appear as soon as the admin saves a
+  // `lan_subnets` edit instead of waiting for the round-trip.
+  const [optimisticDirty, setOptimisticDirty] = useState<Set<string>>(new Set());
   // Per-network shift applied at derive time (so left/up content
   // pushes the frame anchor). We save raw positions in the layout,
   // then add the shift when handing off to React Flow; on dragStop
@@ -419,8 +423,15 @@ function UnifiedGraphInner() {
   const shiftsRef = useRef<Map<string, { shiftX: number; shiftY: number }>>(
     new Map(),
   );
+  const pendingPush = useMemo(() => {
+    const s = new Set<string>(optimisticDirty);
+    for (const n of networks) {
+      if (n.routes_dirty) s.add(n.id);
+    }
+    return s;
+  }, [networks, optimisticDirty]);
   const markPending = useCallback((nid: string) => {
-    setPendingPush((prev) => {
+    setOptimisticDirty((prev) => {
       if (prev.has(nid)) return prev;
       const next = new Set(prev);
       next.add(nid);
@@ -530,7 +541,10 @@ function UnifiedGraphInner() {
         "success",
         `pushed ${r.routes.length} route(s) to ${r.count} client(s)`,
       );
-      setPendingPush((prev) => {
+      // Drop our optimistic overlay — the server's
+      // `routes.dirty=false` WS event flips `Network.routes_dirty`
+      // back to false via cache invalidation.
+      setOptimisticDirty((prev) => {
         if (!prev.has(nid)) return prev;
         const next = new Set(prev);
         next.delete(nid);

@@ -559,6 +559,8 @@ aarch64 Cortex-A55 client → x86_64 server，千兆 LAN 单流（直连 LAN 基
 
 ### 已完成（Phase 3.x — 零碎收尾）
 
+- ✅ **服务端驱动的 `routes.dirty` 信号**。hub 现在显式跟踪每个网络的"是否需要 push?"状态：用一个内存里的 `last_pushed_routes` 快照，由 `device_push` 更新；每次任何配置变更（admit / kick / 改 `lan_subnets` / 跨网迁移 / 删除）后跟当前 `derive_routes_for_network` 比较一次。状态翻转时发 `HubEvent::RoutesDirty { network, dirty }`，`HubSnapshot::routes_dirty` 带上当前集合，新打开的 WebUI 不需要轮询就能画出正确的脉冲状态。`Network` API 行新增 `routes_dirty: bool` 字段；Table 和 Graph 两种视图都从这里驱动琥珀色脉冲（额外保留一个本地 optimistic 集合，让保存和脉冲之间的 round-trip 感觉是即时的）。修复了长期存在的一个场景：admit 一个带 `lan_subnets` 的新 client 时，网络里其他 peer 默默地不知道有这些子网，要靠人手点 "push routes"。
+
 - ✅ **`mknet --ip <cidr>` CLI flag**。`bifrost-server admin mknet <name> --ip 10.0.0.1/24` 一次性建网络 + 配桥 IP，校验只允许 `/16` 或 `/24`（和 WebUI 段位拣选器一致）。kernel 桥在创建时就经 netlink 装上 IP，不需要再 `PATCH`，更不用手编 `server.toml`。in-process REPL 上是 `ip=<cidr>` 同义语法。admin 协议的 `MakeNet` 请求和 `NetEntry` snapshot 行都新增了 `bridge_ip` 字段；非法 CIDR 会立即报错且不留半截创建好的网络。
 
 - ✅ **Phase 3 stale-config Join 竞态**修复。之前 client 配置文件里残留旧 server 的 `joined_network` 时，`HelloAck` 之后会立刻按这个旧 UUID 发 `Join`，与服务端的 `AssignNet` 抢跑，结果是 `JoinDeny: unknown_network` 然后是 `WARN JoinOk without prior Join — ignoring`，session 永久卡死。现在 client 不再从 cache 自动 Join —— 服务端 `AssignNet` 是唯一的 source of truth，REPL/admin 的 `join <net>` 走单独的 `pending_user_join` 字段不会和缓存值打架。

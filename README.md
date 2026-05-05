@@ -962,6 +962,22 @@ Diagnostic notes worth keeping (full perf trace in commit log):
 
 ### Completed (Phase 3.x — small follow-ups)
 
+* **Server-driven `routes.dirty` signal.** The hub now tracks the
+  per-network "needs push?" state explicitly: a `last_pushed_routes`
+  in-memory snapshot is updated by `device_push` and compared to the
+  current derived route table after every config-mutating
+  handler (admit, kick, edit `lan_subnets`, assign across networks,
+  delete). On every transition it emits `HubEvent::RoutesDirty
+  { network, dirty }` and `HubSnapshot::routes_dirty` carries the
+  current set so a freshly-loaded WebUI tab paints the right pulse
+  state without polling. The `Network` API row gains a
+  `routes_dirty: bool` field; the WebUI's Table and Graph views
+  drive the amber pulse from it (with a small optimistic-overlay
+  set so a save+pulse round-trip feels immediate). Closes the
+  long-standing case where admitting a brand-new client with
+  `lan_subnets` left existing peers in the network silently
+  unaware until someone hand-clicked "push routes".
+
 * **`mknet --ip <cidr>` CLI flag.** `bifrost-server admin mknet
   <name> --ip 10.0.0.1/24` now creates the network *and* sets the
   host-side bridge IP in one step, validated to `/16` or `/24` to

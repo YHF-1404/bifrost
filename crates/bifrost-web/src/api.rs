@@ -65,6 +65,11 @@ pub fn router() -> Router<AppState> {
 /// JSON view of one virtual network. `bridge_*` are per-network as of
 /// Phase 2.0; the WebUI uses `bridge_ip` to render the IP-segment
 /// picker and to derive the prefix constraint for client TAP IPs.
+/// `routes_dirty` is the initial value of the "push routes" button's
+/// pulse state — `true` means the network's derived routes have
+/// drifted from what was last pushed (e.g. a new device joined with
+/// fresh `lan_subnets`); the WebUI keeps this in sync via the
+/// `routes.dirty` WS event after the first paint.
 #[derive(Debug, Serialize)]
 struct Network {
     id: Uuid,
@@ -73,6 +78,7 @@ struct Network {
     bridge_ip: String,
     device_count: usize,
     online_count: usize,
+    routes_dirty: bool,
 }
 
 async fn list_networks(State(state): State<AppState>) -> Response {
@@ -97,6 +103,7 @@ async fn list_networks(State(state): State<AppState>) -> Response {
                 bridge_ip: n.bridge_ip.clone(),
                 device_count: in_net.len(),
                 online_count: in_net.iter().filter(|d| d.online).count(),
+                routes_dirty: snap.routes_dirty.contains(&n.uuid),
             }
         })
         .collect();

@@ -1445,3 +1445,87 @@ async fn set_bridge_ip_24_to_16_rewrites_client_tap_ip_prefix() {
 
     h.hub.shutdown().await;
 }
+
+#[tokio::test]
+async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
+    // Phase 3.x — when an admin admits a device whose `lan_subnets`
+    // aren't in the network's last-pushed route table, the hub fires
+    // `routes.dirty=true` so the WebUI's "push routes" button starts
+    // pulsing. Running `device_push` afterwards flips it back to
+    // false. Without this signal the admin has no reason to know
+    // they need to re-push for OTHER peers in the network.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    cfg.approved_clients.push(ApprovedClient {
+        client_uuid: client,
+        net_uuid: net,
+        tap_ip: "10.0.0.5/24".to_string(),
+        display_name: String::new(),
+        lan_subnets: vec!["192.168.50.0/24".into()],
+        admitted: false, // pending until admit toggle
+    });
+    let h = spawn(cfg).await;
+    let mut events = h.hub.subscribe();
+
+    // At spawn time the network exists but no device is admitted, so
+    // no routes are derived and no routes have been pushed: dirty=false.
+    let snap = h.hub.list().await.unwrap();
+    assert!(
+        !snap.routes_dirty.contains(&net),
+        "fresh network with no admitted devices must start clean"
+    );
+
+    // Admit the device — its lan_subnets become "live" in the
+    // network's derived route set, but no `device_push` has run yet,
+    // so the hub flags dirty=true.
+    let result = h
+        .hub
+        .device_set(
+            client,
+            net,
+            DeviceUpdate {
+                admitted: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
+
+    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::RoutesDirty { .. })
+    })
+    .await
+    .expect("expected RoutesDirty");
+    match evt {
+        HubEvent::RoutesDirty { network, dirty } => {
+            assert_eq!(network, net);
+            assert!(dirty, "expected dirty=true after admit");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(
+        h.hub.list().await.unwrap().routes_dirty.contains(&net),
+        "snapshot must reflect routes_dirty=true after admit"
+    );
+
+    // Run device_push — derived now matches last_pushed → dirty flips
+    // back to false and the hub fires the transition event.
+    let _ = h.hub.device_push(net).await;
+    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::RoutesDirty { .. })
+    })
+    .await
+    .expect("expected RoutesDirty=false after push");
+    match evt {
+        HubEvent::RoutesDirty { network, dirty } => {
+            assert_eq!(network, net);
+            assert!(!dirty, "expected dirty=false after push");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    assert!(!h.hub.list().await.unwrap().routes_dirty.contains(&net));
+
+    h.hub.shutdown().await;
+}
