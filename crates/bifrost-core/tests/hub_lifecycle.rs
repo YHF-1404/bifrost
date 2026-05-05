@@ -1447,45 +1447,74 @@ async fn set_bridge_ip_24_to_16_rewrites_client_tap_ip_prefix() {
 }
 
 #[tokio::test]
-async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
-    // Phase 3.x — when an admin admits a device whose `lan_subnets`
-    // aren't in the network's last-pushed route table, the hub fires
-    // `routes.dirty=true` so the WebUI's "push routes" button starts
-    // pulsing. Running `device_push` afterwards flips it back to
-    // false. Without this signal the admin has no reason to know
-    // they need to re-push for OTHER peers in the network.
+async fn routes_dirty_only_fires_when_all_clients_online() {
+    // Phase 3.x — the push-pulse is a *completion-cue*. While any
+    // client in the network is still pending an IP or the admit
+    // toggle, the hub stays dirty=false even when their `lan_subnets`
+    // aren't in last_pushed. The operator's attention belongs on
+    // the IP picker (which pulses amber) and the locked admit
+    // switch, not on a route push that wouldn't carry the in-flight
+    // client's subnets anyway. Once everyone goes online, the
+    // pulse fires.
     let net = Uuid::new_v4();
-    let client = Uuid::new_v4();
+    let c1 = Uuid::new_v4();
+    let c2 = Uuid::new_v4();
     let mut cfg = build_cfg(60);
     cfg.networks.push(NetRecord::new("n", net));
+    // c1 already admitted with valid IP and routes. At startup the
+    // hub seeds last_pushed = derived, so this network is
+    // simultaneously fully-online AND derived==pushed → dirty=false.
     cfg.approved_clients.push(ApprovedClient {
-        client_uuid: client,
+        client_uuid: c1,
         net_uuid: net,
-        tap_ip: "10.0.0.5/24".to_string(),
+        tap_ip: "10.0.0.5/24".into(),
         display_name: String::new(),
         lan_subnets: vec!["192.168.50.0/24".into()],
-        admitted: false, // pending until admit toggle
+        admitted: true,
+    });
+    // c2 dragged in earlier but still pending (no IP, not admitted).
+    cfg.approved_clients.push(ApprovedClient {
+        client_uuid: c2,
+        net_uuid: net,
+        tap_ip: String::new(),
+        display_name: String::new(),
+        lan_subnets: vec!["192.168.60.0/24".into()],
+        admitted: false,
     });
     let h = spawn(cfg).await;
     let mut events = h.hub.subscribe();
 
-    // The network already has a client with `lan_subnets` that
-    // aren't in `last_pushed` (condition 2: uncovered intent), so
-    // the snapshot starts dirty even though nobody is admitted yet.
-    // The admin sees the pulse and is reminded to admit + set IP +
-    // push.
+    // Some client is still mid-setup, so the gate forces dirty=false
+    // even though c2's subnets aren't in last_pushed.
+    let snap = h.hub.list().await.unwrap();
     assert!(
-        h.hub.list().await.unwrap().routes_dirty.contains(&net),
-        "fresh network with an unadmitted client whose lan_subnets aren't pushed yet must start dirty"
+        !snap.routes_dirty.contains(&net),
+        "gate should suppress pulse while c2 is unadmitted"
     );
 
-    // Admit the device — its lan_subnets are now "live" in the
-    // network's derived route set too (condition 1), so dirty
-    // remains true (no transition, no event).
+    // Set c2's IP — still unadmitted, gate still suppresses.
+    let _ = h
+        .hub
+        .device_set(
+            c2,
+            net,
+            DeviceUpdate {
+                tap_ip: Some("10.0.0.6/24".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        !h.hub.list().await.unwrap().routes_dirty.contains(&net),
+        "still suppressed: c2.admitted=false"
+    );
+
+    // Admit c2 — now both online; derived gained c2's route, so
+    // derived ≠ pushed and the gate opens. Pulse fires.
     let result = h
         .hub
         .device_set(
-            client,
+            c2,
             net,
             DeviceUpdate {
                 admitted: Some(true),
@@ -1494,23 +1523,31 @@ async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
         )
         .await;
     assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
+    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::RoutesDirty { network, dirty } if *network == net && *dirty)
+    })
+    .await
+    .expect("expected RoutesDirty=true after last client admitted");
+    let HubEvent::RoutesDirty { dirty, .. } = evt else {
+        panic!("event filter mismatch");
+    };
+    assert!(dirty);
     assert!(h.hub.list().await.unwrap().routes_dirty.contains(&net));
 
-    // Run device_push — `last_pushed` now equals `derive_routes` AND
-    // covers the client's lan_subnets, so both conditions clear and
-    // the hub fires the dirty=false transition.
+    // Push — last_pushed catches up to derived, gate stays open
+    // (still all-online), so dirty flips to false.
     let _ = h.hub.device_push(net).await;
     let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
-        matches!(e, HubEvent::RoutesDirty { .. })
+        matches!(e, HubEvent::RoutesDirty { network, dirty } if *network == net && !*dirty)
     })
     .await
     .expect("expected RoutesDirty=false after push");
     match evt {
         HubEvent::RoutesDirty { network, dirty } => {
             assert_eq!(network, net);
-            assert!(!dirty, "expected dirty=false after push");
+            assert!(!dirty);
         }
-        other => panic!("unexpected event: {other:?}"),
+        _ => unreachable!(),
     }
     assert!(!h.hub.list().await.unwrap().routes_dirty.contains(&net));
 
@@ -1518,81 +1555,88 @@ async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
 }
 
 #[tokio::test]
-async fn assigning_client_with_lan_subnets_into_net_emits_routes_dirty_true() {
-    // Phase 3.x — the user-reported case: drag a client from one
-    // network to another. Phase 3 spec clears the admitted+tap_ip on
-    // assign, so the moved client contributes nothing to the
-    // *derived-pushable* set in either network — but the destination
-    // network's last-pushed table still doesn't cover the client's
-    // `lan_subnets`. The hub must flag dirty=true on the destination
-    // anyway so the admin sees the pulse and remembers to admit +
-    // set tap_ip + push.
+async fn dragging_client_into_net_does_not_pulse_until_all_admitted() {
+    // Phase 3.x — drag-in puts the client at admitted=false, tap_ip="".
+    // Because the destination now has an unadmitted client, the gate
+    // suppresses the push pulse. Setting the IP alone is not enough
+    // either — only flipping the admit toggle (which the WebUI
+    // unlocks once tap_ip is set) brings the network all-online and
+    // re-opens the gate.
     let net_a = Uuid::new_v4();
     let net_b = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
     cfg.networks.push(NetRecord::new("a", net_a));
     cfg.networks.push(NetRecord::new("b", net_b));
-    // Client starts in net_a, NOT admitted (no tap_ip), with subnets.
+    // Client starts admitted in net_a with valid IP; at startup
+    // derived seeds into last_pushed, so net_a is dirty=false.
     cfg.approved_clients.push(ApprovedClient {
         client_uuid: client,
         net_uuid: net_a,
-        tap_ip: String::new(),
+        tap_ip: "10.0.0.5/24".into(),
         display_name: String::new(),
         lan_subnets: vec!["192.168.77.0/24".into()],
-        admitted: false,
+        admitted: true,
     });
     let h = spawn(cfg).await;
-    let mut events = h.hub.subscribe();
-
-    // Both networks should start dirty=true (uncovered intent in
-    // net_a: client's lan_subnet isn't in last_pushed). We seed
-    // last_pushed=derived at startup, derived=[] for both, so
-    // condition 2 fires for net_a only.
-    let snap = h.hub.list().await.unwrap();
-    assert!(
-        snap.routes_dirty.contains(&net_a),
-        "net_a starts dirty: client in it has uncovered lan_subnets"
-    );
-    assert!(
-        !snap.routes_dirty.contains(&net_b),
-        "net_b starts clean: no clients in it"
-    );
-
-    // Drag the client to net_b. handle_assign_client clears admitted
-    // and tap_ip; the client now lives in net_b with lan_subnets
-    // intact.
-    let r = h.hub.assign_client(client, Some(net_b)).await;
-    assert!(matches!(r, bifrost_core::AssignClientResult::Ok(_)));
-
-    // net_a should flip dirty=false (no clients with uncovered
-    // subnets remain).
-    // net_b should flip dirty=true (the moved client's lan_subnet
-    // isn't in net_b's last_pushed dsts).
-    let mut saw_a_clean = false;
-    let mut saw_b_dirty = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    while !(saw_a_clean && saw_b_dirty) {
-        let Some(Ok(e)) =
-            tokio::time::timeout_at(deadline, events.recv()).await.ok()
-        else {
-            break;
-        };
-        if let HubEvent::RoutesDirty { network, dirty } = e {
-            if network == net_a && !dirty {
-                saw_a_clean = true;
-            }
-            if network == net_b && dirty {
-                saw_b_dirty = true;
-            }
-        }
-    }
-    assert!(saw_a_clean, "expected net_a dirty=false after client left");
-    assert!(saw_b_dirty, "expected net_b dirty=true after drag-in");
 
     let snap = h.hub.list().await.unwrap();
     assert!(!snap.routes_dirty.contains(&net_a));
-    assert!(snap.routes_dirty.contains(&net_b));
+    assert!(!snap.routes_dirty.contains(&net_b));
+
+    let mut events = h.hub.subscribe();
+
+    // Drag to net_b — handle_assign_client clears admitted+tap_ip,
+    // so net_b now has one pending client. Gate suppresses pulse.
+    let r = h.hub.assign_client(client, Some(net_b)).await;
+    assert!(matches!(r, bifrost_core::AssignClientResult::Ok(_)));
+    let snap = h.hub.list().await.unwrap();
+    assert!(
+        !snap.routes_dirty.contains(&net_a),
+        "net_a empty after drag → dirty=false"
+    );
+    assert!(
+        !snap.routes_dirty.contains(&net_b),
+        "net_b has unadmitted client → gate suppresses pulse"
+    );
+
+    // Set the IP. Still admitted=false → still suppressed.
+    let _ = h
+        .hub
+        .device_set(
+            client,
+            net_b,
+            DeviceUpdate {
+                tap_ip: Some("10.0.1.5/24".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(!h.hub.list().await.unwrap().routes_dirty.contains(&net_b));
+
+    // Admit. Now all-online; derived gained the client's route,
+    // pushed is empty for net_b → derived ≠ pushed → dirty=true.
+    let _ = h
+        .hub
+        .device_set(
+            client,
+            net_b,
+            DeviceUpdate {
+                admitted: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
+        matches!(e, HubEvent::RoutesDirty { network, dirty } if *network == net_b && *dirty)
+    })
+    .await
+    .expect("expected net_b RoutesDirty=true after admit");
+    let HubEvent::RoutesDirty { dirty, .. } = evt else {
+        panic!("event filter mismatch");
+    };
+    assert!(dirty);
+    assert!(h.hub.list().await.unwrap().routes_dirty.contains(&net_b));
 
     h.hub.shutdown().await;
 }

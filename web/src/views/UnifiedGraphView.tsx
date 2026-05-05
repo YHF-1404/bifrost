@@ -245,6 +245,14 @@ function ClientNode({ data }: NodeProps<Node<ClientData>>) {
   const statusVariant =
     status === "online" ? "success" : status === "pending" ? "default" : "muted";
 
+  // Phase 3.x — IP-first flow. A freshly dragged-in client has
+  // admitted=false + empty tap_ip. The IP picker pulses amber to
+  // demand attention; the admit toggle stays disabled until the IP
+  // is set so users can't try to bring the client online without an
+  // address. Once tap_ip is set, the pulse stops and the switch
+  // unlocks.
+  const ipMissing = !isPending && !c.tap_ip;
+
   const setName = (name: string) => {
     if (isPending) data.onUpdatePending({ name });
     else data.onUpdateAdmitted({ name });
@@ -282,7 +290,15 @@ function ClientNode({ data }: NodeProps<Node<ClientData>>) {
           <Switch
             checked={c.admitted}
             onChange={setAdmit}
+            disabled={ipMissing}
             label={c.admitted ? "Kick this device" : "Admit this device"}
+            title={
+              ipMissing
+                ? "Set an IP first, then flip to bring this device online"
+                : c.admitted
+                  ? "Kick this device"
+                  : "Admit this device"
+            }
           />
         )}
         <span
@@ -312,6 +328,10 @@ function ClientNode({ data }: NodeProps<Node<ClientData>>) {
               collisions={data.collisions}
               onCommit={setIp}
               placeholder="click to set"
+              className={cn(
+                ipMissing &&
+                  "animate-pulse bg-amber-100 ring-2 ring-amber-400 ring-offset-1",
+              )}
             />
           </>
         )}

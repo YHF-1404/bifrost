@@ -727,59 +727,69 @@ impl Hub {
     /// Re-evaluate whether `net_uuid` needs a route push and emit a
     /// `HubEvent::RoutesDirty` on state TRANSITIONS only.
     ///
-    /// Two independent conditions count as "dirty"; the pulse fires
-    /// if EITHER holds:
+    /// Phase 3.x — the pulse is an *operator-completion-cue*, not a
+    /// raw equality check. It only fires once a network is fully set
+    /// up (every client in it admitted with a valid `tap_ip`) AND the
+    /// derived route table differs from what was last pushed. While
+    /// any client is still pending an IP or the admit toggle, no
+    /// pulse — the operator's attention belongs on those incomplete
+    /// rows (where the IP picker pulses amber and the admit switch
+    /// is locked) rather than on a route push that wouldn't carry the
+    /// in-flight client's subnets anyway.
     ///
-    /// 1. **Pushable drift.** The set of routes
-    ///    `derive_routes_for_network` would emit right now (the
-    ///    `admitted=true` + valid `tap_ip` clients) doesn't equal
-    ///    `last_pushed_routes`. This catches edits to `lan_subnets`
-    ///    on an admitted client, kicks (admitted flipping false,
-    ///    leaving stale via in pushed), and tap_ip changes.
+    /// Concretely:
     ///
-    /// 2. **Uncovered intent.** Some `lan_subnet` of *any* client in
-    ///    the network isn't a `dst` in `last_pushed`. This catches
-    ///    the user-visible case the simpler condition missed: a
-    ///    client gets dragged into the network (Phase-3 spec clears
-    ///    its `admitted` and `tap_ip`, so it contributes nothing to
-    ///    `derive_routes_for_network`) but it brought
-    ///    `lan_subnets` that the network's pushed table has never
-    ///    seen. The button pulses to remind the admin to admit the
-    ///    client + set its IP + push, even though that single drag
-    ///    didn't change the *pushable* derived set.
+    /// * **Empty network** (no clients in `net_uuid`): `dirty=false`.
+    ///   Nothing to push.
+    /// * **Any unadmitted or IP-missing client**: `dirty=false`. The
+    ///   operator is mid-setup; pushing now would be premature.
+    /// * **All clients admitted with a valid `tap_ip`**: `dirty=true`
+    ///   iff `derive_routes_for_network ≠ last_pushed_routes`.
+    ///   Catches `lan_subnets` edits, drift after a kick, etc.
     ///
-    /// Both routes are sorted by `(dst, via)` before equality so
-    /// insertion-order differences across operations don't cause
+    /// Both route vectors are sorted by `(dst, via)` before equality
+    /// so insertion-order differences across operations don't cause
     /// false dirty signals.
     fn recheck_routes_dirty(&mut self, net_uuid: Uuid) {
         if !self.cfg.networks.iter().any(|n| n.uuid == net_uuid) {
             return;
         }
-        let mut derived = derive_routes_for_network(&self.cfg, net_uuid);
-        derived.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
-        let mut pushed = self
-            .last_pushed_routes
-            .get(&net_uuid)
-            .cloned()
-            .unwrap_or_default();
-        pushed.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
-
-        // Condition 1: pushable drift.
-        let pushable_drift = derived != pushed;
-
-        // Condition 2: uncovered intent — any client in the network
-        // has lan_subnets whose dsts aren't in pushed.
-        let pushed_dsts: std::collections::HashSet<&str> =
-            pushed.iter().map(|r| r.dst.as_str()).collect();
-        let uncovered_intent = self
+        // Determine "fully online" — every client row in this
+        // network is admitted AND has a valid `tap_ip`. Rows with an
+        // empty / unparseable `tap_ip` count as not-yet-online even
+        // when `admitted=true` (defense in depth: derive_routes
+        // already drops them, but the pulse gate is a UX rule about
+        // operator intent).
+        let mut any_in_net = false;
+        let mut all_online = true;
+        for ac in self
             .cfg
             .approved_clients
             .iter()
             .filter(|a| a.net_uuid == net_uuid)
-            .flat_map(|a| a.lan_subnets.iter())
-            .any(|s| !pushed_dsts.contains(s.as_str()));
-
-        let new_dirty = pushable_drift || uncovered_intent;
+        {
+            any_in_net = true;
+            let ip_ok = !ac.tap_ip.is_empty()
+                && (ac.tap_ip.parse::<ipnet::IpNet>().is_ok()
+                    || ac.tap_ip.parse::<std::net::IpAddr>().is_ok());
+            if !ac.admitted || !ip_ok {
+                all_online = false;
+                break;
+            }
+        }
+        let new_dirty = if any_in_net && all_online {
+            let mut derived = derive_routes_for_network(&self.cfg, net_uuid);
+            derived.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
+            let mut pushed = self
+                .last_pushed_routes
+                .get(&net_uuid)
+                .cloned()
+                .unwrap_or_default();
+            pushed.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
+            derived != pushed
+        } else {
+            false
+        };
         let old_dirty = self.routes_dirty.get(&net_uuid).copied().unwrap_or(false);
         if new_dirty != old_dirty {
             self.emit(HubEvent::RoutesDirty {
@@ -864,13 +874,14 @@ impl Hub {
 
         // Seed `last_pushed_routes` from each network's *currently
         // pushable* derived set (admitted+tapped clients only) and
-        // run `recheck_routes_dirty` so the initial state correctly
-        // reflects condition 2 (uncovered intent) — e.g. a network
-        // whose persisted config has clients with `lan_subnets` that
-        // were never admitted starts at dirty=true, prompting the
-        // operator to finish the setup. No events are emitted here
-        // because `recheck` only fires on transitions and the prior
-        // dirty value (default false) might match.
+        // run `recheck_routes_dirty` so the initial state lines up
+        // with the gate. With derived freshly seeded into pushed,
+        // the post-restart steady state is dirty=false (the seed
+        // pretends we just pushed). Networks with unadmitted /
+        // IP-less clients also land at dirty=false because the
+        // gate suppresses the pulse mid-setup — the WebUI surfaces
+        // those incomplete rows directly (pulsing IP picker, locked
+        // admit switch) rather than via the push button.
         for net in self.cfg.networks.clone() {
             let derived = derive_routes_for_network(&self.cfg, net.uuid);
             self.last_pushed_routes.insert(net.uuid, derived);

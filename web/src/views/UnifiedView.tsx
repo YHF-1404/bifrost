@@ -951,6 +951,10 @@ function AdmittedClientRow({
     id: `client:${client.client_uuid}`,
     data: { kind: "client", cuid: client.client_uuid, from: netUuid },
   });
+  // Phase 3.x — IP-first flow: a freshly dragged-in client has empty
+  // tap_ip. Pulse the IP picker to demand attention; lock the admit
+  // switch so users can't try to bring it online without an address.
+  const ipMissing = !client.tap_ip;
   return (
     <li
       ref={setNodeRef}
@@ -976,7 +980,15 @@ function AdmittedClientRow({
       <Switch
         checked={client.admitted}
         onChange={(next) => onUpdate({ admitted: next })}
+        disabled={ipMissing}
         label={client.admitted ? "Kick this device" : "Admit this device"}
+        title={
+          ipMissing
+            ? "Set an IP first, then flip to bring this device online"
+            : client.admitted
+              ? "Kick this device"
+              : "Admit this device"
+        }
       />
       <InlineEdit
         value={client.display_name}
@@ -990,6 +1002,10 @@ function AdmittedClientRow({
         collisions={collisions}
         onCommit={(v) => onUpdate({ tap_ip: v })}
         placeholder="click to set"
+        className={cn(
+          ipMissing &&
+            "animate-pulse bg-amber-100 ring-2 ring-amber-400 ring-offset-1",
+        )}
       />
       <InlineEdit
         value={client.lan_subnets.join(", ")}

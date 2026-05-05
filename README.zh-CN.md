@@ -559,7 +559,9 @@ aarch64 Cortex-A55 client → x86_64 server，千兆 LAN 单流（直连 LAN 基
 
 ### 已完成（Phase 3.x — 零碎收尾）
 
-- ✅ **服务端驱动的 `routes.dirty` 信号**。hub 现在显式跟踪每个网络的"是否需要 push?"状态：用一个内存里的 `last_pushed_routes` 快照，由 `device_push` 更新；每次任何配置变更（admit / kick / 改 `lan_subnets` / 跨网迁移 / 删除）后跟当前 `derive_routes_for_network` 比较一次。状态翻转时发 `HubEvent::RoutesDirty { network, dirty }`，`HubSnapshot::routes_dirty` 带上当前集合，新打开的 WebUI 不需要轮询就能画出正确的脉冲状态。`Network` API 行新增 `routes_dirty: bool` 字段；Table 和 Graph 两种视图都从这里驱动琥珀色脉冲（额外保留一个本地 optimistic 集合，让保存和脉冲之间的 round-trip 感觉是即时的）。修复了长期存在的一个场景：admit 一个带 `lan_subnets` 的新 client 时，网络里其他 peer 默默地不知道有这些子网，要靠人手点 "push routes"。
+- ✅ **服务端驱动的 `routes.dirty` 信号 —— 以"全员 online"为门槛**。hub 显式跟踪每个网络的"是否需要 push?"状态：内存里有一个 `last_pushed_routes` 快照，由 `device_push` 更新；每次配置变更（admit / kick / 改 `lan_subnets` / 跨网迁移 / 删除）后跟当前 `derive_routes_for_network` 比较一次。**脉冲带门控**：只有当网络里的**每一个** client 都 `admitted=true` 且 `tap_ip` 合法时，门才打开；只要还有任意一行在等 IP 或开关，门关上、push 按钮保持沉默 —— 操作员的注意力应该落在那行闪烁的 IP 框上（见下条），而不是一次注定不完整的 push。状态翻转时发 `HubEvent::RoutesDirty { network, dirty }`，`HubSnapshot::routes_dirty` 带上当前集合，新打开的 WebUI 不轮询就能画出正确状态。`Network` API 行新增 `routes_dirty: bool` 字段；Table 和 Graph 两种视图都从这里驱动琥珀色脉冲（额外一个本地 optimistic 集合，让保存→脉冲的 round-trip 感觉即时）。
+
+- ✅ **IP-first 的 client 接入引导**。把 client 拖进网络后，Phase-3 规范会清掉它的 `admitted` 和 `tap_ip`。WebUI 现在用两个可见提示把操作员的动作顺序压成一条线：(1) IP 拣选器以琥珀色脉冲呼吸（`animate-pulse` + 琥珀边框/底色）抢注意力，(2) admit 开关 `disabled`（变灰，吞 click），鼠标悬停提示 "Set an IP first, then flip to bring this device online"。Table 行和 Graph 卡片用同一套提示。提交 IP 后脉冲停下、开关解锁；切上开关把 client 拉 online —— 如果它是该网络最后一个未上线的成员，`routes.dirty` 门同时打开，push 按钮变琥珀色。
 
 - ✅ **`mknet --ip <cidr>` CLI flag**。`bifrost-server admin mknet <name> --ip 10.0.0.1/24` 一次性建网络 + 配桥 IP，校验只允许 `/16` 或 `/24`（和 WebUI 段位拣选器一致）。kernel 桥在创建时就经 netlink 装上 IP，不需要再 `PATCH`，更不用手编 `server.toml`。in-process REPL 上是 `ip=<cidr>` 同义语法。admin 协议的 `MakeNet` 请求和 `NetEntry` snapshot 行都新增了 `bridge_ip` 字段；非法 CIDR 会立即报错且不留半截创建好的网络。
 
