@@ -291,6 +291,24 @@ Each script does:
 4. `systemctl daemon-reload && systemctl enable --now`
 5. Print `systemctl status` for verification
 
+### Optional: kernel tuning for higher throughput
+
+Bifrost's bulk-throughput ceiling on a host with a **single-queue NIC**
+(USB Ethernet adapters, most ARM SBCs, lots of embedded boards) is set
+by `NET_RX` softirq pinning to one core. To distribute that work in
+software run once per host, after each boot:
+
+```bash
+sudo scripts/tune-host.sh             # auto-detect default-route NIC
+sudo scripts/tune-host.sh end0        # or specify the NIC
+```
+
+The script enables RPS / RFS / XPS on the chosen NIC. On the
+project's LAN testbed (Cortex-A55 4-core, single-queue gigabit) it
+lifted single-stream upload from 361 Mbps → 451 Mbps (~+25 %). The
+settings are runtime only — re-run after each reboot, or wire it
+into `/etc/rc.local` / a systemd-tmpfiles drop-in / a udev rule.
+
 ### systemd integration
 
 Units are bundled at `deploy/systemd/`:

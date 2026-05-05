@@ -121,6 +121,17 @@ CLIENT_HOST=root@<router-ip>  ./scripts/deploy-client.sh
 3. `scp` 示例 toml + systemd unit（**不会覆盖已有 `client.toml` / `server.toml`**）
 4. `systemctl daemon-reload && systemctl enable --now`
 
+### 可选：内核调优以提高吞吐
+
+如果 server 或 client 跑在**单队列 NIC** 上（USB 以太网适配器、多数 ARM SBC、嵌入式板子等），bifrost 的批量吞吐上限被 `NET_RX` softirq 钉在单核上。要把这部分工作分散到多核，每台机器开机后跑一次：
+
+```bash
+sudo scripts/tune-host.sh             # 自动选默认路由 NIC
+sudo scripts/tune-host.sh end0        # 或者手动指定
+```
+
+脚本启用 RPS / RFS / XPS。本项目 LAN 测试床（Cortex-A55 四核 + 单队列千兆 NIC）上，单流上行从 361 Mbps 涨到 451 Mbps（约 +25%）。设置是运行时的，重启后失效 —— 写进 `/etc/rc.local` / `systemd-tmpfiles` drop-in / udev 规则可持久化。
+
 ### Bootstrap 第一次连接
 
 ```bash
