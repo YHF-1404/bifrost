@@ -13,7 +13,9 @@ use ipnet::IpNet;
 use rtnetlink::Handle;
 use tracing::{debug, warn};
 
-use super::tap::{add_route, del_link, flush_user_routes, io_other, lookup_if_index};
+use super::tap::{
+    add_route, del_link, flush_user_routes, io_other, lookup_if_index, set_link_mtu, TAP_MTU,
+};
 use crate::traits::Bridge;
 use crate::types::RouteEntry;
 
@@ -51,6 +53,17 @@ impl LinuxBridge {
             }
             Err(e) => return Err(e),
         };
+
+        // Match the bridge MTU to its member TAPs (TAP_MTU). Linux's
+        // bridge MTU defaults to 1500; if a member TAP has a smaller
+        // MTU the kernel auto-shrinks the bridge to match, but setting
+        // it explicitly avoids depending on that timing and makes the
+        // host-side address (br-bifrost) advertise the correct MSS to
+        // local listeners (e.g. sshd on 10.0.0.1 negotiating with a
+        // remote scp).
+        if let Err(e) = set_link_mtu(&handle, if_index, TAP_MTU).await {
+            warn!(error = %e, bridge = name, mtu = TAP_MTU, "set bridge MTU failed");
+        }
 
         // Up + IP. The kernel may already have the link up if we
         // re-used an existing bridge; setting it up again is a no-op.

@@ -57,23 +57,14 @@ where
         tokio::select! {
             biased;
 
-            // Outbound from hub / session → wire. We feed the first
-            // frame, then drain anything else already queued, then a
-            // single flush — this turns N per-frame syscalls under
-            // bulk traffic into one. SinkExt::send is feed+flush, so
-            // the previous code paid one flush (and at least one
-            // write syscall) per frame.
+            // Per-frame send — see bifrost-client/conn.rs for why we
+            // do NOT batch into one flush. With TCP_NODELAY each frame
+            // becomes its own small TCP segment immediately, which a
+            // slow downstream proxy (xray-core, …) can pace through
+            // its tunnel without choking on a multi-MB burst.
             outbound = frame_rx.recv() => match outbound {
                 Some(frame) => {
-                    let res: Result<(), bifrost_proto::ProtoError> = async {
-                        framed.feed(frame).await?;
-                        while let Ok(more) = frame_rx.try_recv() {
-                            framed.feed(more).await?;
-                        }
-                        framed.flush().await
-                    }
-                    .await;
-                    if let Err(e) = res {
+                    if let Err(e) = framed.send(frame).await {
                         warn!(?conn_id, error = %e, "socket write failed");
                         break 'main;
                     }

@@ -36,4 +36,4 @@ pub use traits::{Bridge, Platform, Tap};
 pub use types::{ParseError, RouteEntry};
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxPlatform;
+pub use linux::{set_send_buffer_size, LinuxPlatform};

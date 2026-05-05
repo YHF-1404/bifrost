@@ -108,19 +108,17 @@ impl ConnTask {
                     },
                     outgoing = self.out_rx.recv() => match outgoing {
                         Some(frame) => {
-                            // Feed first + drain backlog + single flush.
-                            // Replaces SinkExt::send (feed+flush per
-                            // frame), turning N write syscalls into 1
-                            // when bulk traffic queues frames up.
-                            let res: Result<(), bifrost_proto::ProtoError> = async {
-                                framed.feed(frame).await?;
-                                while let Ok(more) = self.out_rx.try_recv() {
-                                    framed.feed(more).await?;
-                                }
-                                framed.flush().await
-                            }
-                            .await;
-                            if let Err(e) = res {
+                            // Per-frame send (= feed + flush). With
+                            // TCP_NODELAY each frame becomes its own
+                            // small TCP segment immediately. Earlier we
+                            // batched (drain channel into one flush) to
+                            // save syscalls — but that creates large
+                            // bursts that overwhelm a slow downstream
+                            // proxy (e.g. xray-core), causing its ACK
+                            // window to stall and our outer TCP to drop
+                            // cwnd to 10. Per-frame writes give the
+                            // proxy a steady, paced stream.
+                            if let Err(e) = framed.send(frame).await {
                                 warn!(error = %e, "socket write failed");
                                 break;
                             }
@@ -160,6 +158,14 @@ impl ConnTask {
         // server-side rationale.
         if let Err(e) = stream.set_nodelay(true) {
             warn!(error = %e, "set_nodelay failed (continuing)");
+        }
+        // Bound kernel SNDBUF — see accept.rs. Through nested TCP
+        // tunnels (xray etc.) the auto-tuned multi-MB buffer hides
+        // congestion from the inner TCP, which then keeps growing
+        // its cwnd until bulk throughput collapses to near zero.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = bifrost_net::set_send_buffer_size(&stream, 256 * 1024) {
+            warn!(error = %e, "set_send_buffer_size failed (continuing)");
         }
         Ok(stream)
     }
