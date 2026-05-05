@@ -37,7 +37,12 @@ export function ThroughputCell({ network, clientUuid, online }: Props) {
         <span aria-hidden className="text-emerald-600">
           ▼
         </span>
-        <span className="w-16 tabular-nums text-right">
+        {/* w-20 + whitespace-nowrap: longest possible fmtBps output is
+            "99.9 GB/s" (9 chars). 64 px (w-16) wasn't quite enough so
+            "98.0 B/s" wrapped at the space; 80 px gives a comfortable
+            margin and the explicit nowrap keeps it on one line even
+            at edge cases. */}
+        <span className="w-20 whitespace-nowrap tabular-nums text-right">
           {fmtBps(last.bps_in)}
         </span>
         <Sparkline
@@ -51,7 +56,7 @@ export function ThroughputCell({ network, clientUuid, online }: Props) {
         <span aria-hidden className="text-sky-600">
           ▲
         </span>
-        <span className="w-16 tabular-nums text-right">
+        <span className="w-20 whitespace-nowrap tabular-nums text-right">
           {fmtBps(last.bps_out)}
         </span>
         <Sparkline

@@ -11,6 +11,22 @@
 //! `set_ip` / `apply_routes` / `destroy` go via rtnetlink so we never
 //! shell out to `/sbin/ip`.
 
+/// MTU we assign to every Bifrost TAP. Must leave headroom in the
+/// underlying TCP transport (and any tunnel that transport rides
+/// inside) for our framing:
+///
+/// * 4 B  — bifrost length prefix
+/// * ~3 B — postcard frame variant tag + Vec<u8> length
+/// * 40 B — outer IPv4 + TCP header
+/// * ~30 B reserve for nested tunnels (VLESS / Trojan / …) which add
+///         their own headers; common single-tunnel deployments use ≤30.
+///
+/// 1500 (Ethernet MTU) − ~77 ≈ 1423, rounded down to **1400**. With
+/// the default 1500 MTU, every full-size TAP packet becomes a
+/// fragmented or dropped outer segment, which through nested TCP
+/// tunnels (TCP-over-TCP) collapses bulk throughput to ~0.
+pub const TAP_MTU: u32 = 1400;
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -102,6 +118,12 @@ impl LinuxTap {
 
         // Look up the kernel-assigned index, bring the link up.
         let if_index = lookup_if_index(&handle, name).await?;
+        // Set the MTU *before* bringing the link up — once it's up
+        // the stack starts queueing packets, and a late MTU change
+        // can race with in-flight traffic.
+        if let Err(e) = set_link_mtu(&handle, if_index, TAP_MTU).await {
+            warn!(error = %e, tap = name, mtu = TAP_MTU, "set MTU failed (using kernel default)");
+        }
         bring_link_up(&handle, if_index).await?;
 
         if let Some(net) = ip {
@@ -246,7 +268,21 @@ async fn bring_link_up(handle: &Handle, idx: u32) -> io::Result<()> {
     handle.link().set(idx).up().execute().await.map_err(io_other)
 }
 
-async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
+/// Set the link MTU via rtnetlink. Used by both `LinuxTap::create` and
+/// `LinuxBridge::create` so the bridge MTU matches its member TAPs —
+/// otherwise the bridge would advertise the larger of the two and the
+/// kernel would still accept oversized frames into the bridge.
+pub(super) async fn set_link_mtu(handle: &Handle, idx: u32, mtu: u32) -> io::Result<()> {
+    handle
+        .link()
+        .set(idx)
+        .mtu(mtu)
+        .execute()
+        .await
+        .map_err(io_other)
+}
+
+pub(super) async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
     handle
         .address()
         .add(idx, net.addr(), net.prefix_len())
@@ -255,7 +291,7 @@ async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
         .map_err(io_other)
 }
 
-async fn flush_addrs(handle: &Handle, idx: u32) -> io::Result<()> {
+pub(super) async fn flush_addrs(handle: &Handle, idx: u32) -> io::Result<()> {
     use futures::TryStreamExt;
     let mut stream = handle.address().get().set_link_index_filter(idx).execute();
     while let Some(addr_msg) = stream.try_next().await.map_err(io_other)? {

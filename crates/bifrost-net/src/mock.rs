@@ -136,6 +136,8 @@ pub struct MockBridge {
 pub struct MockBridgeState {
     pub ports: Vec<String>,
     pub routes: Vec<RouteEntry>,
+    /// Last IP set via `set_ip`. `None` means "explicitly cleared".
+    pub ip: Option<IpNet>,
     pub destroyed: bool,
 }
 
@@ -168,6 +170,11 @@ impl Bridge for MockBridge {
 
     async fn remove_tap(&self, tap_name: &str) -> io::Result<()> {
         self.state.lock().await.ports.retain(|p| p != tap_name);
+        Ok(())
+    }
+
+    async fn set_ip(&self, ip: Option<IpNet>) -> io::Result<()> {
+        self.state.lock().await.ip = ip;
         Ok(())
     }
 
@@ -238,8 +245,11 @@ impl Platform for MockPlatform {
         Ok(tap as Arc<dyn Tap>)
     }
 
-    async fn create_bridge(&self, name: &str, _ip: Option<IpNet>) -> io::Result<Arc<dyn Bridge>> {
+    async fn create_bridge(&self, name: &str, ip: Option<IpNet>) -> io::Result<Arc<dyn Bridge>> {
         let br = MockBridge::new(name);
+        if let Some(addr) = ip {
+            br.state.lock().await.ip = Some(addr);
+        }
         self.bridges.lock().await.push(br.clone());
         Ok(br as Arc<dyn Bridge>)
     }

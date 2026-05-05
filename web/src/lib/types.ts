@@ -20,7 +20,8 @@ export interface Throughput {
 
 export interface Device {
   client_uuid: string;
-  net_uuid: string;
+  /** Phase 3 — `null` for unassigned (pending pool) clients. */
+  net_uuid: string | null;
   display_name: string;
   admitted: boolean;
   tap_ip: string | null;

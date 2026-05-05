@@ -20,6 +20,7 @@ repository = "https://github.com/hml/bifrost"
 # ── protocol & util ───────────────────────────────────────────────
 bytes      = "1"
 serde      = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 postcard   = { version = "1", features = ["use-std"] }
 uuid       = { version = "1", features = ["v4", "serde"] }
 thiserror  = "1"
@@ -56,3 +57,13 @@ bifrost-web    = { path = "crates/bifrost-web",    version = "0.1.0" }
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Same codegen as release but keeps debug-info so `perf report`
+# resolves real Rust function names. Use via:
+#   cross build --profile=perf --target=… -p bifrost-{server,client}
+# Not the default release because the binary is ~3x larger with full
+# line-tables debug info.
+[profile.perf]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"

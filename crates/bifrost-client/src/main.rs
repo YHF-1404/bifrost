@@ -124,7 +124,11 @@ async fn run_daemon(
 
     let platform: Arc<dyn bifrost_net::Platform> = build_platform()?;
 
-    let (out_tx, out_rx) = mpsc::channel(128);
+    // 1024 ≈ 1.5 MB of buffered TAP frames at MTU 1500 — enough that
+    // a brief socket-write stall doesn't immediately backpressure the
+    // session task and stall TAP reads. See bifrost-server/conn.rs for
+    // the matching capacity on the other side.
+    let (out_tx, out_rx) = mpsc::channel(1024);
     let (events_tx, events_rx) = mpsc::channel(128);
     let (user_tx, user_rx) = mpsc::channel::<bifrost_client::repl::UserCmd>(64);
 

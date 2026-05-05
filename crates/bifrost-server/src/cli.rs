@@ -69,6 +69,16 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: DeviceAction,
     },
+    /// **Phase 3** — assign a client to a network (or `none` to detach
+    /// it to the pending pool). Sends `AssignNet` to the live conn
+    /// (if any) so the client tears down its TAP and re-joins the
+    /// new target. After assign you'll typically run `device set
+    /// --ip <addr> --admit true` to bring the client online.
+    Assign {
+        client_uuid: uuid::Uuid,
+        /// Target network UUID, or the literal `none` to detach.
+        net: String,
+    },
     /// Show the current daemon snapshot.
     List,
     /// Broadcast a text message to every connected client.

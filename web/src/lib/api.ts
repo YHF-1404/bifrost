@@ -65,11 +65,34 @@ export interface PushRoutesResp {
   routes: Array<{ dst: string; via: string }>;
 }
 
-/** Per-network graph layout: a map of node id → { x, y } in flow space.
- *  The keys match the IDs the frontend assigns (`server:<nid>`,
- *  `device:<cuid>`). Empty map = nothing saved yet. */
-export interface GraphLayout {
-  positions: Record<string, { x: number; y: number }>;
+/** Phase 3 — single-file UI layout. Replaces the old per-network
+ *  `<nid>.json` files; the WebUI does one GET on load and one
+ *  debounced PUT after each interaction.
+ *
+ *  Schema:
+ *  - `table.left_ratio`: width of the LEFT pane in [0, 1].
+ *  - `table.left_collapsed`: whether the left pane is collapsed.
+ *  - `graph.positions`: keyed by `hub:<nid>` / `client:<cuid>`.
+ *  - `graph.frames`: keyed by net_uuid string. */
+export interface UiLayout {
+  table: {
+    left_ratio?: number | null;
+    left_collapsed?: boolean;
+  };
+  graph: {
+    positions: Record<string, { x: number; y: number }>;
+    frames: Record<string, { x: number; y: number; width: number; height: number }>;
+  };
+}
+
+export interface PatchNetworkBody {
+  name?: string;
+  bridge_ip?: string;
+}
+
+export interface PatchPendingClientBody {
+  name?: string;
+  lan_subnets?: string[];
 }
 
 export const api = {
@@ -81,12 +104,19 @@ export const api = {
       name,
     }) as Promise<{ id: string; name: string }>;
   },
-  renameNetwork(networkId: string, name: string): Promise<{ id: string; name: string }> {
-    return sendJson<{ id: string; name: string }>(
+  renameNetwork(networkId: string, name: string): Promise<Network> {
+    return sendJson<Network>(
       "PATCH",
       `/api/networks/${encodeURIComponent(networkId)}`,
       { name },
-    ) as Promise<{ id: string; name: string }>;
+    ) as Promise<Network>;
+  },
+  patchNetwork(networkId: string, body: PatchNetworkBody): Promise<Network> {
+    return sendJson<Network>(
+      "PATCH",
+      `/api/networks/${encodeURIComponent(networkId)}`,
+      body,
+    ) as Promise<Network>;
   },
   deleteNetwork(networkId: string): Promise<null> {
     return sendJson<null>(
@@ -96,6 +126,29 @@ export const api = {
   },
   listDevices(networkId: string): Promise<Device[]> {
     return getJson<Device[]>(`/api/networks/${encodeURIComponent(networkId)}/devices`);
+  },
+  /** Phase 3 — every known client (admitted + pending), one shot. */
+  listClients(): Promise<Device[]> {
+    return getJson<Device[]>("/api/clients");
+  },
+  /** Phase 3 — edit name / lan_subnets of a pending (unassigned) client. */
+  patchPendingClient(
+    clientUuid: string,
+    body: PatchPendingClientBody,
+  ): Promise<Device> {
+    return sendJson<Device>(
+      "PATCH",
+      `/api/clients/${encodeURIComponent(clientUuid)}`,
+      body,
+    ) as Promise<Device>;
+  },
+  /** Phase 3 — drag-to-assign. `netUuid = null` detaches to pending pool. */
+  assignClient(clientUuid: string, netUuid: string | null): Promise<Device> {
+    return sendJson<Device>(
+      "POST",
+      `/api/clients/${encodeURIComponent(clientUuid)}/assign`,
+      { net_uuid: netUuid },
+    ) as Promise<Device>;
   },
   updateDevice(
     networkId: string,
@@ -114,17 +167,12 @@ export const api = {
       `/api/networks/${encodeURIComponent(networkId)}/routes/push`,
     ) as Promise<PushRoutesResp>;
   },
-  getLayout(networkId: string): Promise<GraphLayout> {
-    return getJson<GraphLayout>(
-      `/api/networks/${encodeURIComponent(networkId)}/layout`,
-    );
+  /** Phase 3 — single-file UI layout (replaces per-network layouts). */
+  getUiLayout(): Promise<UiLayout> {
+    return getJson<UiLayout>("/api/ui-layout");
   },
-  putLayout(networkId: string, layout: GraphLayout): Promise<null> {
-    return sendJson<null>(
-      "PUT",
-      `/api/networks/${encodeURIComponent(networkId)}/layout`,
-      layout,
-    ) as Promise<null>;
+  putUiLayout(layout: UiLayout): Promise<null> {
+    return sendJson<null>("PUT", "/api/ui-layout", layout) as Promise<null>;
   },
 };
 

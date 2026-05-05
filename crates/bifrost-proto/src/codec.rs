@@ -73,17 +73,54 @@ impl Decoder for FrameCodec {
     }
 }
 
+/// Postcard `Flavor` that serializes directly into a `BytesMut`,
+/// avoiding the intermediate `Vec` allocation that `to_allocvec` does.
+///
+/// On the bifrost upload hot path `perf record` showed
+/// `FrameCodec::encode` taking ~10 % of all cycles — almost entirely
+/// the per-frame allocation + copy from `to_allocvec`'s `Vec` into the
+/// `BytesMut`. Writing straight into the destination eliminates both.
+struct BytesMutFlavor<'a>(&'a mut BytesMut);
+
+impl<'a> postcard::ser_flavors::Flavor for BytesMutFlavor<'a> {
+    type Output = ();
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.0.put_u8(byte);
+        Ok(())
+    }
+
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.put_slice(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(())
+    }
+}
+
 impl Encoder<Frame> for FrameCodec {
     type Error = ProtoError;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), ProtoError> {
-        let payload = postcard::to_allocvec(&item)?;
-        if payload.len() > self.max_len {
-            return Err(ProtoError::FrameTooLarge(payload.len(), self.max_len));
+        // Reserve a placeholder length header, serialize the body
+        // straight into `dst` via the no-alloc flavor, then back-patch
+        // the header with the actual length. Truncating on overflow
+        // restores `dst` exactly to its pre-encode state so a too-big
+        // frame doesn't leave half-written bytes on the wire.
+        let len_pos = dst.len();
+        dst.reserve(HEADER_LEN);
+        dst.put_u32(0); // placeholder; patched below
+        let payload_start = dst.len();
+        postcard::serialize_with_flavor::<_, _, ()>(&item, BytesMutFlavor(dst))?;
+        let payload_len = dst.len() - payload_start;
+        if payload_len > self.max_len {
+            dst.truncate(len_pos);
+            return Err(ProtoError::FrameTooLarge(payload_len, self.max_len));
         }
-        dst.reserve(HEADER_LEN + payload.len());
-        dst.put_u32(payload.len() as u32);
-        dst.put_slice(&payload);
+        let len_be = (payload_len as u32).to_be_bytes();
+        dst[len_pos..len_pos + HEADER_LEN].copy_from_slice(&len_be);
         Ok(())
     }
 }

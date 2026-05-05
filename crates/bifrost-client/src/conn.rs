@@ -108,6 +108,16 @@ impl ConnTask {
                     },
                     outgoing = self.out_rx.recv() => match outgoing {
                         Some(frame) => {
+                            // Per-frame send (= feed + flush). With
+                            // TCP_NODELAY each frame becomes its own
+                            // small TCP segment immediately. Earlier we
+                            // batched (drain channel into one flush) to
+                            // save syscalls — but that creates large
+                            // bursts that overwhelm a slow downstream
+                            // proxy (e.g. xray-core), causing its ACK
+                            // window to stall and our outer TCP to drop
+                            // cwnd to 10. Per-frame writes give the
+                            // proxy a steady, paced stream.
                             if let Err(e) = framed.send(frame).await {
                                 warn!(error = %e, "socket write failed");
                                 break;
@@ -133,15 +143,30 @@ impl ConnTask {
     /// on and avoid threading a generic type all the way through.
     async fn connect(cfg: &ClientConfig) -> anyhow::Result<TcpStream> {
         let target = (cfg.client.host.as_str(), cfg.client.port);
-        if cfg.proxy.enabled {
+        let stream = if cfg.proxy.enabled {
             let s = Socks5Stream::connect(
                 (cfg.proxy.host.as_str(), cfg.proxy.port),
                 target,
             )
             .await?;
-            Ok(s.into_inner())
+            s.into_inner()
         } else {
-            Ok(TcpStream::connect(target).await?)
+            TcpStream::connect(target).await?
+        };
+        // Disable Nagle so per-frame writes don't get held waiting for
+        // the previous segment's ACK. See accept.rs for the matching
+        // server-side rationale.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(error = %e, "set_nodelay failed (continuing)");
         }
+        // Bound kernel SNDBUF — see accept.rs. Through nested TCP
+        // tunnels (xray etc.) the auto-tuned multi-MB buffer hides
+        // congestion from the inner TCP, which then keeps growing
+        // its cwnd until bulk throughput collapses to near zero.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = bifrost_net::set_send_buffer_size(&stream, 256 * 1024) {
+            warn!(error = %e, "set_send_buffer_size failed (continuing)");
+        }
+        Ok(stream)
     }
 }

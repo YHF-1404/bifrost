@@ -194,12 +194,12 @@ async fn patch_device_unknown_is_404() {
 
 #[tokio::test]
 async fn fresh_join_creates_pending_row_and_admit_promotes_it() {
+    // Phase 3 — Hello → unassigned, assign → row in net (admitted=false),
+    // Join → silent pending, admit → live session.
     let h = spawn_with(vec![]).await;
 
-    // Stand up a fake conn that joins. Hub creates a row with
-    // admitted=false on first contact.
     let cid = Uuid::new_v4();
-    let (frame_tx, _frame_rx) = mpsc::channel(16);
+    let (frame_tx, mut frame_rx) = mpsc::channel(16);
     let (bind_tx, _bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
     let conn = h
         .hub
@@ -207,11 +207,16 @@ async fn fresh_join_creates_pending_row_and_admit_promotes_it() {
         .await
         .unwrap();
     h.hub.hello(conn, cid, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Admin assigns to the network — the conn receives `AssignNet`.
+    let _ = h.hub.assign_client(cid, Some(h.net)).await;
+    // Drain that frame so we don't confuse later assertions.
+    let _ = tokio::time::timeout(Duration::from_millis(100), frame_rx.recv()).await;
     h.hub.join(conn, h.net).await;
-    // brief settle
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Listing shows the device in pending state.
+    // Listing shows the device in pending-admit state.
     let arr: Value = reqwest::get(url(&h, &format!("/api/networks/{}/devices", h.net)))
         .await
         .unwrap()
@@ -345,11 +350,14 @@ async fn rename_unknown_network_is_404() {
 }
 
 #[tokio::test]
-async fn delete_network_cascades_devices() {
-    // Spawn with one device row. Then delete the whole network and
-    // verify both the network and its row are gone.
+async fn delete_network_detaches_devices_to_pending() {
+    // Phase 3 — deleting a network does NOT delete its devices; they
+    // fall back to the pending pool, carrying display_name and
+    // lan_subnets across.
     let cid = Uuid::new_v4();
-    let h = spawn_with(vec![approved(cid, Uuid::nil(), "10.0.0.5/24", &[])]).await;
+    let mut row = approved(cid, Uuid::nil(), "10.0.0.5/24", &["192.168.10.0/24"]);
+    row.display_name = "router".into();
+    let h = spawn_with(vec![row]).await;
 
     let resp = reqwest::Client::new()
         .delete(url(&h, &format!("/api/networks/{}", h.net)))
@@ -378,6 +386,316 @@ async fn delete_network_cascades_devices() {
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // But the cross-network /api/clients listing now shows the
+    // detached client as pending (net_uuid = null).
+    let arr: Value = reqwest::get(url(&h, "/api/clients"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["client_uuid"] == cid.to_string())
+        .expect("detached client should appear in /api/clients");
+    assert!(row["net_uuid"].is_null());
+    assert_eq!(row["display_name"], "router");
+    assert_eq!(row["lan_subnets"][0], "192.168.10.0/24");
+}
+
+// ── Phase 3: cross-network client endpoints ──────────────────────────────
+
+#[tokio::test]
+async fn list_clients_returns_pending_and_admitted() {
+    // One admitted, one pending. The unified /api/clients endpoint
+    // should return both.
+    let admitted = Uuid::new_v4();
+    let h = spawn_with(vec![approved(admitted, Uuid::nil(), "10.0.0.5/24", &[])]).await;
+
+    // Pre-register a pending client by registering a conn + Hello.
+    let pending = Uuid::new_v4();
+    let (frame_tx, _frame_rx) = mpsc::channel(16);
+    let (bind_tx, _bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
+    let conn = h
+        .hub
+        .register_conn("y".into(), ConnLink { frame_tx, bind_tx })
+        .await
+        .unwrap();
+    h.hub.hello(conn, pending, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let arr: Value = reqwest::get(url(&h, "/api/clients"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = arr.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr
+        .iter()
+        .any(|c| c["client_uuid"] == admitted.to_string() && c["net_uuid"] == h.net.to_string()));
+    assert!(arr
+        .iter()
+        .any(|c| c["client_uuid"] == pending.to_string() && c["net_uuid"].is_null()));
+}
+
+#[tokio::test]
+async fn assign_client_pending_to_network_clears_admit_and_ip() {
+    // Pre-register a pending client; assign it to the seeded net.
+    // Returned record should have admitted=false, tap_ip=null.
+    let cid = Uuid::new_v4();
+    let h = spawn_with(vec![]).await;
+
+    let (frame_tx, mut frame_rx) = mpsc::channel(16);
+    let (bind_tx, _bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
+    let conn = h
+        .hub
+        .register_conn("y".into(), ConnLink { frame_tx, bind_tx })
+        .await
+        .unwrap();
+    h.hub.hello(conn, cid, PROTOCOL_VERSION).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Phase 3 — `handle_hello` now pushes one `AssignNet` so the client
+    // knows its server-authoritative assignment (None for a pending
+    // pool entry). Drain it before we trigger the explicit assign.
+    let _ = tokio::time::timeout(Duration::from_millis(100), frame_rx.recv()).await;
+
+    let resp = reqwest::Client::new()
+        .post(url(&h, &format!("/api/clients/{cid}/assign")))
+        .json(&json!({ "net_uuid": h.net }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["client_uuid"], cid.to_string());
+    assert_eq!(body["net_uuid"], h.net.to_string());
+    assert_eq!(body["admitted"], false);
+    assert!(body["tap_ip"].is_null());
+
+    // The conn should have received `AssignNet { Some(net) }`.
+    let assign_frame = tokio::time::timeout(Duration::from_millis(200), frame_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .expect("expected AssignNet frame");
+    assert!(matches!(
+        assign_frame,
+        bifrost_proto::Frame::AssignNet { net_uuid: Some(n) } if n == h.net
+    ));
+}
+
+#[tokio::test]
+async fn assign_client_detach_returns_pending_row() {
+    // Already-admitted client, dragged out to the pending pool.
+    let cid = Uuid::new_v4();
+    let h = spawn_with(vec![approved(cid, Uuid::nil(), "10.0.0.5/24", &["10.20.0.0/16"])])
+        .await;
+    let resp = reqwest::Client::new()
+        .post(url(&h, &format!("/api/clients/{cid}/assign")))
+        .json(&json!({ "net_uuid": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["net_uuid"].is_null());
+    assert_eq!(body["admitted"], false);
+    assert_eq!(body["lan_subnets"][0], "10.20.0.0/16");
+}
+
+#[tokio::test]
+async fn assign_client_unknown_network_is_400() {
+    let cid = Uuid::new_v4();
+    let h = spawn_with(vec![approved(cid, Uuid::nil(), "10.0.0.5/24", &[])]).await;
+    let resp = reqwest::Client::new()
+        .post(url(&h, &format!("/api/clients/{cid}/assign")))
+        .json(&json!({ "net_uuid": Uuid::new_v4() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn assign_client_unknown_client_is_404() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .post(url(&h, &format!("/api/clients/{}/assign", Uuid::new_v4())))
+        .json(&json!({ "net_uuid": h.net }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn patch_pending_client_sets_name_and_lan_subnets() {
+    // Detach an admitted client to pending, then PATCH /clients/:cid.
+    let cid = Uuid::new_v4();
+    let h = spawn_with(vec![approved(cid, Uuid::nil(), "10.0.0.5/24", &[])]).await;
+    let _ = reqwest::Client::new()
+        .post(url(&h, &format!("/api/clients/{cid}/assign")))
+        .json(&json!({ "net_uuid": null }))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/clients/{cid}")))
+        .json(&json!({ "name": "laptop", "lan_subnets": ["172.16.0.0/12"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["display_name"], "laptop");
+    assert_eq!(body["lan_subnets"][0], "172.16.0.0/12");
+    assert!(body["net_uuid"].is_null());
+}
+
+#[tokio::test]
+async fn patch_network_sets_bridge_ip_with_24_prefix_ok() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", h.net)))
+        .json(&json!({ "bridge_ip": "10.0.0.1/24" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["bridge_ip"], "10.0.0.1/24");
+}
+
+#[tokio::test]
+async fn patch_network_rejects_unsupported_prefix() {
+    let h = spawn_with(vec![]).await;
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", h.net)))
+        .json(&json!({ "bridge_ip": "10.0.0.1/22" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn ui_layout_round_trip() {
+    let h = spawn_with(vec![]).await;
+    // Empty initial GET.
+    let r: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["table"].is_object());
+    assert!(r["graph"]["positions"].as_object().unwrap().is_empty());
+
+    // PUT something, then GET back.
+    let body = json!({
+        "table": { "left_ratio": 0.4, "left_collapsed": false },
+        "graph": {
+            "positions": { "client:abc": { "x": 1.5, "y": 2.5 } },
+            "frames": { h.net.to_string(): { "x": 0.0, "y": 0.0, "width": 600.0, "height": 400.0 } }
+        }
+    });
+    let put = reqwest::Client::new()
+        .put(url(&h, "/api/ui-layout"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let got: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["table"]["left_ratio"], 0.4);
+    assert_eq!(got["graph"]["positions"]["client:abc"]["x"], 1.5);
+    assert_eq!(
+        got["graph"]["frames"][h.net.to_string()]["width"],
+        600.0
+    );
+}
+
+#[tokio::test]
+async fn delete_network_drops_frame_from_ui_layout() {
+    let h = spawn_with(vec![]).await;
+    let body = json!({
+        "graph": {
+            "frames": { h.net.to_string(): { "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0 } }
+        }
+    });
+    let _ = reqwest::Client::new()
+        .put(url(&h, "/api/ui-layout"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    let _ = reqwest::Client::new()
+        .delete(url(&h, &format!("/api/networks/{}", h.net)))
+        .send()
+        .await
+        .unwrap();
+
+    let got: Value = reqwest::get(url(&h, "/api/ui-layout"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(got["graph"]["frames"]
+        .as_object()
+        .unwrap()
+        .get(&h.net.to_string())
+        .is_none());
+}
+
+#[tokio::test]
+async fn patch_network_24_to_16_rewrites_client_tap_ip_prefix() {
+    // Spawn with bridge /24 + a client at 10.0.0.5/24. Switch bridge
+    // to /16; client's tap_ip should auto-rewrite to 10.0.0.5/16.
+    let cid = Uuid::new_v4();
+    let mut row = approved(cid, Uuid::nil(), "10.0.0.5/24", &[]);
+    row.tap_ip = "10.0.0.5/24".into();
+    let h = spawn_with(vec![row]).await;
+
+    // Set bridge /24 first.
+    let _ = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", h.net)))
+        .json(&json!({ "bridge_ip": "10.0.0.1/24" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Now widen to /16.
+    let resp = reqwest::Client::new()
+        .patch(url(&h, &format!("/api/networks/{}", h.net)))
+        .json(&json!({ "bridge_ip": "10.0.0.1/16" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Verify the client's row now reads the /16 form.
+    let arr: Value = reqwest::get(url(&h, &format!("/api/networks/{}/devices", h.net)))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = &arr[0];
+    assert_eq!(row["tap_ip"], "10.0.0.5/16");
 }
 
 // ── Graph layout (per-network UI state) ───────────────────────────────────

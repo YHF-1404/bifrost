@@ -2,26 +2,14 @@
 // pair of side-midpoints between source and target nodes — so as the
 // user drags nodes around, each edge "snaps" to the nearest side
 // instead of always launching from a fixed handle.
-//
-// Why not the built-in handle routing? React Flow's default edge
-// renderer asks each Handle for its position and renders a path
-// between those two fixed anchors. With our four-handles-per-node
-// layout, that would just round-robin to whatever handle ID was
-// requested first. We want continuous re-evaluation: drag the device
-// to the right of the hub → edge enters the device's left side, exits
-// the hub's right side. That's a function of the node centres, so we
-// compute it ourselves.
-//
-// The arithmetic:
-//   1. Read both nodes' bounding boxes from the React Flow store
-//      (positionAbsolute + measured size).
-//   2. Compute the four side-midpoints of each box.
-//   3. Pick the (source, target) midpoint pair with the smallest
-//      Euclidean distance.
-//   4. Hand off to `getBezierPath` so the curve hint matches the
-//      chosen side (e.g. exiting "right" curves toward +x).
 
-import { BaseEdge, type EdgeProps, Position, getBezierPath, useInternalNode } from "@xyflow/react";
+import {
+  BaseEdge,
+  type EdgeProps,
+  Position,
+  getBezierPath,
+  useInternalNode,
+} from "@xyflow/react";
 
 interface Side {
   x: number;
@@ -29,12 +17,22 @@ interface Side {
   pos: Position;
 }
 
-/** Four side-midpoints (top / right / bottom / left) for a node whose
- *  position+size is known. Coordinates are in flow space. */
-function midpoints(node: ReturnType<typeof useInternalNode>): Side[] {
-  if (!node || !node.measured) return [];
-  const w = node.measured.width ?? 0;
-  const h = node.measured.height ?? 0;
+function midpoints(
+  node: ReturnType<typeof useInternalNode> | undefined,
+): Side[] {
+  if (!node) return [];
+  // React Flow v12 only fills `measured` after a ResizeObserver
+  // tick. Parented nodes with an explicit `style: { width, height }`
+  // sometimes render before measure completes — fall back to those
+  // values so the edge midpoints don't collapse to a single point
+  // and the line ends up pinned to the wrong corner of the card.
+  const styleW =
+    typeof node.style?.width === "number" ? node.style.width : undefined;
+  const styleH =
+    typeof node.style?.height === "number" ? node.style.height : undefined;
+  const w = node.measured?.width ?? node.width ?? styleW ?? 0;
+  const h = node.measured?.height ?? node.height ?? styleH ?? 0;
+  if (w === 0 || h === 0) return [];
   const x = node.internals.positionAbsolute.x;
   const y = node.internals.positionAbsolute.y;
   return [
@@ -52,8 +50,6 @@ export function FloatingEdge({
   markerEnd,
   style,
 }: EdgeProps) {
-  // useInternalNode subscribes to store updates for these nodes; the
-  // edge re-renders on every drag tick, which is exactly what we want.
   const sourceNode = useInternalNode(source);
   const targetNode = useInternalNode(target);
   if (!sourceNode || !targetNode) return null;

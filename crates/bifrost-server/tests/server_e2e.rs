@@ -180,6 +180,7 @@ async fn full_join_flow_creates_tap_and_binds() {
     .await
     .unwrap();
     let _ = recv_frame(&mut c).await; // HelloAck
+    let _ = recv_frame(&mut c).await; // Phase 3 — server's AssignNet on Hello
 
     c.send(Frame::Join { net_uuid: net }).await.unwrap();
     match recv_frame(&mut c).await {
@@ -222,6 +223,7 @@ async fn ping_is_answered_inline() {
     .await
     .unwrap();
     let _ = recv_frame(&mut c).await; // HelloAck
+    let _ = recv_frame(&mut c).await; // Phase 3 — server's AssignNet on Hello
 
     c.send(Frame::Ping(0xCAFEBABE)).await.unwrap();
     match recv_frame(&mut c).await {
@@ -242,7 +244,8 @@ async fn file_frame_lands_in_save_dir() {
     })
     .await
     .unwrap();
-    let _ = recv_frame(&mut c).await;
+    let _ = recv_frame(&mut c).await; // HelloAck
+    let _ = recv_frame(&mut c).await; // Phase 3 — server's AssignNet on Hello
 
     c.send(Frame::File {
         name: "report.txt".into(),
@@ -279,7 +282,8 @@ async fn disconnect_then_reconnect_rebinds_no_new_tap() {
     })
     .await
     .unwrap();
-    let _ = recv_frame(&mut c1).await;
+    let _ = recv_frame(&mut c1).await; // HelloAck
+    let _ = recv_frame(&mut c1).await; // Phase 3 — AssignNet on Hello
     c1.send(Frame::Join { net_uuid: net }).await.unwrap();
     let _ = recv_frame(&mut c1).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -298,7 +302,8 @@ async fn disconnect_then_reconnect_rebinds_no_new_tap() {
     })
     .await
     .unwrap();
-    let _ = recv_frame(&mut c2).await;
+    let _ = recv_frame(&mut c2).await; // HelloAck
+    let _ = recv_frame(&mut c2).await; // Phase 3 — AssignNet on Hello
     c2.send(Frame::Join { net_uuid: net }).await.unwrap();
     match recv_frame(&mut c2).await {
         Frame::JoinOk { .. } => {}

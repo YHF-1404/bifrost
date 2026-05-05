@@ -36,7 +36,10 @@ pub async fn run<S>(stream: S, addr: String, hub: HubHandle, server_id: Uuid, sa
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(128);
+    // 1024 ≈ 1.5 MB of buffered frames at MTU 1500. Big enough that a
+    // momentarily-stalled writer (e.g. socket congestion window
+    // shrinking) doesn't immediately backpressure the TAP-read loop.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Frame>(1024);
     let (bind_tx, mut bind_rx) = mpsc::channel::<Option<mpsc::Sender<SessionCmd>>>(8);
     let conn_id = match hub
         .register_conn(addr.clone(), ConnLink { frame_tx, bind_tx })
@@ -54,7 +57,11 @@ where
         tokio::select! {
             biased;
 
-            // Outbound from hub / session → wire.
+            // Per-frame send — see bifrost-client/conn.rs for why we
+            // do NOT batch into one flush. With TCP_NODELAY each frame
+            // becomes its own small TCP segment immediately, which a
+            // slow downstream proxy (xray-core, …) can pace through
+            // its tunnel without choking on a multi-MB burst.
             outbound = frame_rx.recv() => match outbound {
                 Some(frame) => {
                     if let Err(e) = framed.send(frame).await {
@@ -192,6 +199,7 @@ where
         f @ (Frame::HelloAck { .. }
         | Frame::JoinOk { .. }
         | Frame::JoinDeny { .. }
+        | Frame::AssignNet { .. }
         | Frame::SetIp { .. }
         | Frame::SetRoutes(_)) => {
             warn!(?conn_id, ?f, "unexpected server→client frame from client");

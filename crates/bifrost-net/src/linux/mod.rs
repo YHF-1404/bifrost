@@ -14,8 +14,10 @@
 
 mod bridge;
 mod platform;
+mod sockopt;
 mod tap;
 
 pub use bridge::LinuxBridge;
 pub use platform::LinuxPlatform;
+pub use sockopt::set_send_buffer_size;
 pub use tap::LinuxTap;

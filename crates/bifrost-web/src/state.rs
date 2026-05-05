@@ -8,8 +8,10 @@ use bifrost_core::HubHandle;
 #[derive(Clone)]
 pub struct AppState {
     pub hub: HubHandle,
-    /// Directory under which per-network UI state lives. Currently
-    /// holds graph node-position layouts (`<layout_dir>/<nid>.json`).
-    /// Pre-created at startup so handlers don't race on it.
+    /// Directory under which UI state lives. Phase 3 collapses the old
+    /// per-network layout files into a single `ui-layout.json` here
+    /// (per-network frame + per-client position + table-view
+    /// preferences). Pre-created at startup so handlers don't race
+    /// on it.
     pub layout_dir: PathBuf,
 }

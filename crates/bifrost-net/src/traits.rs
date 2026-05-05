@@ -55,6 +55,10 @@ pub trait Bridge: Send + Sync + 'static {
     /// Remove `tap_name` from this bridge. Idempotent.
     async fn remove_tap(&self, tap_name: &str) -> io::Result<()>;
 
+    /// Replace the IP/CIDR assigned to this bridge. `None` clears the
+    /// address. Idempotent on repeat calls with the same value.
+    async fn set_ip(&self, ip: Option<IpNet>) -> io::Result<()>;
+
     /// Replace the kernel routes that flow through this bridge.
     /// Implementations install each entry with the bridge as the
     /// output device, so the host's routing table can reach the

@@ -139,6 +139,17 @@ async fn recv_bind(
         .expect("bind_rx closed")
 }
 
+/// Phase 3 — `handle_hello` always pushes one `AssignNet` so the
+/// client knows its server-authoritative assignment. Tests that only
+/// care about post-Hello behavior call this to consume it.
+async fn drain_hello_assign(rx: &mut mpsc::Receiver<Frame>) {
+    let f = recv(rx).await;
+    assert!(
+        matches!(f, Frame::AssignNet { .. }),
+        "expected AssignNet from Hello, got {f:?}"
+    );
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -154,6 +165,7 @@ async fn whitelisted_join_creates_tap_and_binds_conn() {
 
     let mut c = fake_conn(&h, "1.2.3.4:1").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     // Expect JoinOk first.
@@ -185,6 +197,7 @@ async fn unknown_network_is_denied() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, Uuid::new_v4(), PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, Uuid::new_v4()).await; // wrong net
 
     match recv(&mut c.frame_rx).await {
@@ -215,10 +228,11 @@ async fn join_without_hello_is_denied() {
 }
 
 #[tokio::test]
-async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
-    // No row exists for this client yet. handle_join creates one with
-    // admitted=false and parks the conn in pending — no JoinOk or
-    // JoinDeny is sent.
+async fn fresh_hello_creates_pending_unassigned_row() {
+    // Phase 3 — server is authoritative on assignment. A first Hello
+    // from an unknown client creates a pending_clients row (left pane
+    // in the WebUI) and any Join attempt is denied with "unassigned"
+    // until an admin assigns it.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -227,9 +241,56 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
-    h.hub.join(c.id, net).await;
+    drain_hello_assign(&mut c.frame_rx).await;
+    // Give the hub a beat to write the pending_clients row.
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    // No frame should arrive — server holds the conn in pending state.
+    h.hub.join(c.id, net).await;
+    match recv(&mut c.frame_rx).await {
+        Frame::JoinDeny { reason } => assert_eq!(reason, "unassigned"),
+        other => panic!("expected JoinDeny(unassigned), got {other:?}"),
+    }
+
+    // Device list (no filter) shows the unassigned row with net_uuid=None.
+    let devices = h.hub.device_list(None).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].client_uuid, client);
+    assert_eq!(devices[0].net_uuid, None);
+    assert!(!devices[0].admitted);
+    assert!(devices[0].online);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn assign_then_join_creates_pending_admit_row_and_holds_conn() {
+    // After Hello, an admin's `assign_client` creates an approved_clients
+    // row with admitted=false. The client (re-)joins and the server
+    // holds the conn silently in `pending` — waiting for admit toggle.
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let h = spawn(cfg).await;
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Admin assigns. This sends `Frame::AssignNet { Some(net) }` to the
+    // conn; in the test harness we observe it on `frame_rx`.
+    let result = h.hub.assign_client(client, Some(net)).await;
+    assert!(matches!(result, bifrost_core::AssignClientResult::Ok(_)));
+
+    match recv(&mut c.frame_rx).await {
+        Frame::AssignNet { net_uuid } => assert_eq!(net_uuid, Some(net)),
+        other => panic!("expected AssignNet, got {other:?}"),
+    }
+
+    // Now the client (simulating its on_assign_net handler) issues Join.
+    h.hub.join(c.id, net).await;
+    // Server holds silently — no JoinOk yet.
     assert!(try_recv_silent(&mut c.frame_rx, Duration::from_millis(80))
         .await
         .is_none());
@@ -238,8 +299,6 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
     assert_eq!(snap.pending.len(), 1);
     assert_eq!(snap.pending[0].client_uuid, client);
 
-    // The device list shows the row in pending state (admitted=false,
-    // online=true).
     let devices = h.hub.device_list(Some(net)).await;
     assert_eq!(devices.len(), 1);
     assert!(!devices[0].admitted);
@@ -250,8 +309,7 @@ async fn fresh_join_creates_pending_row_and_holds_conn_silently() {
 
 #[tokio::test]
 async fn admit_toggle_on_promotes_pending_to_session() {
-    // Same as above, then admin flips admitted=true and a real session
-    // spawns; the conn finally gets JoinOk.
+    // Phase 3 flow: Hello → assign → Join (silent) → admit → JoinOk.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -260,6 +318,11 @@ async fn admit_toggle_on_promotes_pending_to_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = h.hub.assign_client(client, Some(net)).await;
+    // Drain the AssignNet frame.
+    let _ = recv(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     // Flip admitted on.
@@ -300,6 +363,7 @@ async fn admit_toggle_off_kicks_session_keeps_row_in_pending() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -362,6 +426,7 @@ async fn disconnect_unbinds_session_but_keeps_tap() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await; // bound
@@ -391,6 +456,7 @@ async fn reconnect_reuses_session_no_new_tap() {
     // First join.
     let mut c1 = fake_conn(&h, "x1").await;
     h.hub.hello(c1.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c1.frame_rx).await;
     h.hub.join(c1.id, net).await;
     let _ = recv(&mut c1.frame_rx).await;
     let _ = recv_bind(&mut c1.bind_rx).await;
@@ -402,6 +468,7 @@ async fn reconnect_reuses_session_no_new_tap() {
     // Second conn reconnects.
     let mut c2 = fake_conn(&h, "x2").await;
     h.hub.hello(c2.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c2.frame_rx).await;
     h.hub.join(c2.id, net).await;
 
     // Still only 1 TAP.
@@ -430,6 +497,7 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
 
     let mut c1 = fake_conn(&h, "x1").await;
     h.hub.hello(c1.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c1.frame_rx).await;
     h.hub.join(c1.id, net).await;
     let _ = recv(&mut c1.frame_rx).await;
     let _ = recv_bind(&mut c1.bind_rx).await; // initial bind
@@ -437,6 +505,7 @@ async fn reconnect_while_first_still_bound_unbinds_first() {
     // Second conn from same client without disconnecting the first.
     let mut c2 = fake_conn(&h, "x2").await;
     h.hub.hello(c2.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c2.frame_rx).await;
     h.hub.join(c2.id, net).await;
 
     // First conn must observe an unbind (`None` on bind_rx).
@@ -459,6 +528,7 @@ async fn disconnect_then_timeout_removes_session_and_tap() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await;
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -499,6 +569,7 @@ async fn routes_pushed_after_join_and_filter_self_via() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
 
     let _ = recv(&mut c.frame_rx).await; // JoinOk
@@ -526,6 +597,7 @@ async fn shutdown_destroys_bridge_and_kills_sessions() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await;
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -556,6 +628,7 @@ async fn device_set_ip_pushes_to_live_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -772,6 +845,7 @@ async fn device_push_pushes_to_each_bound_session() {
 
     let mut a = fake_conn(&h, "x:1").await;
     h.hub.hello(a.id, client_a, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut a.frame_rx).await;
     h.hub.join(a.id, net).await;
     let _ = recv(&mut a.frame_rx).await; // JoinOk
     let _ = recv(&mut a.frame_rx).await; // SetRoutes (initial push)
@@ -779,6 +853,7 @@ async fn device_push_pushes_to_each_bound_session() {
 
     let mut b = fake_conn(&h, "x:2").await;
     h.hub.hello(b.id, client_b, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut b.frame_rx).await;
     h.hub.join(b.id, net).await;
     let _ = recv(&mut b.frame_rx).await;
     let _ = recv(&mut b.frame_rx).await;
@@ -873,6 +948,7 @@ async fn metrics_tick_broadcasts_one_sample_per_session() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
     let _ = recv_bind(&mut c.bind_rx).await;
@@ -934,7 +1010,8 @@ where
 
 #[tokio::test]
 async fn admit_toggle_emits_device_online() {
-    // Pending join → admit toggle ON → DeviceOnline.
+    // Phase 3 — Hello → DevicePending(net=nil) (unassigned),
+    // assign  → DeviceChanged (now in net), admit → DeviceOnline.
     let net = Uuid::new_v4();
     let client = Uuid::new_v4();
     let mut cfg = build_cfg(60);
@@ -944,15 +1021,23 @@ async fn admit_toggle_emits_device_online() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
-    h.hub.join(c.id, net).await;
+    drain_hello_assign(&mut c.frame_rx).await;
 
-    // First a DevicePending arrives.
+    // First a DevicePending(network=nil) arrives — unassigned client.
     let pending = next_matching(&mut events, Duration::from_millis(500), |e| {
         matches!(e, HubEvent::DevicePending { .. })
     })
     .await
     .expect("expected DevicePending");
-    assert!(matches!(pending, HubEvent::DevicePending { network, .. } if network == net));
+    assert!(
+        matches!(pending, HubEvent::DevicePending { network, .. } if network == Uuid::nil())
+    );
+
+    // Assign the client to `net`.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = h.hub.assign_client(client, Some(net)).await;
+    let _ = recv(&mut c.frame_rx).await; // AssignNet
+    h.hub.join(c.id, net).await;
 
     // Flip admitted on via device_set.
     h.hub
@@ -1118,6 +1203,7 @@ async fn admit_attaches_tap_to_owning_network_bridge_only() {
 
     let mut c = fake_conn(&h, "x").await;
     h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
     h.hub.join(c.id, net_a).await;
     let _ = recv(&mut c.frame_rx).await; // JoinOk
 
@@ -1216,4 +1302,140 @@ uuid = "{net_b}"
     );
     assert_eq!(cfg.networks[1].bridge_ip, "");
     assert!(cfg.networks[1].bridge_name.starts_with("bf-"));
+}
+
+// ─── Phase 3: assign_client + bridge_ip ────────────────────────────────────
+
+#[tokio::test]
+async fn assign_pending_to_network_emits_assignnet_and_creates_row() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let h = spawn(cfg).await;
+
+    let mut c = fake_conn(&h, "x").await;
+    h.hub.hello(c.id, client, PROTOCOL_VERSION).await;
+    drain_hello_assign(&mut c.frame_rx).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Sanity: client is in the pending pool now (no approved row).
+    let devices = h.hub.device_list(None).await;
+    assert!(devices.iter().any(|d| d.client_uuid == client && d.net_uuid.is_none()));
+
+    // Assign.
+    let r = h.hub.assign_client(client, Some(net)).await;
+    assert!(matches!(r, bifrost_core::AssignClientResult::Ok(_)));
+
+    match recv(&mut c.frame_rx).await {
+        Frame::AssignNet { net_uuid } => assert_eq!(net_uuid, Some(net)),
+        other => panic!("expected AssignNet, got {other:?}"),
+    }
+
+    // Now the row is in the network as admitted=false.
+    let devices = h.hub.device_list(Some(net)).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].client_uuid, client);
+    assert!(!devices[0].admitted);
+    assert!(devices[0].tap_ip.is_none());
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn assign_detach_moves_admitted_client_to_pending_pool() {
+    let net = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let mut row = approved_with_lan(client, net, "10.0.0.5/24", &["192.168.10.0/24"]);
+    row.display_name = "router".into();
+    cfg.approved_clients.push(row);
+    let h = spawn(cfg).await;
+
+    // No live conn — purely a config-level move.
+    let r = h.hub.assign_client(client, None).await;
+    assert!(matches!(r, bifrost_core::AssignClientResult::Ok(_)));
+
+    let devices = h.hub.device_list(None).await;
+    let only = devices.iter().find(|d| d.client_uuid == client).unwrap();
+    assert!(only.net_uuid.is_none());
+    // display_name + lan_subnets carried across to the pending row.
+    assert_eq!(only.display_name, "router");
+    assert_eq!(only.lan_subnets, vec!["192.168.10.0/24"]);
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn assign_unknown_network_returns_unknown_network() {
+    let client = Uuid::new_v4();
+    let h = spawn(build_cfg(60)).await;
+
+    let r = h.hub.assign_client(client, Some(Uuid::new_v4())).await;
+    assert!(matches!(r, bifrost_core::AssignClientResult::UnknownNetwork));
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn delete_net_detaches_clients_to_pending() {
+    let net = Uuid::new_v4();
+    let cid_a = Uuid::new_v4();
+    let cid_b = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let mut a = approved_with_lan(cid_a, net, "10.0.0.5/24", &["192.168.10.0/24"]);
+    a.display_name = "a".into();
+    let mut b = approved_with_lan(cid_b, net, "10.0.0.6/24", &[]);
+    b.display_name = "b".into();
+    cfg.approved_clients.push(a);
+    cfg.approved_clients.push(b);
+    let h = spawn(cfg).await;
+
+    assert!(h.hub.delete_net(net).await);
+
+    // Both clients now in the pending pool.
+    let devices = h.hub.device_list(None).await;
+    assert_eq!(devices.len(), 2);
+    assert!(devices.iter().all(|d| d.net_uuid.is_none()));
+    let names: std::collections::HashSet<&str> =
+        devices.iter().map(|d| d.display_name.as_str()).collect();
+    assert!(names.contains("a"));
+    assert!(names.contains("b"));
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn set_bridge_ip_rejects_non_16_or_24_prefix() {
+    let net = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("n", net));
+    let h = spawn(cfg).await;
+
+    // /22 is not a valid Phase-3 bridge prefix.
+    let r = h.hub.set_net_bridge_ip(net, "10.0.0.1/22".into()).await;
+    assert!(matches!(r, bifrost_core::SetNetBridgeIpResult::Invalid(_)));
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn set_bridge_ip_24_to_16_rewrites_client_tap_ip_prefix() {
+    let net = Uuid::new_v4();
+    let cid = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    let mut net_rec = NetRecord::new("n", net);
+    net_rec.bridge_ip = "10.0.0.1/24".into();
+    cfg.networks.push(net_rec);
+    cfg.approved_clients
+        .push(approved(cid, net, "10.0.0.5/24"));
+    let h = spawn(cfg).await;
+
+    let r = h.hub.set_net_bridge_ip(net, "10.0.0.1/16".into()).await;
+    assert!(matches!(r, bifrost_core::SetNetBridgeIpResult::Ok(_)));
+
+    let devices = h.hub.device_list(Some(net)).await;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].tap_ip.as_deref(), Some("10.0.0.5/16"));
+
+    h.hub.shutdown().await;
 }

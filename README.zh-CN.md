@@ -19,7 +19,7 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 - **协议带版本号** — `Hello/HelloAck` 强制版本协商，未来加密升级（Noise / TLS）已经预留 `caps` bit
 - **断线复用** — Session 跨重连保 TAP，可配置 disconnect timeout 之后才回收
 - **三套控制面同源** — daemon 默认起 admin Unix socket + 本机 HTTP/WS（代码默认 `127.0.0.1:8080`，部署示例配置改成 `0.0.0.0:8080`），可选前台 REPL；三者背后是同一个 `HubHandle`
-- **WebUI（v1）** — `web/` 下的 React + Vite + Tailwind 应用：网络 CRUD、设备 admit/踢人开关、行内编辑名字 / TAP IP / LAN 子网、自动派生路由 + Push 按钮、表格 / 节点图两种视图、节点拖拽位置**服务端持久化**、连线自动吸附最近边中点、实时数字化吞吐 + sparkline
+- **WebUI（v3 - 统一视图）** — `web/` 下的 React + Vite + Tailwind 应用。**单页**统一展示所有网络与设备：左右分栏 + 拖拽分隔条；左栏列 pending（未入网）client，右栏一张卡片一个虚拟网络；**拖拽 client 跨栏 / 跨网**即可触发 `assign_client`，每次拖拽完 admit 自动归零、TAP IP 自动清空。**Graph 视图**单画布展示所有网络（每个网络一个实线框），拖到框内 = 入网，右键 Hub 删网络，右键空白处建网络。每个网桥 IP 用段位拣选器（仅支持 `/16` 或 `/24`），client TAP IP 锁住网桥前缀对应的 octets，禁止冲突
 - **路由表自动派生** — 每台设备声明背后的 `lan_subnets`，server 端 `device push` 时聚合下发，不再手维护 `[[routes]]`
 - **零外部 `ip` 命令依赖** — Linux 后端走 rtnetlink + ioctl 直连内核
 - **跨编译开箱即用** — `cross.toml` + Docker 一行编译 x86_64 / aarch64
@@ -52,6 +52,7 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 - **每个虚拟网一座网桥（Phase 2）**：每个 `[[networks]]` 行拥有自己的 Linux bridge（默认从 UUID 派生 `bf-<8-hex>`，可在 `NetRecord.bridge_name` 自定义）。`mknet` 建网桥，`delete_net` 拆网桥。已 admit 设备的 TAP 只挂到自己网络的桥上——网络之间不共享广播域、ARP、MAC 表、路由表。
 - **Session 状态机**：`Joined → Disconnected → Dead`，server 端有 disconnect timeout，client 端用 `None` 表示"永不超时由用户控制"。
 - **路由派生而非配置**：每台 admitted client 声明 `lan_subnets`，`device push` 时按网络聚合 → 安装到 **该网络的桥** 上（不是全局），去掉了 `[[routes]]` 这个独立维度。
+- **服务端权威分配（Phase 3）**：一个 client 同一时间最多在一个网络。**服务端**决定它在哪个网络（管理员通过 WebUI 拖拽或 `assign` CLI 指令触发），新连入的 client 落到 pending pool，未被分配前 `Join` 会被拒（`unassigned`）；分配变化时服务端推 `Frame::AssignNet { net_uuid }`，client 收到后销毁 TAP 并向新网络重新 `Join`。
 - **两个控制面同源**：admin Unix socket（`bifrost-server admin <cmd>`）和 HTTP API（`/api/...`）背后都是 `HubHandle` 的方法；WebUI 只是另一个 consumer。
 
 ---
@@ -62,7 +63,7 @@ postcard 帧格式封装后通过 TCP（可选 SOCKS5）双向转发。
 
 ```bash
 cargo build --workspace
-cargo test  --workspace      # 164 个单测 / 集成测试
+cargo test  --workspace      # 187 个单测 / 集成测试
 cargo clippy --workspace --all-targets -- -D warnings
 
 # 前端（只在动 WebUI 时需要）
@@ -127,18 +128,22 @@ CLIENT_HOST=root@<router-ip>  ./scripts/deploy-client.sh
 ssh root@<server-ip> 'bifrost-server admin mknet hml-net'
 # → network created  uuid=<NET_UUID>
 
-# 客户端发起 join（落到 pending 行）
-ssh root@<router-ip> 'bifrost-client admin join <NET_UUID>'
-
-# 一次性 admit + 配置：name / IP / LAN 子网。每个 flag 独立，缺省 = 不动。
-# 没传 --admit true 之前设备一直停在 pending 状态，行还在但不会下发 JoinOk。
+# 客户端 daemon 自启即连入服务端，被自动登记到 pending pool。
+# Phase 3 起服务端决定 client 归属哪个网络，用 `assign` 把它分到 NET_UUID：
 CLIENT_UUID=$(ssh root@<router-ip> \
   'grep ^uuid /etc/bifrost/client.toml | cut -d\" -f2')
+ssh root@<server-ip> "bifrost-server admin assign $CLIENT_UUID <NET_UUID>"
+# (服务端会发 Frame::AssignNet 给 client，client 自动 Join 新网，
+#  此时 admitted=false，等下一步配 IP 并打开 admit)
+
+# 一次性 admit + 配置：name / IP / LAN 子网。每个 flag 独立，缺省 = 不动。
 ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID \
   --admit true --name router --ip 10.0.0.2/24 --lan 192.168.200.0/24"
 
 # 后续要把已经 admit 的设备踢回 pending（保留行不删）：
 #   ssh root@<server-ip> "bifrost-server admin device set $CLIENT_UUID --admit false"
+# 或彻底拆出该网络回到 pending pool：
+#   ssh root@<server-ip> "bifrost-server admin assign $CLIENT_UUID none"
 
 # 重新派生路由表并下发给所有成员
 ssh root@<server-ip> "bifrost-server admin device push <NET_UUID>"
@@ -149,7 +154,7 @@ ssh root@<server-ip> 'ping -c 3 10.0.0.2'
 
 之后每次 client 重启都会用持久化的 `joined_network` 字段自动重连，server 端的 `approved_clients` 也已落盘 → 全部走自动批准路径。
 
-可选：开 `http://127.0.0.1:8080`（通过 SSH `-L` 转发）拿到同一份信息的可视化视图。详见下文 [WebUI](#webui)。
+可选：开 `http://127.0.0.1:8080`（通过 SSH `-L` 转发）拿到同一份信息的可视化视图——直接在左栏把那张 pending 卡片拖到右栏的网络卡片上，等同于上面 4-5 步。详见下文 [WebUI](#webui)。
 
 ---
 
@@ -192,15 +197,21 @@ listen = "127.0.0.1:9090"
 #   uuid         = "..."
 #   bridge_name  = "br-bifrost"        # 新建网络默认从 UUID 派生 `bf-<8-hex>`，
 #                                      # 升级时第一个网络会继承遗留 [bridge].name
-#   bridge_ip    = "10.0.0.1/24"       # 空 = 纯 L2，不给桥加 host 侧地址
+#   bridge_ip    = "10.0.0.1/24"       # 仅接受 /16 或 /24 (Phase 3)；空 = 纯 L2
 #
 # 每个 [[approved_clients]] 行的字段：
-#   client_uuid  = "..."               # daemon 写入
+#   client_uuid  = "..."               # daemon 写入（Phase 3 起每个 client 最多一行）
 #   net_uuid     = "..."               # daemon 写入
 #   tap_ip       = "10.0.0.2/24"       # device set --ip
 #   display_name = "router"            # device set --name
 #   lan_subnets  = ["192.168.200.0/24"]  # device set --lan
 #   admitted     = true                # device set --admit
+#
+# Phase 3 — 已连入但还没被分配到任何网络的 client 在另外一段：
+# [[pending_clients]]
+#   client_uuid  = "..."
+#   display_name = ""                  # pending 时也可编辑
+#   lan_subnets  = []                  # pending 时也可编辑
 #
 # 每个网络的路由表是 **从其成员的 `lan_subnets` 派生** 的，
 # 只装到该网络的桥上，不再有独立的 [[routes]] 段。
@@ -249,8 +260,9 @@ socket = "/run/bifrost/client.sock"
 |---|---|
 | `mknet <name>` | 创建虚拟网络，返回 UUID |
 | `rename <net-uuid> <new-name>` | 重命名网络 |
-| `rmnet <net-uuid>` | 删除网络并级联删除其下所有 device 行（在线 session 杀掉、conn 解绑、approved_clients 清掉、bridge 路由重派生） |
-| `device list [<net-uuid>]` | 列设备（已 admit 的 + 当前 pending 的），可按 net 过滤 |
+| `rmnet <net-uuid>` | **Phase 3** —— 删网络。下属 client 不删，**统一搬到 pending pool**（保留 display_name 和 lan_subnets），同时拆掉内核网桥并重派生路由 |
+| `assign <client-uuid> <net-uuid|none>` | **Phase 3** —— 把 client 分配到某网络（`none` 则拆出去回到 pending pool）。服务端发 `Frame::AssignNet` 让 client 销毁 TAP 重新 Join；分到新网后 admitted=false、tap_ip="" 需要再 `device set --ip ... --admit true` |
+| `device list [<net-uuid>]` | 列设备。不带 `<net-uuid>` 时同时包含 pending pool 里的 client（行 net 显示为 `-`） |
 | `device set <client-uuid> [--name X] [--ip Y/CIDR] [--admit BOOL] [--lan A,B,…]` | 改一台设备的字段。每个 flag 独立：缺省 = 不动；`--ip ""` 清空；`--lan ""` 清空 LAN 列表。`--admit true` 把 pending 升级为 admit（建 TAP + 发 JoinOk），`--admit false` 把在线 session 踢回 pending（杀 socket，行保留）。在线设备会立即收到 `SET_IP` |
 | `device push <net-uuid>` | 重新从所有成员的 `lan_subnets` 派生路由表，本机 bridge 上 apply 一遍，并下发 `SetRoutes` 给该网络内所有 joined 客户端 |
 | `list` | networks / sessions / pending 全量 snapshot |
@@ -259,6 +271,8 @@ socket = "/run/bifrost/client.sock"
 | `shutdown` | 让 daemon 优雅退出 |
 
 > 旧版本里的 `approve <sid>` / `deny <sid>` / `setip` / `route add/del/push` 已经全部移除。**Admit/踢人统一收敛到 `device set --admit true|false`**：被踢的客户端留在 pending 行（不删），重连重发 `Join` 落回 pending。`device set --ip` 取代 `setip`；`route` 被 per-device `lan_subnets` + `device push` 取代。alpha 阶段，没有迁移路径——直接手工删除老 `server.toml` 里的 `[[routes]]` 段，然后 `device set --lan` 重建。
+>
+> **Phase 3** 加了 `assign` 一个新动作；`rmnet` 语义改为"拆掉网桥，client 留在 pending pool"。线上协议从 v1 升级到 v2（新增 `Frame::AssignNet`），老版本 client 在 Hello 时会被 `version_mismatch` 拒掉，需要随服务端一起升级。
 
 ### `bifrost-client admin`
 
@@ -304,15 +318,18 @@ ssh -L 8080:127.0.0.1:8080 root@<server-ip>
 
 | Method | Path | 行为 |
 |---|---|---|
-| `GET` | `/api/networks` | 网络列表 + 每网的 `device_count` / `online_count` |
+| `GET` | `/api/networks` | 网络列表 + 每网的 `device_count` / `online_count` / `bridge_name` / `bridge_ip` |
 | `POST` | `/api/networks` | 建网络。Body `{ "name": "..." }` |
-| `PATCH` | `/api/networks/:nid` | 改名。Body `{ "name": "..." }` |
-| `DELETE` | `/api/networks/:nid` | 级联删除网络 + 下属 device 行 + 落盘的 layout 文件 |
-| `GET` | `/api/networks/:nid/devices` | admitted + pending 设备合并视图 |
+| `PATCH` | `/api/networks/:nid` | 改 `name` 和/或 `bridge_ip`。**Phase 3：** `bridge_ip` 必须是 `/16` 或 `/24` 否则 400；前缀长度变化会自动改写本网络所有 client 的 `tap_ip`（保留 octet）并下发 `SetIp` 给在线 session |
+| `DELETE` | `/api/networks/:nid` | **Phase 3** —— 拆该网络的内核网桥；下属 client **不删**，搬到 pending pool 保留 `display_name` 和 `lan_subnets` |
+| `GET` | `/api/networks/:nid/devices` | 单个网络下 admitted + pending-admit 设备合并视图 |
 | `PATCH` | `/api/networks/:nid/devices/:cid` | 改 device 字段：`name` / `tap_ip` / `lan_subnets` / **`admitted`**（true 升级 pending，false 踢回 pending） |
 | `POST` | `/api/networks/:nid/routes/push` | 重新派生路由表 + 下发 `SetRoutes` 到所有 joined peers |
-| `GET` | `/api/networks/:nid/layout` | 拿 graph 节点位置：`{ positions: { "<id>": { x, y } } }`。新网络返 `{}` 不是 404；网络不存在才 404 |
-| `PUT` | `/api/networks/:nid/layout` | 整张 map 替换写入，atomic write 到 `<save_dir>/layouts/<nid>.json` |
+| `GET` | `/api/clients` | **Phase 3** —— 一次性列出所有已知 client（已分配 + pending pool），统一 WebUI 用这个 |
+| `PATCH` | `/api/clients/:cid` | **Phase 3** —— 改 client 的 `name` 和/或 `lan_subnets`；不论它在 pending 还是 admitted |
+| `POST` | `/api/clients/:cid/assign` | **Phase 3** —— 拖拽分配。Body `{ "net_uuid": <uuid> | null }`，`null` 拆回 pending pool。同网无操作。会推 `Frame::AssignNet` 给 conn；跨网移动每次都重置 `admitted` 与 `tap_ip` |
+| `GET` | `/api/ui-layout` | **Phase 3** —— 单文件统一布局：`{ table: { left_ratio, left_collapsed }, graph: { positions, frames } }`，取代旧的 per-network layout 文件 |
+| `PUT` | `/api/ui-layout` | **Phase 3** —— 整体替换写盘，前端 debounce 后批量 PUT |
 | `GET` | `/ws` | WebSocket：推 `metrics.tick`（1Hz 吞吐采样）/ `device.{online,offline,changed,pending,removed}` / `routes.changed` / `network.{created,changed,deleted}`，25s 心跳 ping |
 
 错误统一信封 `{"error": "..."}`：4xx 是用户可修复的（未知网络、CIDR 格式错、IP 冲突），5xx 留给 hub 故障。
@@ -349,15 +366,21 @@ npm run dev        # http://127.0.0.1:5173；/api 与 /ws 自动 proxy 到 8080
 
 如果 backend 不在 `127.0.0.1:8080`，设 `BIFROST_BACKEND=http://host:port`。HMR 正常工作。
 
-当前能用的页面：
+**Phase 3** 起整个 WebUI 收敛成一个页面（`/`），不再有 Networks → Devices 的层级：
 
-- `/networks` —— 虚拟网络列表。**+ New network** 内联建；点名字 InlineEdit 改名；每行 Delete 按钮带 confirm 弹窗。30s 兜底轮询，事件驱动刷新。
-- `/networks/:nid` —— 该网下所有设备，**两种可切换视图**（per-tab 持久化到 localStorage）：
-  - **Table 视图**：单一 admit 开关替代旧 approve/deny/kick；行内编辑 name / TAP IP / LAN 子网，乐观更新 + 失败回滚 + 校验失败弹 toast；ThroughputCell 同时显示数字 bps + sparkline。
-  - **Graph 视图**：React Flow 画布全屏。Hub 居中，设备首次按确定环形布局；Hub 卡片网络名 InlineEdit（与列表页同步）。**节点拖拽位置服务端持久化**——drag end 后 debounce 300 ms PUT 到 `/api/networks/:nid/layout`，换浏览器 / 换设备打开都看到一样的布局。**连线浮动**：每个节点四边中点都是隐藏 handle，FloatingEdge 每帧选两节点距离最近的一对中点画 bezier。画布右上角 chip 显示保存状态：`Saving layout… → Layout saved → idle`，失败显示 `Save failed`。
-- `Push routes` 按钮：LAN 子网改了之后变琥珀色 + 微脉冲 + 末尾加 "•" 提示需要点击下发；同时弹 info toast。push 成功清掉提示。
-- 顶栏连接状态徽章：live / connecting / offline，由 WebSocket 状态驱动。
-- 每个设备的实时吞吐：数字 `B/s` / `KB/s` / `MB/s` + 60 采样 sparkline，由 1 Hz `metrics.tick` 事件驱动。
+- **Table 视图** —— `react-resizable-panels` 提供的左右分栏 + 可拖拽分隔条；左栏列 pending（未入网）client，右栏一张卡片一个虚拟网络。`@dnd-kit/core` 实现拖拽：**把 client 卡片在两栏 / 不同网络卡片之间拖动**就是 assign，服务端推 `Frame::AssignNet` 让 client 销毁 TAP 切到新网；TanStack Query 的 `onMutate` 立即写 cache，drop 当帧卡片就到位（无 fly-back 反向动画——`<DragOverlay dropAnimation={null}>`）。每次跨网拖完 admit 自动归零、TAP IP 自动清空——按规范用户得重新设置。Pending 卡片只显示 `name` 和 `lan_subnets`（不显示 IP 和吞吐）；admitted 行有完整字段 + 60 采样 sparkline。左下角 FAB 通过 `ImperativePanelHandle.collapse()` / `.expand()` 折叠/展开左栏，pane 不卸载所以拖宽尺寸跨折叠保留；分隔比例和折叠状态由 `/api/ui-layout` 持久化。
+- **Graph 视图** —— React Flow 一张画布展示所有网络，每个网络是一个**实线框**容纳自己的 Hub 和已 admitted client；pending client 是画布上自由浮动节点。Hub 和 Client 卡片都富编辑（admit Switch / 名字 / 段位 IP / LAN 子网 chips / 吞吐），仅顶部宽 header 是 drag handle，编辑控件不会触发拖拽。
+  - **拖 client 进框** = 入网；**拖出所有框** = 拆回 pending pool。卡片留在用户松手的位置上（drop 位置在目标 frame 的坐标系内换算后再触发 assign mutation）。
+  - **右键 Hub 卡片** → "Delete network"（client 落到 pending pool 不删除）。
+  - **右键画布空白** → "Create new network"（`screenToFlowPosition` 把新框落在鼠标位置）。
+  - 框 **四面自动伸张**容纳 Hub + 所有 admitted client；多个框 **不重叠**：迭代式 AABB 碰撞解算器沿较小重叠轴推开未 pin 的（无用户保存位置的）那一个。
+  - 连线用自定义 **`FloatingEdge`**：每帧用 `useInternalNode` 拿两端节点的位置和尺寸，挑距离最近的一对边中点画 bezier，线段端点精确落在卡片可见边框上（卡片内部用 `h-full w-full flex-col` 让内容贴合 React Flow wrapper，不留 padding 空隙）。
+  - 框 x/y/w/h、Hub/client 位置都通过 `/api/ui-layout` 服务端持久化。
+- **IP 段位拣选器** —— 网桥 IP 用四 octet 输入框 + 一个**点击切换** `/16 ↔ /24` 的按钮（取代原生 `<select>`，那个一打开就丢焦点退出编辑）+ 一个 "ok" 显式提交按钮。client TAP IP 把网桥前缀对应的 octets 锁住（如网桥 `10.0.0.1/24` ⇒ client 拣选器显示 `10.0.0.[__]/24`）；行内冲突检测同时拦截同网内重复 IP **以及** 与网桥 IP 相同。
+- **每张卡片各自的 Push routes 按钮** —— LAN 子网改完后弹 info toast，按钮变琥珀色 + 微脉冲 + 末尾加 `•` 提示需要点击下发；push 成功清掉。
+- **toolbar 上的 saving/saved 状态 chip** —— 反映 `/api/ui-layout` 异步保存状态。
+- **WS 状态徽章**：`live` / `connecting` / `offline`，由 WebSocket 状态驱动。
+- 每个 admitted 设备的实时吞吐由 1 Hz `metrics.tick` 事件驱动。
 
 ---
 
@@ -387,15 +410,15 @@ bifrost/
 │  └─ bifrost-client/              # 二进制 + lib：ConnTask 重连 / App / admin / repl
 │
 ├─ web/                            # React + Vite + TS + Tailwind 前端
-│  ├─ src/views/                   #   NetworkList、NetworkDetail、
-│  │                                 #   DevicesAsTable、DevicesAsGraph
+│  ├─ src/views/                   #   UnifiedView (table) + UnifiedGraphView
 │  ├─ src/components/
 │  │  ├─ Layout、InlineEdit、Sparkline、ThroughputCell、Toaster
-│  │  ├─ graph/                    #   ServerNode、DeviceNode、
-│  │  │                              #   FloatingEdge、graphLayout
+│  │  ├─ IpSegmentInput              #   /16 与 /24 段位拣选器
+│  │  ├─ SaveStatusChip              #   layout: saved / unsaved / saving
 │  │  └─ ui/                       #   Button、Card、Badge、Switch、Table
 │  └─ src/lib/                     #   api / ws / types / metrics /
-│                                    #   eventInvalidator / toast / format / cn
+│                                    #   useUiLayout / eventInvalidator /
+│                                    #   toast / format / cn
 │
 ├─ deploy/
 │  ├─ server.toml.example
@@ -428,7 +451,7 @@ bifrost/
 
 ---
 
-## Wire protocol (v1)
+## Wire protocol (v2)
 
 帧格式：
 
@@ -438,13 +461,14 @@ bifrost/
 └────────────────────────┴──────────────────────────────────┘
 ```
 
-`Frame` 是个 12-variant enum：
+`Frame` 是个 13-variant enum：
 
 | Variant | 方向 | 时机 |
 |---|---|---|
 | `Hello / HelloAck` | C↔S | 第一帧握手；带 `version` 与 `caps` |
 | `Join / JoinOk / JoinDeny` | C→S / S→C | 加入虚拟网络 |
 | `Eth(Vec<u8>)` | 双向 | 数据面以太帧 |
+| `AssignNet { net_uuid }` | S→C | **v2** —— 服务端推送的网络分配。`Some` 把 client 切到该网络，client 销毁 TAP 重新 `Join`；`None` 拆回 idle |
 | `SetIp { ip }` | S→C | 在线热更 TAP IP |
 | `SetRoutes(Vec<RouteEntry>)` | S→C | 路由表下发（自动过滤 self-via） |
 | `Text(String)` | 双向 | REPL `send` |
@@ -472,7 +496,7 @@ Admin RPC 是另一份独立协议：
 - ✅ 跨编译：x86_64-linux-gnu + aarch64-linux-gnu via `cross`
 - ✅ systemd unit + 部署脚本，已在生产 Arch + Ubuntu aarch64 跑通端到端
 
-### 已完成（Phase 1.0–1.6 — WebUI v1，Phase 2.0 — 多租户 L2）
+### 已完成（Phase 1.0–1.6 — WebUI v1，Phase 2.0 — 多租户 L2，Phase 3.0 — 统一 WebUI + 服务端权威分配）
 
 - ✅ **per-device `lan_subnets`** 取代全局 `[[routes]]`；路由表按需派生。CLI 改为 `device list/set/push`。
 - ✅ **单一 admit 开关**取代 approve / deny / kick：CLI 用 `device set --admit true|false`，HTTP 用 `PATCH … {admitted:…}`；被踢的设备保留为 pending 行，重连重发 `Join` 落回 pending —— 不需要协议层改动。
@@ -483,13 +507,28 @@ Admin RPC 是另一份独立协议：
 - ✅ **per-session 字节计数 + 1 Hz 采样**：每台设备同时显示数字 bps + 60 采样 sparkline。WS 事件驱动 TanStack Query invalidate，UI 不轮询，30 s 兜底刷一次。
 - ✅ **单二进制部署**：`rust-embed` 把 `web/dist/` 编进 `bifrost-server`；同端口服务 SPA + API + WS；深链接回退 `index.html`；哈希资产 immutable cache；`<save_dir>/layouts/<nid>.json` 存 per-network UI 状态。
 - ✅ **每个虚拟网一座 Linux bridge（Phase 2.0）**：`mknet` 建网桥，`delete_net` 拆网桥；admit 设备的 TAP 只挂到自己网络的桥上。`NetRecord` 新增 `bridge_name`（默认 `bf-<8-hex>`）和 `bridge_ip`（host 侧网关地址，可空）。从 Phase 1 升级时，第一个网络自动继承遗留 `[bridge]` 段。网络之间不共享广播域、ARP、MAC 表、路由表。
-- ✅ **168 个测试**通过，clippy `-D warnings` 干净。
+- ✅ **服务端权威分配 + 协议 v2（Phase 3.0）**：新增 `pending_clients` 表跟踪已连未入网的 client；新帧 `Frame::AssignNet` 让服务端把 client 在网络间挪动（client 端销毁 TAP 重新 Join）。一个 client 同时只属于一个网络（Phase 2 → 3 自动迁移）。新增 `GET /api/clients`、`PATCH /api/clients/:cid`、`POST /api/clients/:cid/assign`；`PATCH /api/networks/:nid` 加上 `bridge_ip`（仅接受 `/16` 或 `/24`，前缀变化时自动改写所有 client 的 `tap_ip` 保留 octet）。`delete_net` 不再级联删 client，改为搬到 pending pool。新增 CLI 子命令 `assign <client> <net|none>`。
+- ✅ **统一 WebUI（Phase 3.0）**：把原本的 Networks 列表 + 单网详情合并为一页。Table 模式用 `@dnd-kit/core` 做拖拽分配；Graph 模式用 React Flow 单画布展示所有网络（每个网络一个实线框 + 右键菜单）。段位拣选器锁定 IP；单文件 `ui-layout.json` 替代旧的 per-network layout（启动一次性合并旧文件）。
+- ✅ **187 个测试**通过，clippy `-D warnings` 干净。
+
+### 已完成（Phase 3.1 — 数据面性能 + WebUI 抛光）
+
+- ✅ **批量传输性能重做**。一组小修复让单流上行从用户原始 26 KB/s（生产 xray 隧道）涨到 4.1 MB/s（约 150×），千兆 LAN 测试床上从 222 Mbps 涨到 361 Mbps。要点：
+  - 数据面 socket 全部启用 `TCP_NODELAY`（server `accept`、client `connect`、SOCKS5 包裹后的内层 TcpStream），消除 Nagle 等待上一段 ACK 的卡延迟。
+  - 同样 socket 上 `SO_SNDBUF` 限到 256 KB，避免内核自动调到几 MB 之后把下游隧道的拥塞从内层 TCP 那里完全屏蔽（CUBIC 找不到丢包就一直涨 cwnd 直到 bufferbloat 把吞吐压垮）。helper 是 `bifrost-net::set_send_buffer_size`。
+  - TAP 与每张虚拟桥的 MTU 设为 **1400**，1500 字节内层以太帧 + 4 字节长度前缀 + postcard tag + 外层 TCP/IP header 还能塞进底层 1500 物理 MTU；不设的话嵌套 TCP 隧道下整帧会分片或丢弃。
+  - 两端都改回每帧一次 `framed.send`。前一版"feed 通道里所有帧 + 单次 flush"看似省 syscall，实测是性能反优化：把 1 MB 量级写入塞进慢下游代理（xray-core），把它的 RWND 砸到 0，外层 cwnd 被打回 10。
+  - 数据面 mpsc 通道扩容（`128 → 1024`），让短暂的 socket stall 不会立刻把 TAP 读循环反压住。
+- ✅ **零分配 Frame 编码**。`FrameCodec::encode` 在 perf 上吃掉了 10% 的 CPU。`bifrost-proto` 里两处修复：自定义 `BytesMutFlavor` 让 postcard 直接序列化进目标 `BytesMut`（去掉 `to_allocvec` 中转 Vec）；`#[serde(with = "serde_bytes")]` 标在 `Frame::Eth(Vec<u8>)` 和 `Frame::File::data` 上，让 postcard 把 payload 当字节串处理（一次 `try_extend(slice)`），而不是按序列里 1500 个独立 `u8` 调 `try_push`。线格式不变。两处修复后 `FrameCodec::encode` 直接跌出 perf top 25。
+- ✅ **`bridge_ip` 实时更新**。`PATCH /api/networks/:nid` 改桥 IP 现在会通过 netlink 推到 kernel 桥上（`Bridge::set_ip` 加进 trait + `LinuxBridge` 实现 `flush_addrs` / `add_addr`）。之前只更新了内存配置和持久化，要重启 server 才生效。
+- ✅ **Table 视图**：每行升级成圆角卡片（细边框 + 浅阴影 + hover 高亮），相邻行有清晰边界；列模板和顶部表头条共享同一份 grid，`name` / `tap IP` / `LAN subnets` / `throughput` / `uuid` 永远纵向对齐；`dnd-kit` 改用 `pointerWithin` 碰撞检测，PENDING 区任何位置（包括紧贴顶部）都能放进去 —— 之前默认 `rectIntersection` 让 200px 宽的拖动预览框跟更宽的 Networks 区相交面积更大，落点会被吃掉。
+- ✅ **Graph 视图**：客户端卡片高度按 LAN 子网数量自动算（`base + (lan_rows - 1) * 22 px`），5 个 LAN 也不会把流量图挤出 React Flow 包装；IP 段位拣选器输入框宽度从 `w-9 → w-12`，3 位数（`255`）也宽松；流量数值列改 `w-20 + whitespace-nowrap`，`99.9 GB/s` 也能单行。
 
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |
 |---|---|---|
-| 2.x | `mknet` CLI 加 `--ip <cidr>` flag、`POST /api/networks` body 加 `bridge_ip`、WebUI 加每网桥编辑面板 | Phase 2.0 已经做了内核级隔离，但新建网络默认 `bridge_ip = ""`。当前可手动改 `server.toml` 给某网络配 host 侧 IP，等 UI 落地后会更顺手。 |
+| 3.x | `mknet` CLI 加 `--ip <cidr>` flag | Phase 3.0 已经在 WebUI + `PATCH /api/networks/:nid` 加上了网桥 IP 段位拣选器，但 `mknet` CLI 还得手编 `server.toml` 给新网络配 IP。 |
 | —   | **Noise XX 加密 transport** | `Hello.caps` 已经预留 bit；上 `snow` crate 实现 `Transport` trait 即可，业务代码无需改动 |
 | —   | **Prometheus metrics** | `metrics-exporter-prometheus`；per-session 字节 / 帧 / 丢包（1.2 帮它打地基；`[metrics]` 配置段已存在但目前是空挂） |
 | —   | **per-session pcap dump** | `SessionCmd::PcapStart/Stop` 已经定义，只缺实现 |

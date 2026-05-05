@@ -111,6 +111,16 @@ pub async fn dispatch(hub: &HubHandle, req: ServerAdminReq) -> ServerAdminResp {
         ServerAdminReq::SendFile { name, data } => {
             ServerAdminResp::Count(hub.broadcast_file(name, data).await as u64)
         }
+        ServerAdminReq::AssignClient {
+            client_uuid,
+            net_uuid,
+        } => match hub.assign_client(client_uuid, net_uuid).await {
+            bifrost_core::AssignClientResult::Ok(d) => ServerAdminResp::Device(d),
+            bifrost_core::AssignClientResult::NotFound => ServerAdminResp::NotFound,
+            bifrost_core::AssignClientResult::UnknownNetwork => {
+                ServerAdminResp::Error("unknown network".into())
+            }
+        },
         ServerAdminReq::Shutdown => {
             hub.shutdown().await;
             ServerAdminResp::Ok
@@ -132,7 +142,11 @@ async fn resolve_single_net(
         .collect();
     match candidates.len() {
         0 => Err(ServerAdminResp::NotFound),
-        1 => Ok(candidates[0].net_uuid),
+        1 => candidates[0]
+            .net_uuid
+            .ok_or(ServerAdminResp::Error(format!(
+                "client {client_uuid} is unassigned (no network); use `assign` first"
+            ))),
         _ => Err(ServerAdminResp::Error(format!(
             "client {} appears in {} networks; specify net_uuid",
             client_uuid,
@@ -155,7 +169,7 @@ pub fn format_resp(resp: &ServerAdminResp) -> String {
                 "device {client} net={net} name={name:?} admitted={admit} ip={ip} \
                  lan={lan} online={on}",
                 client = short(&d.client_uuid),
-                net = short(&d.net_uuid),
+                net = d.net_uuid.map(|u| short(&u)).unwrap_or_else(|| "-".into()),
                 name = d.display_name,
                 admit = d.admitted,
                 ip = d.tap_ip.as_deref().unwrap_or("-"),
@@ -177,7 +191,7 @@ pub fn format_resp(resp: &ServerAdminResp) -> String {
                     s,
                     "  client={} net={} name={:?} admitted={} ip={} lan={} online={}",
                     short(&d.client_uuid),
-                    short(&d.net_uuid),
+                    d.net_uuid.map(|u| short(&u)).unwrap_or_else(|| "-".into()),
                     d.display_name,
                     d.admitted,
                     d.tap_ip.as_deref().unwrap_or("-"),
