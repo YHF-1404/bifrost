@@ -57,14 +57,36 @@ where
         tokio::select! {
             biased;
 
-            // Per-frame send — see bifrost-client/conn.rs for why we
-            // do NOT batch into one flush. With TCP_NODELAY each frame
-            // becomes its own small TCP segment immediately, which a
-            // slow downstream proxy (xray-core, …) can pace through
-            // its tunnel without choking on a multi-MB burst.
+            // Bounded batch send: feed up to ~32 frames or ~32 KB
+            // into the write buffer, then a single flush. Mirrors the
+            // bifrost-client side. The bound is small enough that a
+            // slow downstream (xray over a long-RTT tunnel) doesn't
+            // see RWND collapse, big enough that the outbound NIC's
+            // TSO can split one ~32 KB userspace write into many
+            // wire packets — re-enabling the kernel offload that
+            // per-frame writes silently disabled.
             outbound = frame_rx.recv() => match outbound {
                 Some(frame) => {
-                    if let Err(e) = framed.send(frame).await {
+                    const BATCH_FRAMES: usize = 32;
+                    const BATCH_BYTES: usize = 32 * 1024;
+                    let res: Result<(), bifrost_proto::ProtoError> = async {
+                        framed.feed(frame).await?;
+                        let mut count = 1;
+                        while count < BATCH_FRAMES
+                            && framed.write_buffer().len() < BATCH_BYTES
+                        {
+                            match frame_rx.try_recv() {
+                                Ok(more) => {
+                                    framed.feed(more).await?;
+                                    count += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        framed.flush().await
+                    }
+                    .await;
+                    if let Err(e) = res {
                         warn!(?conn_id, error = %e, "socket write failed");
                         break 'main;
                     }

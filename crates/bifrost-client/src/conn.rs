@@ -108,17 +108,41 @@ impl ConnTask {
                     },
                     outgoing = self.out_rx.recv() => match outgoing {
                         Some(frame) => {
-                            // Per-frame send (= feed + flush). With
-                            // TCP_NODELAY each frame becomes its own
-                            // small TCP segment immediately. Earlier we
-                            // batched (drain channel into one flush) to
-                            // save syscalls — but that creates large
-                            // bursts that overwhelm a slow downstream
-                            // proxy (e.g. xray-core), causing its ACK
-                            // window to stall and our outer TCP to drop
-                            // cwnd to 10. Per-frame writes give the
-                            // proxy a steady, paced stream.
-                            if let Err(e) = framed.send(frame).await {
+                            // Bounded batch send: feed up to N frames
+                            // OR ~32 KB into the write buffer, then a
+                            // single flush. This lets the kernel TCP /
+                            // any downstream proxy (xray) handle one
+                            // larger write — re-enabling outbound TSO
+                            // and amortizing per-write fixed costs —
+                            // without overrunning a slow proxy's recv
+                            // buffer. An earlier version drained the
+                            // whole channel (up to 1024 frames / ~1.4
+                            // MB) in one flush and that crashed xray's
+                            // RWND to 0 over a long-RTT VPS tunnel.
+                            // 32 frames / 32 KB is the compromise:
+                            // big enough to amortize, small enough to
+                            // stay well under any reasonable recv
+                            // buffer.
+                            const BATCH_FRAMES: usize = 32;
+                            const BATCH_BYTES: usize = 32 * 1024;
+                            let res: Result<(), bifrost_proto::ProtoError> = async {
+                                framed.feed(frame).await?;
+                                let mut count = 1;
+                                while count < BATCH_FRAMES
+                                    && framed.write_buffer().len() < BATCH_BYTES
+                                {
+                                    match self.out_rx.try_recv() {
+                                        Ok(more) => {
+                                            framed.feed(more).await?;
+                                            count += 1;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                framed.flush().await
+                            }
+                            .await;
+                            if let Err(e) = res {
                                 warn!(error = %e, "socket write failed");
                                 break;
                             }
