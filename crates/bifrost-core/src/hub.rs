@@ -724,17 +724,34 @@ impl Hub {
         }
     }
 
-    /// Re-evaluate whether `net_uuid`'s derived route set still
-    /// matches what was last pushed to peers. Emits a
-    /// `HubEvent::RoutesDirty` only on state TRANSITIONS — repeated
-    /// no-op edits don't produce a flurry of identical events.
+    /// Re-evaluate whether `net_uuid` needs a route push and emit a
+    /// `HubEvent::RoutesDirty` on state TRANSITIONS only.
     ///
-    /// Order-insensitive equality: routes are sorted by `(dst, via)`
-    /// before comparison so two equivalent tables (postcard might
-    /// not preserve insertion order across joins) compare equal.
+    /// Two independent conditions count as "dirty"; the pulse fires
+    /// if EITHER holds:
+    ///
+    /// 1. **Pushable drift.** The set of routes
+    ///    `derive_routes_for_network` would emit right now (the
+    ///    `admitted=true` + valid `tap_ip` clients) doesn't equal
+    ///    `last_pushed_routes`. This catches edits to `lan_subnets`
+    ///    on an admitted client, kicks (admitted flipping false,
+    ///    leaving stale via in pushed), and tap_ip changes.
+    ///
+    /// 2. **Uncovered intent.** Some `lan_subnet` of *any* client in
+    ///    the network isn't a `dst` in `last_pushed`. This catches
+    ///    the user-visible case the simpler condition missed: a
+    ///    client gets dragged into the network (Phase-3 spec clears
+    ///    its `admitted` and `tap_ip`, so it contributes nothing to
+    ///    `derive_routes_for_network`) but it brought
+    ///    `lan_subnets` that the network's pushed table has never
+    ///    seen. The button pulses to remind the admin to admit the
+    ///    client + set its IP + push, even though that single drag
+    ///    didn't change the *pushable* derived set.
+    ///
+    /// Both routes are sorted by `(dst, via)` before equality so
+    /// insertion-order differences across operations don't cause
+    /// false dirty signals.
     fn recheck_routes_dirty(&mut self, net_uuid: Uuid) {
-        // Skip nets we don't manage (e.g. one was just deleted and
-        // the caller is wrapping cleanup).
         if !self.cfg.networks.iter().any(|n| n.uuid == net_uuid) {
             return;
         }
@@ -746,7 +763,23 @@ impl Hub {
             .cloned()
             .unwrap_or_default();
         pushed.sort_by(|a, b| (a.dst.cmp(&b.dst)).then(a.via.cmp(&b.via)));
-        let new_dirty = derived != pushed;
+
+        // Condition 1: pushable drift.
+        let pushable_drift = derived != pushed;
+
+        // Condition 2: uncovered intent — any client in the network
+        // has lan_subnets whose dsts aren't in pushed.
+        let pushed_dsts: std::collections::HashSet<&str> =
+            pushed.iter().map(|r| r.dst.as_str()).collect();
+        let uncovered_intent = self
+            .cfg
+            .approved_clients
+            .iter()
+            .filter(|a| a.net_uuid == net_uuid)
+            .flat_map(|a| a.lan_subnets.iter())
+            .any(|s| !pushed_dsts.contains(s.as_str()));
+
+        let new_dirty = pushable_drift || uncovered_intent;
         let old_dirty = self.routes_dirty.get(&net_uuid).copied().unwrap_or(false);
         if new_dirty != old_dirty {
             self.emit(HubEvent::RoutesDirty {
@@ -829,15 +862,19 @@ impl Hub {
         // until someone re-ran `route push`.
         self.sync_local_routes().await;
 
-        // Seed `last_pushed_routes` from the persisted config so a
-        // clean restart starts at `dirty=false` for every network.
-        // Newly admitted clients between this startup and the next
-        // `device_push` will flip dirty=true via `recheck_routes_dirty`
-        // calls in the relevant handlers.
+        // Seed `last_pushed_routes` from each network's *currently
+        // pushable* derived set (admitted+tapped clients only) and
+        // run `recheck_routes_dirty` so the initial state correctly
+        // reflects condition 2 (uncovered intent) — e.g. a network
+        // whose persisted config has clients with `lan_subnets` that
+        // were never admitted starts at dirty=true, prompting the
+        // operator to finish the setup. No events are emitted here
+        // because `recheck` only fires on transitions and the prior
+        // dirty value (default false) might match.
         for net in self.cfg.networks.clone() {
             let derived = derive_routes_for_network(&self.cfg, net.uuid);
             self.last_pushed_routes.insert(net.uuid, derived);
-            self.routes_dirty.insert(net.uuid, false);
+            self.recheck_routes_dirty(net.uuid);
         }
 
         let mut sampler = tokio::time::interval(METRICS_TICK);

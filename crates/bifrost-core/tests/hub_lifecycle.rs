@@ -1469,17 +1469,19 @@ async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
     let h = spawn(cfg).await;
     let mut events = h.hub.subscribe();
 
-    // At spawn time the network exists but no device is admitted, so
-    // no routes are derived and no routes have been pushed: dirty=false.
-    let snap = h.hub.list().await.unwrap();
+    // The network already has a client with `lan_subnets` that
+    // aren't in `last_pushed` (condition 2: uncovered intent), so
+    // the snapshot starts dirty even though nobody is admitted yet.
+    // The admin sees the pulse and is reminded to admit + set IP +
+    // push.
     assert!(
-        !snap.routes_dirty.contains(&net),
-        "fresh network with no admitted devices must start clean"
+        h.hub.list().await.unwrap().routes_dirty.contains(&net),
+        "fresh network with an unadmitted client whose lan_subnets aren't pushed yet must start dirty"
     );
 
-    // Admit the device — its lan_subnets become "live" in the
-    // network's derived route set, but no `device_push` has run yet,
-    // so the hub flags dirty=true.
+    // Admit the device — its lan_subnets are now "live" in the
+    // network's derived route set too (condition 1), so dirty
+    // remains true (no transition, no event).
     let result = h
         .hub
         .device_set(
@@ -1492,26 +1494,11 @@ async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
         )
         .await;
     assert!(matches!(result, bifrost_core::DeviceSetResult::Ok(_)));
+    assert!(h.hub.list().await.unwrap().routes_dirty.contains(&net));
 
-    let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
-        matches!(e, HubEvent::RoutesDirty { .. })
-    })
-    .await
-    .expect("expected RoutesDirty");
-    match evt {
-        HubEvent::RoutesDirty { network, dirty } => {
-            assert_eq!(network, net);
-            assert!(dirty, "expected dirty=true after admit");
-        }
-        other => panic!("unexpected event: {other:?}"),
-    }
-    assert!(
-        h.hub.list().await.unwrap().routes_dirty.contains(&net),
-        "snapshot must reflect routes_dirty=true after admit"
-    );
-
-    // Run device_push — derived now matches last_pushed → dirty flips
-    // back to false and the hub fires the transition event.
+    // Run device_push — `last_pushed` now equals `derive_routes` AND
+    // covers the client's lan_subnets, so both conditions clear and
+    // the hub fires the dirty=false transition.
     let _ = h.hub.device_push(net).await;
     let evt = next_matching(&mut events, Duration::from_millis(500), |e| {
         matches!(e, HubEvent::RoutesDirty { .. })
@@ -1526,6 +1513,86 @@ async fn admitting_device_with_lan_subnets_emits_routes_dirty_true() {
         other => panic!("unexpected event: {other:?}"),
     }
     assert!(!h.hub.list().await.unwrap().routes_dirty.contains(&net));
+
+    h.hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn assigning_client_with_lan_subnets_into_net_emits_routes_dirty_true() {
+    // Phase 3.x — the user-reported case: drag a client from one
+    // network to another. Phase 3 spec clears the admitted+tap_ip on
+    // assign, so the moved client contributes nothing to the
+    // *derived-pushable* set in either network — but the destination
+    // network's last-pushed table still doesn't cover the client's
+    // `lan_subnets`. The hub must flag dirty=true on the destination
+    // anyway so the admin sees the pulse and remembers to admit +
+    // set tap_ip + push.
+    let net_a = Uuid::new_v4();
+    let net_b = Uuid::new_v4();
+    let client = Uuid::new_v4();
+    let mut cfg = build_cfg(60);
+    cfg.networks.push(NetRecord::new("a", net_a));
+    cfg.networks.push(NetRecord::new("b", net_b));
+    // Client starts in net_a, NOT admitted (no tap_ip), with subnets.
+    cfg.approved_clients.push(ApprovedClient {
+        client_uuid: client,
+        net_uuid: net_a,
+        tap_ip: String::new(),
+        display_name: String::new(),
+        lan_subnets: vec!["192.168.77.0/24".into()],
+        admitted: false,
+    });
+    let h = spawn(cfg).await;
+    let mut events = h.hub.subscribe();
+
+    // Both networks should start dirty=true (uncovered intent in
+    // net_a: client's lan_subnet isn't in last_pushed). We seed
+    // last_pushed=derived at startup, derived=[] for both, so
+    // condition 2 fires for net_a only.
+    let snap = h.hub.list().await.unwrap();
+    assert!(
+        snap.routes_dirty.contains(&net_a),
+        "net_a starts dirty: client in it has uncovered lan_subnets"
+    );
+    assert!(
+        !snap.routes_dirty.contains(&net_b),
+        "net_b starts clean: no clients in it"
+    );
+
+    // Drag the client to net_b. handle_assign_client clears admitted
+    // and tap_ip; the client now lives in net_b with lan_subnets
+    // intact.
+    let r = h.hub.assign_client(client, Some(net_b)).await;
+    assert!(matches!(r, bifrost_core::AssignClientResult::Ok(_)));
+
+    // net_a should flip dirty=false (no clients with uncovered
+    // subnets remain).
+    // net_b should flip dirty=true (the moved client's lan_subnet
+    // isn't in net_b's last_pushed dsts).
+    let mut saw_a_clean = false;
+    let mut saw_b_dirty = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while !(saw_a_clean && saw_b_dirty) {
+        let Some(Ok(e)) =
+            tokio::time::timeout_at(deadline, events.recv()).await.ok()
+        else {
+            break;
+        };
+        if let HubEvent::RoutesDirty { network, dirty } = e {
+            if network == net_a && !dirty {
+                saw_a_clean = true;
+            }
+            if network == net_b && dirty {
+                saw_b_dirty = true;
+            }
+        }
+    }
+    assert!(saw_a_clean, "expected net_a dirty=false after client left");
+    assert!(saw_b_dirty, "expected net_b dirty=true after drag-in");
+
+    let snap = h.hub.list().await.unwrap();
+    assert!(!snap.routes_dirty.contains(&net_a));
+    assert!(snap.routes_dirty.contains(&net_b));
 
     h.hub.shutdown().await;
 }
