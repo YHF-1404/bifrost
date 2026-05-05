@@ -14,7 +14,8 @@ use rtnetlink::Handle;
 use tracing::{debug, warn};
 
 use super::tap::{
-    add_route, del_link, flush_user_routes, io_other, lookup_if_index, set_link_mtu, TAP_MTU,
+    add_addr, add_route, del_link, flush_addrs, flush_user_routes, io_other, lookup_if_index,
+    set_link_mtu, TAP_MTU,
 };
 use crate::traits::Bridge;
 use crate::types::RouteEntry;
@@ -128,6 +129,18 @@ impl Bridge for LinuxBridge {
             .execute()
             .await
             .map_err(io_other)
+    }
+
+    async fn set_ip(&self, ip: Option<IpNet>) -> io::Result<()> {
+        // Replace strategy mirrors `LinuxTap::set_ip`: drop every
+        // address currently bound to the bridge, then add the new
+        // one. Used by the hub when an admin updates `bridge_ip`
+        // through the WebUI / API at runtime.
+        flush_addrs(&self.handle, self.if_index).await?;
+        if let Some(net) = ip {
+            add_addr(&self.handle, self.if_index, net).await?;
+        }
+        Ok(())
     }
 
     async fn apply_routes(&self, routes: &[RouteEntry]) -> io::Result<()> {

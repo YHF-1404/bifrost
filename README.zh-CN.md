@@ -511,6 +511,19 @@ Admin RPC 是另一份独立协议：
 - ✅ **统一 WebUI（Phase 3.0）**：把原本的 Networks 列表 + 单网详情合并为一页。Table 模式用 `@dnd-kit/core` 做拖拽分配；Graph 模式用 React Flow 单画布展示所有网络（每个网络一个实线框 + 右键菜单）。段位拣选器锁定 IP；单文件 `ui-layout.json` 替代旧的 per-network layout（启动一次性合并旧文件）。
 - ✅ **187 个测试**通过，clippy `-D warnings` 干净。
 
+### 已完成（Phase 3.1 — 数据面性能 + WebUI 抛光）
+
+- ✅ **批量传输性能重做**。一组小修复让单流上行从用户原始 26 KB/s（生产 xray 隧道）涨到 4.1 MB/s（约 150×），千兆 LAN 测试床上从 222 Mbps 涨到 361 Mbps。要点：
+  - 数据面 socket 全部启用 `TCP_NODELAY`（server `accept`、client `connect`、SOCKS5 包裹后的内层 TcpStream），消除 Nagle 等待上一段 ACK 的卡延迟。
+  - 同样 socket 上 `SO_SNDBUF` 限到 256 KB，避免内核自动调到几 MB 之后把下游隧道的拥塞从内层 TCP 那里完全屏蔽（CUBIC 找不到丢包就一直涨 cwnd 直到 bufferbloat 把吞吐压垮）。helper 是 `bifrost-net::set_send_buffer_size`。
+  - TAP 与每张虚拟桥的 MTU 设为 **1400**，1500 字节内层以太帧 + 4 字节长度前缀 + postcard tag + 外层 TCP/IP header 还能塞进底层 1500 物理 MTU；不设的话嵌套 TCP 隧道下整帧会分片或丢弃。
+  - 两端都改回每帧一次 `framed.send`。前一版"feed 通道里所有帧 + 单次 flush"看似省 syscall，实测是性能反优化：把 1 MB 量级写入塞进慢下游代理（xray-core），把它的 RWND 砸到 0，外层 cwnd 被打回 10。
+  - 数据面 mpsc 通道扩容（`128 → 1024`），让短暂的 socket stall 不会立刻把 TAP 读循环反压住。
+- ✅ **零分配 Frame 编码**。`FrameCodec::encode` 在 perf 上吃掉了 10% 的 CPU。`bifrost-proto` 里两处修复：自定义 `BytesMutFlavor` 让 postcard 直接序列化进目标 `BytesMut`（去掉 `to_allocvec` 中转 Vec）；`#[serde(with = "serde_bytes")]` 标在 `Frame::Eth(Vec<u8>)` 和 `Frame::File::data` 上，让 postcard 把 payload 当字节串处理（一次 `try_extend(slice)`），而不是按序列里 1500 个独立 `u8` 调 `try_push`。线格式不变。两处修复后 `FrameCodec::encode` 直接跌出 perf top 25。
+- ✅ **`bridge_ip` 实时更新**。`PATCH /api/networks/:nid` 改桥 IP 现在会通过 netlink 推到 kernel 桥上（`Bridge::set_ip` 加进 trait + `LinuxBridge` 实现 `flush_addrs` / `add_addr`）。之前只更新了内存配置和持久化，要重启 server 才生效。
+- ✅ **Table 视图**：每行升级成圆角卡片（细边框 + 浅阴影 + hover 高亮），相邻行有清晰边界；列模板和顶部表头条共享同一份 grid，`name` / `tap IP` / `LAN subnets` / `throughput` / `uuid` 永远纵向对齐；`dnd-kit` 改用 `pointerWithin` 碰撞检测，PENDING 区任何位置（包括紧贴顶部）都能放进去 —— 之前默认 `rectIntersection` 让 200px 宽的拖动预览框跟更宽的 Networks 区相交面积更大，落点会被吃掉。
+- ✅ **Graph 视图**：客户端卡片高度按 LAN 子网数量自动算（`base + (lan_rows - 1) * 22 px`），5 个 LAN 也不会把流量图挤出 React Flow 包装；IP 段位拣选器输入框宽度从 `w-9 → w-12`，3 位数（`255`）也宽松；流量数值列改 `w-20 + whitespace-nowrap`，`99.9 GB/s` 也能单行。
+
 ### Roadmap（按阶段）
 
 | 阶段 | 内容 | 备注 |

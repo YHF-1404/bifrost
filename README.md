@@ -835,6 +835,62 @@ Crate dependency graph:
   one-shot migration that folds old files in).
 * **187 tests passing**, clippy-clean with `-D warnings`.
 
+### Completed (Phase 3.1 — data-plane perf + WebUI polish)
+
+* **Bulk-throughput rebuild.** A combination of small fixes lifted
+  single-stream upload through a real production xray tunnel from the
+  user's original 26 KB/s to 4.1 MB/s (~150×) and on a gigabit LAN
+  testbed from 222 Mbps to 361 Mbps. Headline changes:
+  * `TCP_NODELAY` on every data-plane socket (server `accept`, client
+    `connect`, both directions of the SOCKS5-wrapped path) so per-frame
+    writes don't sit in Nagle's queue waiting for the previous segment
+    to ACK.
+  * Bounded `SO_SNDBUF` (256 KB) on the same sockets so the auto-tuned
+    multi-MB buffer can't hide downstream tunnel congestion from the
+    inner TCP riding on bifrost. `bifrost-net::set_send_buffer_size`
+    is the helper.
+  * TAP and per-network bridge MTU set to **1400** so a 1500-byte
+    inner Ethernet frame plus our 4-byte length prefix + postcard
+    tags + outer TCP/IP header still fits under the underlying 1500
+    physical MTU — without this, every full-size frame fragmented or
+    dropped through nested TCP tunnels.
+  * `framed.send` per frame on both ends. An earlier "feed all queued
+    frames + one flush" optimization was a real regression here: it
+    accumulated megabyte-sized writes that overran a slow downstream
+    proxy (xray-core), drove its RWND to 0, and reset the outer cwnd.
+  * Wider data-plane mpsc channels (`128 → 1024`) so brief socket
+    stalls don't immediately backpressure the TAP-read loop.
+* **Zero-alloc Frame encoding.** `FrameCodec::encode` was 10 % of all
+  CPU cycles on the upload hot path. Two fixes inside `bifrost-proto`:
+  a custom `BytesMutFlavor` that lets postcard serialize straight into
+  the destination `BytesMut` (no `to_allocvec` round-trip); and
+  `#[serde(with = "serde_bytes")]` on `Frame::Eth(Vec<u8>)` and
+  `Frame::File::data` so postcard treats the payload as bytes
+  (one `try_extend(slice)` call) instead of as a sequence of `u8`
+  (1500 individual `try_push` calls per Ethernet frame). Wire format
+  unchanged. After both fixes `FrameCodec::encode` falls out of the
+  top 25 hotspots entirely.
+* **Live `bridge_ip` updates** via `PATCH /api/networks/:nid` now
+  push the new address through netlink onto the kernel bridge
+  (`Bridge::set_ip` on the trait + a netlink `flush_addrs` /
+  `add_addr` impl in `LinuxBridge`). Previously the WebUI/API edit
+  only updated the on-disk config and required a server restart for
+  the kernel to see the change.
+* **Table view** — per-row card style (rounded border, soft shadow,
+  hover state) so adjacent rows have a visible boundary; a fixed grid
+  template shared with the column-header strip so `name` / `tap IP` /
+  `LAN subnets` / `throughput` / `uuid` line up perfectly across
+  rows; `dnd-kit` collision detection switched to `pointerWithin` so
+  drops on the narrow PENDING pane are decided by cursor position
+  alone (the wider Networks pane no longer "wins" near the top of
+  the pending pane).
+* **Graph view** — per-client card height now scales with LAN-subnet
+  count (`base + (lan_rows - 1) * 22 px`) so a client with 5 subnets
+  no longer pushes its throughput chart out of the React Flow
+  wrapper; the IP-segment editor's input width grew (`w-9 → w-12`)
+  so 3-digit octets fit; the throughput value column got `w-20` +
+  `whitespace-nowrap` so `99.9 GB/s` stays on one line.
+
 ### Roadmap
 
 | Phase | Item | Notes |

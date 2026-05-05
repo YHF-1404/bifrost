@@ -282,7 +282,7 @@ pub(super) async fn set_link_mtu(handle: &Handle, idx: u32, mtu: u32) -> io::Res
         .map_err(io_other)
 }
 
-async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
+pub(super) async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
     handle
         .address()
         .add(idx, net.addr(), net.prefix_len())
@@ -291,7 +291,7 @@ async fn add_addr(handle: &Handle, idx: u32, net: IpNet) -> io::Result<()> {
         .map_err(io_other)
 }
 
-async fn flush_addrs(handle: &Handle, idx: u32) -> io::Result<()> {
+pub(super) async fn flush_addrs(handle: &Handle, idx: u32) -> io::Result<()> {
     use futures::TryStreamExt;
     let mut stream = handle.address().get().set_link_index_filter(idx).execute();
     while let Some(addr_msg) = stream.try_next().await.map_err(io_other)? {

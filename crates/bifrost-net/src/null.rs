@@ -64,6 +64,9 @@ impl Bridge for NullBridge {
     async fn remove_tap(&self, _tap_name: &str) -> io::Result<()> {
         Ok(())
     }
+    async fn set_ip(&self, _ip: Option<IpNet>) -> io::Result<()> {
+        Ok(())
+    }
     async fn apply_routes(&self, _routes: &[RouteEntry]) -> io::Result<()> {
         Ok(())
     }

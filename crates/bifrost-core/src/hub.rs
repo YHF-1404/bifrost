@@ -1488,6 +1488,23 @@ impl Hub {
 
         self.persist().await;
 
+        // Push the new IP through netlink onto the live bridge link.
+        // Without this the WebUI/API edit only updates the on-disk
+        // config — kernel state stays at whatever IP the bridge was
+        // created with (or none), and clients can't reach the
+        // gateway until the server restarts and re-creates the
+        // bridge from persisted config.
+        if let Some(bridge) = self.bridges.get(&net_uuid) {
+            let parsed = if new_ip.is_empty() {
+                None
+            } else {
+                new_ip.parse::<IpNet>().ok()
+            };
+            if let Err(e) = bridge.set_ip(parsed).await {
+                warn!(%net_uuid, error = %e, "bridge.set_ip failed (config still updated)");
+            }
+        }
+
         // Push the new IP down to any live session whose tap_ip we
         // just rewrote.
         for (cuid, ip) in &sessions_to_notify {
